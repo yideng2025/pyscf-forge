@@ -25,6 +25,7 @@ import numpy
 
 from pyscf import gto
 from pyscf import scf
+from pyscf.fci import addons as fci_addons
 from pyscf.fci import direct_spin1
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
@@ -796,6 +797,75 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
         self.assertIsNone(mo_energy)
 
+
+
+    def test_fix_spin_sets_gas_native_penalty_and_undoes(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+
+        self.assertIs(mc.fix_spin_(shift=.15, ss=0), mc)
+
+        self.assertFalse(isinstance(mc.fcisolver, fci_addons.SpinPenaltyFCISolver))
+        self.assertEqual(mc.fcisolver.ss_penalty, .15)
+        self.assertEqual(mc.fcisolver.ss_value, 0.0)
+        self.assertIsNone(getattr(mc.fcisolver, "gen_linkstr"))
+        self.assertIsNone(getattr(mc.fcisolver, "transform_ci_for_orbital_rotation"))
+        self.assertIs(mc.validate_capabilities(), mc)
+
+        self.assertIs(mc.undo_fix_spin_(), mc)
+        self.assertFalse(hasattr(mc.fcisolver, "ss_penalty"))
+        self.assertFalse(hasattr(mc.fcisolver, "ss_value"))
+
+        copied = mc.fix_spin(shift=.25, ss=0)
+        self.assertIsNot(copied, mc)
+        self.assertTrue(hasattr(copied.fcisolver, "ss_penalty"))
+        self.assertFalse(hasattr(mc.fcisolver, "ss_penalty"))
+
+    def test_fix_spin_rejects_spin_incomplete_gas_and_invalid_target(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        incomplete = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 0, 0, 1]],
+            gas_restr_type="spin-supergroup", nelecas=(1, 1), ncore=0)
+
+        with self.assertRaisesRegex(ValueError, "spin-complete"):
+            incomplete.fix_spin_(shift=.2, ss=0)
+
+        complete = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        with self.assertRaisesRegex(ValueError, "target S"):
+            complete.fix_spin_(shift=.2, ss=.5)
+
+    def test_fix_spin_kernel_smoke_tracks_physical_energy(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
+        mc.max_cycle_macro = 1
+        mc.max_cycle_micro = 1
+        mc.conv_tol = 1e-8
+        mc.conv_tol_grad = 1e-4
+        mc.canonicalization = False
+        mc.fix_spin_(shift=.2, ss=0)
+
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
+        report = mc.spin_energy_report()
+
+        self.assertTrue(numpy.isfinite(e_tot))
+        self.assertTrue(numpy.isfinite(e_gas))
+        self.assertEqual(numpy.asarray(ci).ndim, 1)
+        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
+        self.assertIsNone(mo_energy)
+        self.assertTrue(numpy.isfinite(report["physical"]))
+        self.assertTrue(numpy.isfinite(report["penalty"]))
+        self.assertAlmostEqual(report["objective"], e_tot, places=9)
+        self.assertEqual(report["target_s2"], 0.0)
+        self.assertIn(report["method"], (
+            "exact-small-space", "projected-plus-global-davidson"))
 
     def test_as_scanner_runs_energy_scan_with_fixed_gas_model(self):
         mol = gto.M(
