@@ -611,6 +611,69 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
         self.assertIsNone(mo_energy)
 
+    def test_validate_capabilities_sets_internal_rotation_policy(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+
+        gas_as_cas = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        gas_as_cas.internal_rotation = True
+        self.assertIs(gas_as_cas.newton(), gas_as_cas)
+        self.assertFalse(gas_as_cas.internal_rotation)
+
+        restricted = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=0)
+        self.assertIs(restricted.validate_capabilities(), restricted)
+        self.assertTrue(restricted.internal_rotation)
+
+    def test_kernel_rejects_multiroot_until_state_average_stage(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        mc.fcisolver.nroots = 2
+
+        with self.assertRaisesRegex(ValueError, "nroots>1"):
+            mc.kernel(mf.mo_coeff)
+
+    def test_copy_detaches_object_level_solver_caches(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        source_plan = mc.fcisolver._get_rdm_plan(2, (1, 1))
+
+        copied = mc.copy()
+
+        self.assertIsNot(copied, mc)
+        self.assertIsNot(copied.fcisolver, mc.fcisolver)
+        self.assertEqual(copied.gas_orbs, mc.gas_orbs)
+        self.assertIsNone(copied.fcisolver._rdm_plan)
+        self.assertIs(source_plan, mc.fcisolver._rdm_plan)
+        mc.close()
+        self.assertIsNone(source_plan._plan)
+
+    def test_full_active_gas_as_cas_kernel_without_canonicalization(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        ref = gasci.GASCI(
+            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None)
+        for obj in (mc, ref):
+            obj.canonicalization = False
+
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
+        ref_e_tot, ref_e_gas, ref_ci, _, _ = ref.kernel(mf.mo_coeff)
+
+        self.assertFalse(mc.internal_rotation)
+        self.assertAlmostEqual(e_tot, ref_e_tot, places=11)
+        self.assertAlmostEqual(e_gas, ref_e_gas, places=11)
+        self.assertEqual(numpy.asarray(ci).shape, numpy.asarray(ref_ci).shape)
+        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
+        self.assertIsNone(mo_energy)
+
     def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)

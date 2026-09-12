@@ -22,8 +22,8 @@ This module is introduced in small reviewable stages.  Current commits define
 object construction, explicit GASCI solver adaptation, GAS orbital-rotation
 masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
 those plans, GASCI-like object-level wrappers, a fixed-orbital GASCI bridge,
-and a minimal native Newton/CIAH driver bridge.  State averaging, spin penalty
-and scanner support are added separately.
+and a minimal native Newton/CIAH driver bridge.  Current validation also
+guards unsupported staged feature combinations and kernel lifetimes.
 """
 
 from collections import OrderedDict
@@ -401,6 +401,61 @@ class GASSCF(newton_casscf.CASSCF):
         self.fcisolver = solver
         self.fcisolver.mol = self.mol
 
+    def validate_capabilities(self):
+        """Validate the currently staged Newton GASSCF feature set.
+
+        The production algorithm is still assembled in small commits.  This
+        guard makes unsupported combinations fail before entering the native
+        CASSCF driver and sets the native ``internal_rotation`` flag whenever
+        active-active inter-GAS rotations are part of the orbital variables.
+        """
+
+        if not isinstance(self.fcisolver, _GASFCISolver):
+            _unsupported("non-adapted GASCI solver")
+        if isinstance(self, addons.StateAverageMCSCF):
+            _unsupported("state-average Newton GASSCF")
+        if isinstance(self.fcisolver, addons.StateAverageMixFCISolver):
+            _unsupported("state-average-mix GASCI solver")
+        if isinstance(self.fcisolver, addons.StateSpecificFCISolver):
+            _unsupported("state-specific GASCI solver wrapper")
+        if int(getattr(self.fcisolver, "nroots", 1)) != 1:
+            raise ValueError(
+                "nroots>1 requires staged state_average support")
+
+        gas_orbs, gas_restr = self._normalized_restriction()
+        addons_gas.check_kernel_limits(
+            gas_orbs, self._effective_nelecas(), gas_restr)
+        self.internal_rotation = len(gas_orbs) > 1
+        self.fcisolver.mol = self.mol
+        return self
+
+    def close(self):
+        """Release Newton-owned GAS helper plans; repeated calls are safe."""
+
+        self.fcisolver.close()
+        return self
+
+    def reset(self, mol=None):
+        """Reset molecular data and drop GAS helper-plan caches."""
+
+        self.close()
+        result = super().reset(mol)
+        self.fcisolver.mol = self.mol
+        return result
+
+    def copy(self):
+        """Return a copy with independent Newton-owned GAS solver caches."""
+
+        result = super().copy()
+        result.fcisolver = self.fcisolver.copy()
+        result.fcisolver.mol = result.mol
+        return result
+
+    def newton(self):
+        """Return this already-Newton GASSCF object after validation."""
+
+        return self.validate_capabilities()
+
     def uniq_var_indices(self, nmo, ncore, ncas, frozen):
         """Return the independent orbital-rotation mask for GAS orbital optimization.
 
@@ -663,7 +718,17 @@ class GASSCF(newton_casscf.CASSCF):
         GASCI solver dispatch methods staged above.
         """
 
-        return super().kernel(mo_coeff, ci0, callback)
+        self.validate_capabilities()
+        mo = self.mo_coeff if mo_coeff is None else mo_coeff
+        if (mo is not None and self.ncas == mo.shape[1] and
+                not self.internal_rotation and not self.canonicalization):
+            e_tot, e_gas, ci = self._run_fixed_orbital_gasci(mo, ci0)
+            self.mo_energy = None
+            return e_tot, e_gas, ci, self.mo_coeff, self.mo_energy
+        try:
+            return super().kernel(mo_coeff, ci0, callback)
+        finally:
+            self.close()
 
     def mc1step(self, mo_coeff=None, ci0=None, callback=None):
         return self.kernel(mo_coeff, ci0, callback)
