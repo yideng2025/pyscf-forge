@@ -24,6 +24,8 @@ does not yet replace the native Newton/CIAH orbital-gradient machinery.
 """
 
 from pyscf import lib
+from pyscf.fci import addons as fci_addons
+from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import newton_casscf
@@ -38,9 +40,10 @@ def _unsupported(feature):
 class _GASFCISolver(fci_gas.FCISolver):
     """GASCI solver shell reserved for Newton GASSCF-owned caches.
 
-    At this stage the class only records the future cache policy.  Later
-    review blocks will add contraction, RDM and spin-plan lifecycle handling
-    here, while ordinary GASCI remains implemented by :mod:`fci_gas`.
+    At this stage the class records the future cache policy and supports safe
+    adaptation from ordinary :class:`fci_gas.FCISolver` objects.  Later review
+    blocks will add contraction, RDM and spin-plan lifecycle handling here,
+    while ordinary GASCI remains implemented by :mod:`fci_gas`.
     """
 
     _keys = set(fci_gas.FCISolver._keys) | {"cache_plans"}
@@ -52,6 +55,23 @@ class _GASFCISolver(fci_gas.FCISolver):
             mol, gas_orbs=gas_orbs, gas_restr=gas_restr,
             gas_restr_type=gas_restr_type, lib=lib)
         self.cache_plans = bool(cache_plans)
+        self._init_plan_cache()
+
+    def _init_plan_cache(self):
+        """Detach future Newton-owned helper plans from any source object.
+
+        The staged skeleton has no live helper plans yet.  This hook is kept
+        here so that explicit-solver adaptation and later plan-lifecycle code
+        share one ownership boundary: adapted or copied Newton solvers always
+        start with empty Newton-owned caches.
+        """
+
+        return None
+
+    def copy(self):
+        result = super().copy()
+        result._init_plan_cache()
+        return result
 
 
 def _new_gas_solver(mf, gas_orbs, gas_restr, gas_restr_type, cache_plans):
@@ -71,15 +91,48 @@ def _new_gas_solver(mf, gas_orbs, gas_restr, gas_restr_type, cache_plans):
         cache_plans=cache_plans)
 
 
-def _adapt_solver(fcisolver, cache_plans):
-    """Return a Newton-GASSCF solver shell for an explicit GASCI solver.
+def _decorated_solver_classes():
+    """Return native wrapper classes that should decorate GASSCF, not solver."""
 
-    Full solver adaptation will be added in the next review block.  Keeping the
-    guard here avoids silently accepting a solver whose cache ownership has not
-    been audited yet.
+    return tuple(cls for cls in (
+        getattr(addons, "StateAverageFCISolver", None),
+        getattr(addons, "StateAverageMixFCISolver", None),
+        getattr(addons, "StateSpecificFCISolver", None),
+        getattr(fci_addons, "SpinPenaltyFCISolver", None),
+    ) if cls is not None)
+
+
+def _adapt_solver(fcisolver, cache_plans):
+    """Return a Newton-GASSCF-owned shell for an explicit GASCI solver.
+
+    Scientific GASCI settings are copied from the input solver.  Newton-owned
+    helper plans are intentionally not borrowed.  Predecorated solvers are
+    rejected because state averaging, state specificity and spin penalty must
+    decorate the outer GASSCF object where orbital derivatives are visible.
     """
 
-    _unsupported("explicit fcisolver adaptation")
+    if isinstance(fcisolver, _decorated_solver_classes()):
+        _unsupported("predecorated solver input; decorate the GASSCF object")
+    if isinstance(fcisolver, _GASFCISolver):
+        solver = fcisolver.copy()
+    elif type(fcisolver) is fci_gas.FCISolver:
+        solver = lib.view(fcisolver, _GASFCISolver)
+        solver._init_plan_cache()
+    else:
+        _unsupported("external/non-GASCI solver adaptation")
+
+    if solver.gas_orbs is None:
+        raise ValueError("explicit GASCI solver must define gas_orbs")
+    solver.gas_orbs = tuple(int(value) for value in solver.gas_orbs)
+    if any(value <= 0 for value in solver.gas_orbs):
+        raise ValueError("explicit GASCI solver gas_orbs entries must be positive")
+    if solver.gas_restr_type is None:
+        solver.gas_restr_type = addons_gas.GAS_RESTR_SPIN_SUPERGROUP
+    if cache_plans is None:
+        solver.cache_plans = bool(getattr(fcisolver, "cache_plans", True))
+    else:
+        solver.cache_plans = bool(cache_plans)
+    return solver
 
 
 class GASSCF(newton_casscf.CASSCF):
@@ -121,6 +174,11 @@ class GASSCF(newton_casscf.CASSCF):
             solver = _new_gas_solver(
                 mf, gas_orbs, gas_restr, gas_restr_type, cache_plans)
         else:
+            if (gas_orbs is not None or gas_restr is not None or
+                    gas_restr_type is not None):
+                raise ValueError(
+                    "gas_orbs, gas_restr and gas_restr_type are supplied "
+                    "by the explicit fcisolver")
             solver = _adapt_solver(fcisolver, cache_plans)
 
         super().__init__(

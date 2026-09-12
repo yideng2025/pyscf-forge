@@ -22,6 +22,7 @@ import unittest
 
 from pyscf import gto
 from pyscf import scf
+from pyscf.fci import direct_spin1
 from pyscf.mcscf import addons_gas
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import newton_gasscf
@@ -62,6 +63,75 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(
             mc.gas_restr_type, addons_gas.GAS_RESTR_SPIN_SUPERGROUP)
         self.assertFalse(mc.cache_plans)
+
+    def test_explicit_gasci_solver_is_adapted_by_copy(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        solver = fci_gas.FCISolver(
+            mol, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ")
+        solver.nroots = 2
+        solver.spin = 0
+
+        mc = newton_gasscf.GASSCF(
+            mf, fcisolver=solver, nelecas=(1, 1), ncore=0,
+            cache_plans=False)
+
+        self.assertIsNot(mc.fcisolver, solver)
+        self.assertIsInstance(mc.fcisolver, fci_gas.FCISolver)
+        self.assertEqual(mc.ncas, 2)
+        self.assertEqual(mc.ngas, 2)
+        self.assertEqual(mc.fcisolver.gas_orbs, (1, 1))
+        self.assertEqual(mc.fcisolver.gas_restr, [[1, 1], [2, 2]])
+        self.assertEqual(mc.fcisolver.gas_restr_type, "cumulative-occ")
+        self.assertEqual(mc.fcisolver.nroots, 2)
+        self.assertEqual(mc.fcisolver.spin, 0)
+        self.assertFalse(mc.cache_plans)
+        self.assertFalse(hasattr(solver, "cache_plans"))
+
+    def test_explicit_newton_gas_solver_is_copied(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        source = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0,
+            cache_plans=False).fcisolver
+
+        mc = newton_gasscf.GASSCF(
+            mf, fcisolver=source, nelecas=(1, 1), ncore=0)
+
+        self.assertIsNot(mc.fcisolver, source)
+        self.assertEqual(mc.gas_orbs, (2,))
+        self.assertFalse(mc.cache_plans)
+        source.cache_plans = True
+        self.assertFalse(mc.cache_plans)
+
+    def test_explicit_solver_model_arguments_are_rejected(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        solver = fci_gas.FCISolver(mol, gas_orbs=(2,))
+
+        with self.assertRaisesRegex(ValueError, "explicit fcisolver"):
+            newton_gasscf.GASSCF(
+                mf, gas_orbs=(2,), fcisolver=solver,
+                nelecas=(1, 1), ncore=0)
+
+    def test_explicit_solver_requires_gas_orbs(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        solver = fci_gas.FCISolver(mol)
+
+        with self.assertRaisesRegex(ValueError, "explicit GASCI solver"):
+            newton_gasscf.GASSCF(
+                mf, fcisolver=solver, nelecas=(1, 1), ncore=0)
+
+    def test_rejects_external_fci_solver(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        solver = direct_spin1.FCISolver(mol)
+
+        with self.assertRaisesRegex(NotImplementedError, "external/non-GASCI"):
+            newton_gasscf.GASSCF(
+                mf, fcisolver=solver, nelecas=(1, 1), ncore=0)
 
     def test_requires_gas_orbs_without_explicit_solver(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
