@@ -207,6 +207,78 @@ class KnownValues(unittest.TestCase):
             newton_gasscf.GASSCF(
                 mf, fcisolver=solver, nelecas=(1, 1), ncore=0)
 
+    def test_owned_rdm_and_spin_plans_are_reused_and_closed(self):
+        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+
+        rdm_plan = solver._get_rdm_plan(2, (1, 1))
+        spin_plan = solver._get_spin_plan(2, (1, 1))
+
+        self.assertIs(rdm_plan, solver._get_rdm_plan(2, (1, 1)))
+        self.assertIs(spin_plan, solver._get_spin_plan(2, (1, 1)))
+        self.assertEqual(rdm_plan.ndet, spin_plan.ndet)
+        self.assertIsNotNone(solver._topology_key)
+
+        solver.close()
+        self.assertIsNone(rdm_plan._plan)
+        self.assertIsNone(rdm_plan.gas)
+        self.assertIsNone(solver._rdm_plan)
+        self.assertIsNone(solver._spin_plan)
+        self.assertIsNone(solver._topology_key)
+
+    def test_topology_change_invalidates_owned_plans(self):
+        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        old_plan = solver._get_rdm_plan(2, (1, 1))
+
+        solver.gas_orbs = (1, 1)
+        solver.gas_restr = [[1, 1], [2, 2]]
+        solver.gas_restr_type = "cumulative-occ"
+        new_plan = solver._get_rdm_plan(2, (1, 1))
+
+        self.assertIsNot(old_plan, new_plan)
+        self.assertIsNone(old_plan._plan)
+        self.assertIsNone(old_plan.gas)
+        solver.close()
+
+    def test_contract_plan_cache_reuses_and_evicts_plans(self):
+        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        eri0 = numpy.zeros((3, 3))
+        plan0 = solver._get_contract_plan(eri0, 2, (1, 1))
+        self.assertIs(plan0, solver._get_contract_plan(eri0.copy(), 2, (1, 1)))
+
+        ci = numpy.random.default_rng(5).normal(size=plan0.ndet)
+        numpy.testing.assert_allclose(
+            plan0.contract(ci), solver.contract_2e(eri0, ci, 2, (1, 1)),
+            atol=1e-12, rtol=0)
+
+        for scale in (1.0, 2.0, 3.0):
+            solver._get_contract_plan(
+                eri0 + numpy.eye(3) * scale, 2, (1, 1))
+        self.assertLessEqual(
+            len(solver._contract_plans), solver._MAX_CONTRACT_PLANS)
+        self.assertIsNone(plan0._plan)
+        solver.close()
+        self.assertEqual(len(solver._contract_plans), 0)
+        self.assertIsNone(solver._contract_space)
+
+    def test_copy_detaches_owned_plan_caches(self):
+        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        rdm_plan = solver._get_rdm_plan(2, (1, 1))
+        solver._get_spin_plan(2, (1, 1))
+        solver._get_contract_plan(numpy.zeros((3, 3)), 2, (1, 1))
+
+        copied = solver.copy()
+
+        self.assertIsNone(copied._topology_key)
+        self.assertIsNone(copied._rdm_plan)
+        self.assertIsNone(copied._spin_plan)
+        self.assertIsNone(copied._contract_space)
+        self.assertEqual(len(copied._contract_plans), 0)
+        self.assertIsNot(copied._contract_plans, solver._contract_plans)
+        self.assertIsNotNone(rdm_plan._plan)
+
+        copied.close()
+        solver.close()
+
     def test_requires_gas_orbs_without_explicit_solver(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)

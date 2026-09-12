@@ -18,10 +18,14 @@
 
 """PySCF-style generalized active-space self-consistent field.
 
-This module is introduced in small reviewable stages.  The current stage only
-provides the public object skeleton and GASCI solver ownership convention.  It
-does not yet replace the native Newton/CIAH orbital-gradient machinery.
+This module is introduced in small reviewable stages.  Current commits define
+object construction, explicit GASCI solver adaptation, GAS orbital-rotation
+masks and Newton-owned GAS helper plan lifetimes.  The native Newton/CIAH
+derivative adapter is added separately.
 """
+
+from collections import OrderedDict
+import hashlib
 
 import numpy
 
@@ -40,15 +44,16 @@ def _unsupported(feature):
 
 
 class _GASFCISolver(fci_gas.FCISolver):
-    """GASCI solver shell reserved for Newton GASSCF-owned caches.
+    """GASCI solver shell with Newton GASSCF-owned helper plans.
 
-    At this stage the class records the future cache policy and supports safe
-    adaptation from ordinary :class:`fci_gas.FCISolver` objects.  Later review
-    blocks will add contraction, RDM and spin-plan lifecycle handling here,
-    while ordinary GASCI remains implemented by :mod:`fci_gas`.
+    Ordinary GASCI remains implemented by :mod:`fci_gas`.  This subclass owns
+    only reusable helper plans needed by the staged Newton orbital optimizer.
+    Adapted or copied solvers always start with empty caches, so C workspaces
+    are never borrowed across solver objects.
     """
 
     _keys = set(fci_gas.FCISolver._keys) | {"cache_plans"}
+    _MAX_CONTRACT_PLANS = 3
 
     def __init__(self, mol=None, gas_orbs=None, gas_restr=None,
                  gas_restr_type=addons_gas.GAS_RESTR_SPIN_SUPERGROUP,
@@ -60,15 +65,98 @@ class _GASFCISolver(fci_gas.FCISolver):
         self._init_plan_cache()
 
     def _init_plan_cache(self):
-        """Detach future Newton-owned helper plans from any source object.
+        """Detach Newton-owned helper plans without closing borrowed objects.
 
-        The staged skeleton has no live helper plans yet.  This hook is kept
-        here so that explicit-solver adaptation and later plan-lifecycle code
-        share one ownership boundary: adapted or copied Newton solvers always
-        start with empty Newton-owned caches.
+        This method is used immediately after shallow adaptation or copy.  It
+        must not close anything because the copied attributes may still belong
+        to the source solver.  Live resources are released by :meth:`close`.
         """
 
-        return None
+        self._topology_key = None
+        self._contract_space = None
+        self._contract_plans = OrderedDict()
+        self._rdm_plan = None
+        self._spin_plan = None
+
+    def _space_key(self, norb, nelec):
+        """Return a normalized topology key for GAS helper-plan reuse."""
+
+        gas_orbs, nelec, blocks = self._space_spec(norb, nelec)
+        return (
+            tuple(int(value) for value in gas_orbs),
+            tuple(int(value) for value in nelec),
+            tuple(tuple(int(item) for item in row) for row in blocks),
+            id(self.lib),
+        )
+
+    def _ensure_topology(self, norb, nelec):
+        """Drop cached plans when the normalized GAS topology changes."""
+
+        key = self._space_key(norb, nelec)
+        if getattr(self, "_topology_key", None) != key:
+            self.close()
+            self._topology_key = key
+        return key
+
+    @staticmethod
+    def _contract_eri_key(eri):
+        array = numpy.ascontiguousarray(eri, dtype=numpy.float64)
+        digest = hashlib.sha256(array.view(numpy.uint8)).digest()
+        return array, (tuple(int(value) for value in array.shape), digest)
+
+    def _get_contract_plan(self, eri, norb, nelec):
+        """Return a Newton-owned Hamiltonian contraction plan for one ERI."""
+
+        self._ensure_topology(norb, nelec)
+        if self._contract_space is None:
+            self._contract_space = self.make_space(
+                norb, nelec, compress_links=True)
+        eri, key = self._contract_eri_key(eri)
+        plan = self._contract_plans.pop(key, None)
+        if plan is None:
+            if len(self._contract_plans) >= self._MAX_CONTRACT_PLANS:
+                _, evicted = self._contract_plans.popitem(last=False)
+                evicted.close()
+            plan = fci_gas.GasContractPlan(self._contract_space, eri.copy())
+            plan.eri.flags.writeable = False
+            plan.gos.flags.writeable = False
+        self._contract_plans[key] = plan
+        return plan
+
+    def _get_rdm_plan(self, norb, nelec):
+        """Return a Newton-owned raw-link GAS RDM plan."""
+
+        self._ensure_topology(norb, nelec)
+        if self._rdm_plan is None:
+            self._rdm_plan = self.make_rdm_plan(norb, nelec)
+        return self._rdm_plan
+
+    def _get_spin_plan(self, norb, nelec):
+        """Return a Newton-owned independent ``S^2`` contraction plan."""
+
+        self._ensure_topology(norb, nelec)
+        if self._spin_plan is None:
+            self._spin_plan = self.make_spin_plan(norb, nelec)
+        return self._spin_plan
+
+    def close(self):
+        """Release Newton-owned helper plans; repeated calls are safe."""
+
+        contract_plans = getattr(self, "_contract_plans", None)
+        if contract_plans is not None:
+            for plan in list(contract_plans.values()):
+                plan.close()
+            contract_plans.clear()
+        contract_space = getattr(self, "_contract_space", None)
+        if contract_space is not None:
+            contract_space.close()
+            self._contract_space = None
+        rdm_plan = getattr(self, "_rdm_plan", None)
+        if rdm_plan is not None:
+            rdm_plan.close()
+            self._rdm_plan = None
+        self._spin_plan = None
+        self._topology_key = None
 
     def copy(self):
         result = super().copy()
