@@ -796,6 +796,48 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
         self.assertIsNone(mo_energy)
 
+
+    def test_as_scanner_runs_energy_scan_with_fixed_gas_model(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+        mc.max_cycle_macro = 1
+        mc.max_cycle_micro = 1
+        mc.conv_tol = 1e-8
+        mc.conv_tol_grad = 1e-4
+        mc.canonicalization = False
+        mc.kernel(mf.mo_coeff)
+
+        scanner = mc.as_scanner()
+        energy = scanner("H 0 0 0; H 0 0 0.92; H 0 0 2.2; H 0 0 3.1")
+
+        self.assertTrue(numpy.isfinite(energy))
+        self.assertTrue(scanner.scan_info["native_converged"] in (True, False))
+        self.assertEqual(scanner.scan_info["problem"]["gas_orbs"], (1, 1))
+        self.assertEqual(scanner.scan_info["problem"]["nroots"], 1)
+        self.assertIn("GASSCF", scanner.__class__.__name__)
+        self.assertIs(scanner.as_scanner(), scanner)
+
+    def test_as_scanner_rejects_changed_system_model(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+        scanner = mc.as_scanner()
+        changed = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2",
+            basis="sto-3g", spin=1, verbose=0)
+
+        with self.assertRaisesRegex(ValueError, "same atoms"):
+            scanner(changed)
+
     def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)

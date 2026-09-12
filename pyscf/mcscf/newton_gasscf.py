@@ -24,14 +24,16 @@ masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
 those plans, GASCI-like object-level wrappers, a fixed-orbital GASCI bridge,
 and a minimal native Newton/CIAH driver bridge.  Current validation also
 guards unsupported staged feature combinations, kernel lifetimes and
-ordinary state-average wrappers and GAS-safe canonicalization.
+ordinary state-average wrappers, GAS-safe canonicalization and energy scanner support.
 """
 
 from collections import OrderedDict
 import hashlib
+import json
 
 import numpy
 
+from pyscf import gto
 from pyscf import lib
 from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
@@ -371,6 +373,194 @@ def _adapt_solver(fcisolver, cache_plans):
     else:
         solver.cache_plans = bool(cache_plans)
     return solver
+
+
+def _digest(value):
+    """Return a stable digest for small JSON-like scanner invariants."""
+
+    payload = json.dumps(
+        value, sort_keys=True, default=lambda item: numpy.asarray(item).tolist(),
+        allow_nan=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _system_signature(mol):
+    """Return molecular invariants that an energy scanner must preserve."""
+
+    return (
+        tuple(mol.atom_symbol(i) for i in range(mol.natm)),
+        int(mol.charge), int(mol.spin), bool(mol.cart),
+        _digest(mol._basis), _digest(mol._ecp), int(mol.nao_nr()),
+    )
+
+
+def _problem_signature(mc):
+    """Return GAS/Newton invariants that must remain fixed during scans."""
+
+    gas_orbs, nelec, blocks = mc.fcisolver._space_spec(mc.ncas, mc.nelecas)
+    limits = addons_gas.check_kernel_limits(gas_orbs, nelec, blocks)
+    return {
+        "ncore": int(mc.ncore),
+        "ncas": int(mc.ncas),
+        "nelec": tuple(int(value) for value in nelec),
+        "gas_orbs": tuple(int(value) for value in gas_orbs),
+        "spin_supergroups": _digest(numpy.asarray(blocks).tolist()),
+        "ndet": int(limits["ndet_estimate"]),
+        "nroots": int(getattr(mc.fcisolver, "nroots", 1)),
+        "weights": tuple(float(value) for value in getattr(mc, "weights", (1.0,))),
+        "frozen": _digest(mc.frozen),
+    }
+
+
+def _copy_ci(ci, signature):
+    """Copy and validate a scanner CI guess against the GAS model."""
+
+    if ci is None:
+        return None
+    nroots = int(signature["nroots"])
+    ndet = int(signature["ndet"])
+    if nroots == 1:
+        values = list(ci) if isinstance(ci, (list, tuple)) else [ci]
+    elif isinstance(ci, (list, tuple)):
+        values = list(ci)
+    else:
+        array = numpy.asarray(ci)
+        if array.shape == (nroots, ndet):
+            values = list(array)
+        elif array.shape == (ndet, nroots):
+            values = list(array.T)
+        else:
+            raise ValueError("scanner CI must contain one vector per GAS root")
+    if len(values) != nroots:
+        raise ValueError("scanner CI root count does not match the GAS model")
+
+    roots = []
+    for value in values:
+        array = numpy.asarray(value)
+        if numpy.iscomplexobj(array):
+            raise NotImplementedError("complex scanner CI coefficients")
+        array = numpy.asarray(array, dtype=float).reshape(-1)
+        norm = numpy.linalg.norm(array)
+        if array.size != ndet or not numpy.all(numpy.isfinite(array)) or norm < 1e-14:
+            raise ValueError(
+                "scanner CI has invalid GAS length, norm or coefficients")
+        roots.append(numpy.array(array, copy=True))
+    return roots[0] if nroots == 1 else roots
+
+
+def _orbital_groups(mc):
+    """Return projection priority groups that preserve GAS subspace ordering."""
+
+    groups = []
+    start = int(mc.ncore)
+    for size in mc.fcisolver._space_spec(mc.ncas, mc.nelecas)[0]:
+        stop = start + int(size)
+        groups.append(list(range(start, stop)))
+        start = stop
+    if mc.ncore:
+        groups.append(list(range(int(mc.ncore))))
+    return groups
+
+
+def _as_scanner(mc):
+    """Return an energy-only scanner with fixed GAS/Newton objective metadata."""
+
+    if isinstance(mc, lib.SinglePointScanner):
+        return mc
+    mc.validate_capabilities()
+    source = mc.copy()
+    source._scf = mc._scf.copy()
+    source.mo_coeff = None if mc.mo_coeff is None else numpy.array(
+        mc.mo_coeff, copy=True)
+    source.ci = _copy_ci(mc.ci, _problem_signature(mc))
+    return lib.set_class(
+        _GASSCFScanner(source), (_GASSCFScanner, source.__class__),
+        source.__class__.__name__ + "Scanner")
+
+
+class _GASSCFScanner(lib.SinglePointScanner):
+    """Energy scanner for a fixed GASSCF objective and atom/basis model."""
+
+    _keys = {"scan_info", "_scan_problem", "_scan_system"}
+
+    def __init__(self, mc):
+        self.__dict__.update(mc.__dict__)
+        self._scf = mc._scf.as_scanner()
+        self._scan_problem = _problem_signature(mc)
+        self._scan_system = _system_signature(mc.mol)
+        self.scan_info = None
+
+    def __call__(self, mol_or_geom, mo_coeff=None, ci0=None):
+        if isinstance(mol_or_geom, gto.MoleBase):
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+        if _system_signature(mol) != self._scan_system:
+            raise ValueError(
+                "energy scanner requires the same atoms/order, charge, spin, "
+                "basis/ECP and AO size")
+
+        self.validate_capabilities()
+        signature = _problem_signature(self)
+        if signature != self._scan_problem:
+            raise ValueError(
+                "GAS definition, roots, weights or frozen orbitals changed; "
+                "create a new scanner")
+
+        old_mol = self.mol
+        previous_mo = None if self.mo_coeff is None else numpy.array(
+            self.mo_coeff, copy=True)
+        guess_ci = _copy_ci(self.ci if ci0 is None else ci0, signature)
+
+        self.reset(mol)
+        self._scf(mol)
+        self.mol = mol
+        self.validate_capabilities()
+
+        if mo_coeff is not None:
+            guess_mo = numpy.asarray(mo_coeff)
+            mo_source = "explicit MO in current AO basis"
+        elif previous_mo is None:
+            guess_mo = numpy.asarray(self._scf.mo_coeff)
+            mo_source = "SCF MO guess"
+        else:
+            guess_mo = addons.project_init_guess(
+                self, previous_mo, prev_mol=old_mol,
+                priority=_orbital_groups(self), use_hf_core=False)
+            mo_source = "projected previous GASSCF MO by GAS blocks"
+
+        guess_mo = numpy.asarray(guess_mo)
+        if (guess_mo.ndim != 2 or numpy.iscomplexobj(guess_mo) or
+                not numpy.all(numpy.isfinite(guess_mo))):
+            raise ValueError("scanner MO guess must be a finite real matrix")
+        if guess_mo.shape[0] != mol.nao_nr() or guess_mo.shape[1] < self.ncore + self.ncas:
+            raise ValueError("scanner MO guess has an incompatible shape")
+        overlap = self._scf.get_ovlp()
+        metric = guess_mo.T.dot(overlap).dot(guess_mo)
+        error = float(numpy.max(numpy.abs(metric - numpy.eye(guess_mo.shape[1]))))
+        if error > 1e-7:
+            raise ValueError(
+                "scanner initial MO is not orthonormal in the new AO metric: "
+                "%.6g" % error)
+
+        self.scan_info = {
+            "MO_source": mo_source,
+            "CI_source": "explicit" if ci0 is not None else (
+                "previous GAS CI guess" if guess_ci is not None else
+                "native initial guess"),
+            "initial_MO_metric_error": error,
+            "problem": signature,
+            "projection_groups": _orbital_groups(self),
+            "native_converged": None,
+            "scope": "Energy only; root order follows macro GASCI.",
+        }
+        energy = self.kernel(numpy.array(guess_mo, copy=True), guess_ci)[0]
+        self.scan_info.update(
+            native_converged=bool(self.converged),
+            energy=float(energy),
+            e_states=numpy.atleast_1d(getattr(self, "e_states", energy)).tolist(),
+        )
+        return energy
 
 
 class _StateAverageGASSCF(addons.StateAverageMCSCF):
@@ -835,6 +1025,12 @@ class GASSCF(newton_casscf.CASSCF):
         _unsupported("state-average-mix Newton GASSCF")
 
     state_average_mix_ = state_average_mix
+
+
+    def as_scanner(self):
+        """Return an energy-only scanner for a fixed Newton GASSCF objective."""
+
+        return _as_scanner(self)
 
     def state_specific_(self, *args, **kwargs):
         _unsupported("state-specific Newton GASSCF")
