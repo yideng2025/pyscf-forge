@@ -584,6 +584,33 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(e_tot, ref_e_tot, places=7)
         self.assertAlmostEqual(e_gas, ref_e_cas, places=7)
 
+    def test_full_kernel_restricted_gas_smoke(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+        mc.max_cycle_macro = 1
+        mc.max_cycle_micro = 1
+        mc.conv_tol = 1e-8
+        mc.conv_tol_grad = 1e-4
+        mc.canonicalization = False
+
+        mask = mc.uniq_var_indices(
+            mf.mo_coeff.shape[1], mc.ncore, mc.ncas, mc.frozen)
+        self.assertTrue(mask[mc.ncore + 1, mc.ncore])
+
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
+        ndet = mc.fcisolver.space_info(mc.ncas, mc.nelecas)["ndet_estimate"]
+
+        self.assertTrue(numpy.isfinite(e_tot))
+        self.assertTrue(numpy.isfinite(e_gas))
+        self.assertEqual(numpy.asarray(ci).size, ndet)
+        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
+        self.assertIsNone(mo_energy)
+
     def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
