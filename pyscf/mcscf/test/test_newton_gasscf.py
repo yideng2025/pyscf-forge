@@ -25,6 +25,7 @@ import numpy
 from pyscf import gto
 from pyscf import scf
 from pyscf.fci import direct_spin1
+from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
@@ -671,6 +672,65 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(e_tot, ref_e_tot, places=11)
         self.assertAlmostEqual(e_gas, ref_e_gas, places=11)
         self.assertEqual(numpy.asarray(ci).shape, numpy.asarray(ref_ci).shape)
+        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
+        self.assertIsNone(mo_energy)
+
+    def test_state_average_constructs_zero_weight_roots_and_undoes(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
+
+        sa = mc.state_average((1.0, 0.0))
+
+        self.assertIsInstance(sa, addons.StateAverageMCSCF)
+        self.assertIsInstance(sa, newton_gasscf.GASSCF)
+        numpy.testing.assert_allclose(sa.weights, (1.0, 0.0), atol=0, rtol=0)
+        self.assertEqual(sa.fcisolver.nroots, 2)
+        self.assertEqual(sa.gas_orbs, (2,))
+        self.assertIs(sa.validate_capabilities(), sa)
+
+        undone = sa.undo_state_average()
+        self.assertIsInstance(undone, newton_gasscf.GASSCF)
+        self.assertNotIsInstance(undone, addons.StateAverageMCSCF)
+        self.assertEqual(undone.fcisolver.nroots, 1)
+        self.assertIs(undone.validate_capabilities(), undone)
+
+    def test_state_average_rejects_invalid_weights_and_wfnsym(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+
+        for weights in ((1.0,), (0.7, 0.4), (1.1, -0.1), (float("nan"), 1.0)):
+            with self.subTest(weights=weights):
+                with self.assertRaisesRegex(ValueError, "weights"):
+                    mc.state_average(weights)
+        with self.assertRaisesRegex(NotImplementedError, "wfnsym"):
+            mc.state_average((0.5, 0.5), wfnsym=0)
+
+    def test_state_average_kernel_gas_as_cas_smoke(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
+        mc = mc.state_average((1.0, 0.0))
+        mc.max_cycle_macro = 1
+        mc.max_cycle_micro = 1
+        mc.conv_tol = 1e-8
+        mc.conv_tol_grad = 1e-4
+        mc.canonicalization = False
+
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
+
+        self.assertTrue(numpy.isfinite(e_tot))
+        self.assertTrue(numpy.isfinite(e_gas))
+        self.assertEqual(len(ci), 2)
+        self.assertEqual(len(mc.e_states), 2)
         self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
         self.assertIsNone(mo_energy)
 

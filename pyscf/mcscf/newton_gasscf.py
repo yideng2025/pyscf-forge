@@ -23,7 +23,8 @@ object construction, explicit GASCI solver adaptation, GAS orbital-rotation
 masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
 those plans, GASCI-like object-level wrappers, a fixed-orbital GASCI bridge,
 and a minimal native Newton/CIAH driver bridge.  Current validation also
-guards unsupported staged feature combinations and kernel lifetimes.
+guards unsupported staged feature combinations, kernel lifetimes and
+ordinary state-average wrappers.
 """
 
 from collections import OrderedDict
@@ -149,6 +150,28 @@ class _GASFCISolver(fci_gas.FCISolver):
         if self._spin_plan is None:
             self._spin_plan = self.make_spin_plan(norb, nelec)
         return self._spin_plan
+
+    def spin_square(self, ci, norb, nelec, *args, **kwargs):
+        """Return ``(<S^2>, 2S+1)`` without re-entering SA RDM wrappers.
+
+        PySCF's dynamic state-average solver calls the base solver's
+        ``spin_square`` through ``super(StateAverageFCISolver, self)`` while
+        ``self`` is still the decorated state-average object.  The GASCI base
+        implementation computes spin from ``self.make_rdm12s``; on a decorated
+        object that name resolves back to the state-average wrapper and can
+        incorrectly split a single GAS CI vector into scalar elements.  Build
+        the spin-resolved RDMs directly from a Newton-owned GAS RDM plan here.
+        """
+
+        ci = self._as_state_specific_ci(ci)
+        nelec = fci_addons._unpack_nelec(nelec, self.spin)
+        if self.cache_plans:
+            rdm1s, rdm2s = self._get_rdm_plan(norb, nelec).make_rdm12s(ci, ci)
+        else:
+            with self.make_rdm_plan(norb, nelec) as plan:
+                rdm1s, rdm2s = plan.make_rdm12s(ci, ci)
+        return fci_gas.spin_square_from_rdm12s(rdm1s, rdm2s, nelec)
+
 
     def close(self):
         """Release Newton-owned helper plans; repeated calls are safe."""
@@ -350,6 +373,18 @@ def _adapt_solver(fcisolver, cache_plans):
     return solver
 
 
+class _StateAverageGASSCF(addons.StateAverageMCSCF):
+    """State-average marker with GAS-specific undo/cache cleanup."""
+
+    def undo_state_average(self):
+        self.close()
+        result = super().undo_state_average()
+        result.fcisolver.nroots = 1
+        result.fcisolver._init_plan_cache()
+        result.fcisolver.mol = result.mol
+        return result
+
+
 class GASSCF(newton_casscf.CASSCF):
     """Joint Newton orbital optimizer for a determinant GASCI active space.
 
@@ -408,19 +443,29 @@ class GASSCF(newton_casscf.CASSCF):
         guard makes unsupported combinations fail before entering the native
         CASSCF driver and sets the native ``internal_rotation`` flag whenever
         active-active inter-GAS rotations are part of the orbital variables.
+        Ordinary state averaging is supported only when both the outer MCSCF
+        object and the inner GASCI solver carry PySCF's matching SA wrappers.
         """
 
         if not isinstance(self.fcisolver, _GASFCISolver):
             _unsupported("non-adapted GASCI solver")
-        if isinstance(self, addons.StateAverageMCSCF):
-            _unsupported("state-average Newton GASSCF")
         if isinstance(self.fcisolver, addons.StateAverageMixFCISolver):
             _unsupported("state-average-mix GASCI solver")
         if isinstance(self.fcisolver, addons.StateSpecificFCISolver):
             _unsupported("state-specific GASCI solver wrapper")
-        if int(getattr(self.fcisolver, "nroots", 1)) != 1:
+
+        is_sa_mc = isinstance(self, addons.StateAverageMCSCF)
+        is_sa_solver = isinstance(self.fcisolver, addons.StateAverageFCISolver)
+        if is_sa_mc != is_sa_solver:
             raise ValueError(
-                "nroots>1 requires staged state_average support")
+                "state_average requires matching MCSCF and GASCI solver wrappers")
+        if is_sa_mc:
+            weights = self._validate_weights(self.weights)
+            if int(getattr(self.fcisolver, "nroots", 1)) != len(weights):
+                raise ValueError("nroots/weights mismatch")
+        elif int(getattr(self.fcisolver, "nroots", 1)) != 1:
+            raise ValueError(
+                "nroots>1 requires ordinary state_average support")
 
         gas_orbs, gas_restr = self._normalized_restriction()
         addons_gas.check_kernel_limits(
@@ -706,6 +751,56 @@ class GASSCF(newton_casscf.CASSCF):
                 "Use a state-specific solver or wait for staged state-average "
                 "support.")
         return e_tot, e_gas, ci
+
+    @staticmethod
+    def _validate_weights(weights):
+        """Return finite nonnegative state-average weights summing to one."""
+
+        weights = numpy.asarray(weights, dtype=float)
+        if weights.ndim != 1 or weights.size < 2:
+            raise ValueError("state_average requires at least two weights")
+        if (not numpy.all(numpy.isfinite(weights)) or
+                numpy.any(weights < 0) or
+                abs(float(numpy.sum(weights)) - 1.0) > 1e-10):
+            raise ValueError(
+                "weights must be finite, nonnegative and sum to one")
+        return tuple(float(value) for value in weights)
+
+    def state_average(self, weights=(.5, .5), wfnsym=None):
+        """Return an ordinary state-average Newton GASSCF object.
+
+        Zero-weight roots are retained exactly as requested, so they may still
+        contribute to the native CI-response path even though they do not enter
+        the scalar energy objective.  ``wfnsym`` and SA-mix are staged later.
+        """
+
+        if wfnsym is not None:
+            _unsupported("wfnsym")
+        weights = self._validate_weights(weights)
+        source = self.undo_state_average() if isinstance(
+            self, addons.StateAverageMCSCF) else self.copy()
+        source.validate_capabilities()
+        result = addons.state_average(source, weights, wfnsym=None)
+        result.__class__ = lib.replace_class(
+            result.__class__, addons.StateAverageMCSCF, _StateAverageGASSCF)
+        return result.validate_capabilities()
+
+    def state_average_(self, weights=(.5, .5), wfnsym=None):
+        result = self.state_average(weights, wfnsym)
+        self.close()
+        self.__class__ = result.__class__
+        self.__dict__ = result.__dict__
+        return self
+
+    def state_average_mix(self, *args, **kwargs):
+        _unsupported("state-average-mix Newton GASSCF")
+
+    state_average_mix_ = state_average_mix
+
+    def state_specific_(self, *args, **kwargs):
+        _unsupported("state-specific Newton GASSCF")
+
+    state_specific = state_specific_
 
     gen_g_hop = newton_casscf.gen_g_hop
 
