@@ -27,8 +27,9 @@ Supported GAS definitions follow :mod:`pyscf.mcscf.gasci`: ``gas_orbs``,
 ``gas_restr`` and ``gas_restr_type`` are normalized by the same GAS helper
 routines.  This module supports ordinary state averaging, including
 zero-weight roots, GAS-safe canonicalization of inactive/external orbitals,
-energy-only scanners and the GASCI-native spin-penalty Hamiltonian.  It does
-not implement state-average-mix, state-specific excited-state wrappers,
+density fitting through PySCF's ``mcscf.df`` machinery, energy-only scanners
+and the GASCI-native spin-penalty Hamiltonian.  It does not implement
+state-average-mix, state-specific excited-state wrappers,
 active-space natural-orbital rotations, analytic gradients/NACs or the
 legacy two-step CASSCF driver.
 """
@@ -46,11 +47,12 @@ from pyscf.lib import logger
 from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
+from pyscf.mcscf import df as mcdf
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
 from pyscf.mcscf import newton_casscf
 
-__all__ = ["GASSCF"]
+__all__ = ["GASSCF", "DFGASSCF"]
 
 
 def _unsupported(feature):
@@ -659,6 +661,29 @@ class _StateAverageGASSCF(addons.StateAverageMCSCF):
         result.fcisolver.nroots = 1
         result.fcisolver._init_plan_cache()
         result.fcisolver.mol = result.mol
+        return result
+
+
+class _DFGASSCF(mcdf._DFCASSCF):
+    """Density-fitting mixin with GAS-specific user-visible labels."""
+
+    __name_mixin__ = "DF"
+
+    def dump_flags(self, verbose=None):
+        super(mcdf._DFCAS, self).dump_flags(verbose)
+        logger.info(
+            self,
+            "DFGASSCF: density fitting for JK matrix and 2e integral "
+            "transformation")
+        return self
+
+    def undo_df(self):
+        self.close()
+        result = lib.view(self, lib.drop_class(self.__class__, _DFGASSCF))
+        try:
+            del result.with_df
+        except AttributeError:
+            pass
         return result
 
 
@@ -1329,6 +1354,22 @@ class GASSCF(newton_casscf.CASSCF):
             "method": getattr(self.fcisolver, "spin_penalty_method", None),
         }
 
+    def density_fit(self, auxbasis=None, with_df=None):
+        """Return a DF-GASSCF object using PySCF's CASSCF DF machinery.
+
+        Density fitting changes only integral/J-K construction.  The active
+        CI vector, GAS restrictions, GAS RDMs and spin-penalty bookkeeping
+        remain owned by the GASSCF/GASCI adapter.
+        """
+
+        result = mcdf.density_fit(self, auxbasis=auxbasis, with_df=with_df)
+        if isinstance(result, _DFGASSCF):
+            return result
+        if isinstance(result, mcdf._DFCASSCF):
+            result.__class__ = lib.replace_class(
+                result.__class__, mcdf._DFCASSCF, _DFGASSCF)
+        return result
+
 
     def as_scanner(self):
         """Return an energy-only scanner for a fixed GASSCF objective."""
@@ -1431,3 +1472,19 @@ class GASSCF(newton_casscf.CASSCF):
         """Alias for the inherited active-space energy slot."""
 
         return self.e_cas
+
+
+def DFGASSCF(mf, gas_orbs=None, gas_restr=None, *, nelecas,
+             gas_restr_type=None, ncore=None, frozen=None, fcisolver=None,
+             cache_plans=None, auxbasis=None, with_df=None):
+    """Create a density-fitted :class:`GASSCF` object.
+
+    This mirrors PySCF's ``DFCASCI/DFCASSCF`` construction style while keeping
+    the user-facing GAS interface identical to :class:`GASSCF`.
+    """
+
+    return GASSCF(
+        mf, gas_orbs=gas_orbs, gas_restr=gas_restr,
+        nelecas=nelecas, gas_restr_type=gas_restr_type, ncore=ncore,
+        frozen=frozen, fcisolver=fcisolver,
+        cache_plans=cache_plans).density_fit(auxbasis=auxbasis, with_df=with_df)

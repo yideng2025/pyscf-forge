@@ -31,6 +31,7 @@ from pyscf.fci import addons as fci_addons
 from pyscf.fci import direct_spin1
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
+from pyscf.mcscf import df as mcdf
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
 from pyscf.mcscf import newton_casscf
@@ -43,7 +44,8 @@ class KnownValues(unittest.TestCase):
         from pyscf.mcscf import gasscf as imported_gasscf
 
         self.assertIs(imported_gasscf.GASSCF, gasscf.GASSCF)
-        self.assertEqual(imported_gasscf.__all__, ["GASSCF"])
+        self.assertEqual(imported_gasscf.__all__, ["GASSCF", "DFGASSCF"])
+        self.assertIs(imported_gasscf.DFGASSCF, gasscf.DFGASSCF)
         self.assertEqual(gasscf.GASSCF.__module__, "pyscf.mcscf.gasscf")
 
     def test_log_filter_relabels_native_newton_output(self):
@@ -971,6 +973,54 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(report["target_s2"], 0.0)
         self.assertIn(report["method"], (
             "exact-small-space", "projected-plus-global-davidson"))
+
+    def test_density_fit_method_keeps_gas_labels_and_runs(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+        mc = mc.density_fit()
+        mc.max_cycle_macro = 1
+        mc.max_cycle_micro = 1
+        mc.conv_tol = 1e-8
+        mc.conv_tol_grad = 1e-4
+        mc.canonicalization = False
+
+        buf = io.StringIO()
+        mc.stdout = buf
+        mc.verbose = 4
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
+        out = buf.getvalue()
+
+        self.assertIsInstance(mc, gasscf.GASSCF)
+        self.assertIsInstance(mc, mcdf._DFCAS)
+        self.assertTrue(hasattr(mc, "with_df"))
+        self.assertIn("DFGASSCF", out)
+        self.assertNotIn("DFCASSCF", out)
+        self.assertNotIn("DFCASCI", out)
+        self.assertTrue(numpy.isfinite(e_tot))
+        self.assertTrue(numpy.isfinite(e_gas))
+        self.assertEqual(numpy.asarray(ci).ndim, 1)
+        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
+        self.assertIsNone(mo_energy)
+
+    def test_dfgasscf_factory_reuses_density_fit_scf_object(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).density_fit().run()
+        mc = gasscf.DFGASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
+
+        self.assertIsInstance(mc, gasscf.GASSCF)
+        self.assertIsInstance(mc, mcdf._DFCAS)
+        self.assertIs(mc.with_df, mf.with_df)
+        self.assertEqual(mc.gas_orbs, (2,))
+        self.assertIs(mc.validate_capabilities(), mc)
+        self.assertIsInstance(mc.undo_df(), gasscf.GASSCF)
 
     def test_as_scanner_runs_energy_scan_with_fixed_gas_model(self):
         mol = gto.M(
