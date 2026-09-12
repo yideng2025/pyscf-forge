@@ -20,6 +20,7 @@
 
 import io
 import unittest
+from unittest import mock
 
 import numpy
 
@@ -375,6 +376,68 @@ class TestGASFCISolver(unittest.TestCase):
                     embedded_sc = fci_gas.gas2fci(gas_sc, gas)
                     numpy.testing.assert_allclose(
                         embedded_sc, fci_sc, atol=1e-12, rtol=0)
+
+    def test_spin_plan_outlives_temporary_space(self):
+        solver = fci_gas.FCISolver(
+            gas_orbs=(2, 2),
+            gas_restr=[[1, 3], [4, 4]],
+            gas_restr_type="cumulative-occ")
+
+        spaces = []
+        original_make_space = solver.make_space
+
+        def make_space(*args, **kwargs):
+            space = original_make_space(*args, **kwargs)
+            spaces.append(space)
+            return space
+
+        with mock.patch.object(solver, "make_space", side_effect=make_space):
+            plan = solver.make_spin_plan(self.norb, self.nelec)
+
+        self.assertEqual(len(spaces), 1)
+        self.assertIsNone(spaces[0]._gas)
+
+        rng = numpy.random.default_rng(73)
+        ci = rng.normal(size=plan.ndet)
+        ci /= numpy.linalg.norm(ci)
+
+        planned = plan.contract(ci)
+        one_shot = solver.contract_ss(ci, self.norb, self.nelec)
+        numpy.testing.assert_allclose(planned, one_shot, atol=1e-13, rtol=0)
+
+        first = plan.contract(ci)
+        second = plan.contract(ci)
+        self.assertFalse(numpy.shares_memory(first, second))
+
+        diag = plan.diagonal_vector()
+        diag[:] = 999
+        self.assertFalse(numpy.any(plan.diagonal_vector() == 999))
+
+    def test_spin_plan_exception_closes_temporary_space(self):
+        solver = fci_gas.FCISolver(gas_orbs=(2,))
+        space = solver.make_space(2, (1, 1))
+        try:
+            self.assertIsNotNone(space._gas)
+            with mock.patch.object(solver, "make_space", return_value=space):
+                with mock.patch.object(
+                        fci_gas, "_GasSpinPlan",
+                        side_effect=RuntimeError("injected")):
+                    with self.assertRaisesRegex(RuntimeError, "injected"):
+                        solver.make_spin_plan(2, (1, 1))
+            self.assertIsNone(space._gas)
+        finally:
+            space.close()
+
+    def test_spin_plan_rejects_incomplete_space(self):
+        solver = fci_gas.FCISolver(
+            gas_orbs=(1, 1),
+            gas_restr=[[1, 0, 0, 1]])
+
+        with self.assertRaisesRegex(ValueError, "spin-complete"):
+            solver.make_spin_plan(2, (1, 1))
+
+        self.assertAlmostEqual(
+            solver.spin_square(numpy.ones(1), 2, (1, 1))[0], 1.0)
 
     def test_gas_as_cas_rdms(self):
         solver = fci_gas.FCISolver()

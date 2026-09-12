@@ -796,6 +796,26 @@ class FCISolver(direct_spin1.FCISolver):
 
         return GasRDMPlan(self, norb, nelec)
 
+    def make_spin_plan(self, norb, nelec):
+        """Construct an independent reusable ``S^2`` contraction plan.
+
+        GASCI normalizes the restriction and checks spin completeness.
+        The returned plan owns Python descriptors and NumPy link maps, with
+        no C pointers into the temporary raw-link space. ``contract(ci)``
+        and ``diagonal_vector()`` return new arrays. No close is required.
+
+        This closure requirement does not apply to ordinary GASCI or to
+        an ``S^2`` expectation value evaluated from RDMs. Internal solver
+        paths that already own a space may construct their plan directly.
+        """
+
+        gas_orbs, nelec, blocks = self._space_spec(norb, nelec)
+        if not addons_gas.is_spin_complete(gas_orbs, nelec, blocks):
+            raise ValueError(
+                "make_spin_plan requires a spin-complete GAS restriction")
+        with self.make_space(norb, nelec, compress_links=False) as gas:
+            return _GasSpinPlan(gas)
+
     def get_init_guess(self, norb, nelec, nroots, hdiag, gas=None):
         """Build PySCF-style determinant guesses in the GAS vector layout."""
 
