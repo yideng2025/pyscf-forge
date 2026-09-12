@@ -20,9 +20,9 @@
 
 This module is introduced in small reviewable stages.  Current commits define
 object construction, explicit GASCI solver adaptation, GAS orbital-rotation
-masks, Newton-owned GAS helper plan lifetimes, and public solver dispatch
-through those plans.  The native Newton/CIAH derivative adapter is added
-separately.
+masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
+those plans, and GASCI-like object-level wrappers.  The native Newton/CIAH
+derivative adapter is added separately.
 """
 
 from collections import OrderedDict
@@ -402,6 +402,163 @@ class GASSCF(newton_casscf.CASSCF):
                 frozen = numpy.asarray(frozen)
                 mask[frozen] = mask[:, frozen] = False
         return mask
+
+    def _effective_nelecas(self, nelecas=None):
+        """Return active alpha/beta counts after applying ``fcisolver.spin``."""
+
+        if nelecas is None:
+            nelecas = self.nelecas
+        return fci_addons._unpack_nelec(nelecas, self.fcisolver.spin)
+
+    def _normalized_restriction(self, return_info=False):
+        """Return the normalized GAS definition used by GASCI kernels."""
+
+        gas_orbs = tuple(int(value) for value in self.gas_orbs)
+        return addons_gas.normalize_gas_spec(
+            gas_orbs, self._effective_nelecas(),
+            self.gas_restr, self.gas_restr_type,
+            return_info=return_info)
+
+    def gas_space_info(self):
+        """Return normalized GAS metadata and compact C-space information."""
+
+        gas_orbs, blocks, info = self._normalized_restriction(return_info=True)
+        restriction_type = self.gas_restr_type
+        if self.gas_restr is None:
+            restriction = None
+        elif restriction_type == addons_gas.GAS_RESTR_SPIN_SUPERGROUP:
+            restriction = numpy.array(
+                info["canonical_spin_supergroups"], copy=True)
+        elif restriction_type == addons_gas.GAS_RESTR_SUPERGROUP:
+            restriction = numpy.array(info["canonical_supergroups"], copy=True)
+        elif restriction_type == addons_gas.GAS_RESTR_CUMULATIVE_OCC:
+            restriction = numpy.array(info["cumulative_bounds"], copy=True)
+        elif restriction_type == addons_gas.GAS_RESTR_RAS:
+            restriction = {
+                "max_holes": int(info["max_holes"]),
+                "max_particles": int(info["max_particles"]),
+            }
+        else:  # normalize_gas_spec rejects this before reaching this branch.
+            raise RuntimeError("unrecognized normalized GAS restriction type")
+
+        with fci_gas.GasSpace(
+                gas_orbs, self._effective_nelecas(), blocks,
+                lib=self.fcisolver.lib) as space:
+            core = space.core_info()
+        return {
+            "metadata": {
+                "gas_orbs": tuple(int(value) for value in self.gas_orbs),
+                "gas_restr_type": restriction_type,
+                "gas_restr": restriction,
+                "kernel_gas_orbs": tuple(int(value) for value in gas_orbs),
+                "spin_supergroups": numpy.array(blocks, copy=True),
+            },
+            "core": core,
+        }
+
+    def _ci_for_active_property(self, ci=None):
+        ci = self.ci if ci is None else ci
+        if ci is None:
+            raise ValueError("CI vector is not available")
+        if isinstance(ci, (list, tuple)):
+            _unsupported("state-averaged GAS density wrappers")
+        return ci
+
+    def make_gasdm1s(self, ci=None, ncas=None, nelecas=None):
+        """Return alpha and beta active-space GAS one-particle DMs."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        return self.fcisolver.make_rdm1s(
+            self._ci_for_active_property(ci), ncas, nelecas)
+
+    def make_gasdm1(self, ci=None, ncas=None, nelecas=None):
+        """Return the spin-summed active-space GAS one-particle DM."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        return self.fcisolver.make_rdm1(
+            self._ci_for_active_property(ci), ncas, nelecas)
+
+    def make_gasdm12s(self, ci=None, ncas=None, nelecas=None):
+        """Return spin-resolved active-space GAS 1- and 2-particle DMs."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        return self.fcisolver.make_rdm12s(
+            self._ci_for_active_property(ci), ncas, nelecas)
+
+    def make_gasdm12(self, ci=None, ncas=None, nelecas=None):
+        """Return spin-summed active-space GAS 1- and 2-particle DMs."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        return self.fcisolver.make_rdm12(
+            self._ci_for_active_property(ci), ncas, nelecas)
+
+    def make_gasdm2(self, ci=None, ncas=None, nelecas=None):
+        """Return the spin-summed active-space GAS two-particle DM."""
+
+        return self.make_gasdm12(ci, ncas, nelecas)[1]
+
+    def trans_gasdm1s(self, cibra=None, ciket=None, ncas=None, nelecas=None):
+        """Return alpha and beta active-space GAS transition 1-DMs."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        bra = self._ci_for_active_property(cibra)
+        ket = self._ci_for_active_property(ciket)
+        return self.fcisolver.trans_rdm1s(bra, ket, ncas, nelecas)
+
+    def trans_gasdm1(self, cibra=None, ciket=None, ncas=None, nelecas=None):
+        """Return the spin-summed active-space GAS transition 1-DM."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        bra = self._ci_for_active_property(cibra)
+        ket = self._ci_for_active_property(ciket)
+        return self.fcisolver.trans_rdm1(bra, ket, ncas, nelecas)
+
+    def trans_gasdm12s(self, cibra=None, ciket=None, ncas=None, nelecas=None):
+        """Return spin-resolved active-space GAS transition 1- and 2-DMs."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        bra = self._ci_for_active_property(cibra)
+        ket = self._ci_for_active_property(ciket)
+        return self.fcisolver.trans_rdm12s(bra, ket, ncas, nelecas)
+
+    def trans_gasdm12(self, cibra=None, ciket=None, ncas=None, nelecas=None):
+        """Return spin-summed active-space GAS transition 1- and 2-DMs."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        bra = self._ci_for_active_property(cibra)
+        ket = self._ci_for_active_property(ciket)
+        return self.fcisolver.trans_rdm12(bra, ket, ncas, nelecas)
+
+    def trans_gasdm2(self, cibra=None, ciket=None, ncas=None, nelecas=None):
+        """Return the spin-summed active-space GAS transition 2-DM."""
+
+        return self.trans_gasdm12(cibra, ciket, ncas, nelecas)[1]
+
+    def spin_square(self, ci=None, ncas=None, nelecas=None):
+        """Return ``(<S^2>, 2S+1)`` for a state-specific GAS CI vector."""
+
+        ncas = self.ncas if ncas is None else ncas
+        nelecas = self.nelecas if nelecas is None else nelecas
+        return self.fcisolver.spin_square(
+            self._ci_for_active_property(ci), ncas, nelecas)
+
+    def get_h1gas(self, mo_coeff=None, ncas=None, ncore=None):
+        """Return the effective one-electron Hamiltonian in the GAS space."""
+
+        return self.get_h1eff(mo_coeff, ncas, ncore)
+
+    def get_h2gas(self, mo_coeff=None):
+        """Return active-space two-electron integrals for GASSCF."""
+
+        return self.get_h2eff(mo_coeff)
 
     @property
     def gas_orbs(self):

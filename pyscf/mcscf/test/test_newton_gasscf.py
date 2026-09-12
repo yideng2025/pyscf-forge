@@ -373,6 +373,111 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(solver._contract_space)
         self.assertEqual(len(solver._contract_plans), 0)
 
+    def test_gasscf_space_info_uses_gasci_normalization(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=0)
+
+        info = mc.gas_space_info()
+        metadata = info["metadata"]
+
+        self.assertEqual(metadata["gas_orbs"], (1, 1))
+        self.assertEqual(metadata["kernel_gas_orbs"], (1, 1))
+        self.assertEqual(metadata["gas_restr_type"], "cumulative-occ")
+        numpy.testing.assert_array_equal(
+            metadata["gas_restr"], numpy.asarray([[1, 1], [2, 2]]))
+        numpy.testing.assert_array_equal(
+            metadata["spin_supergroups"],
+            numpy.asarray([[0, 1, 1, 0], [1, 0, 0, 1]], dtype=numpy.int32))
+        self.assertEqual(info["core"]["ndet"], 2)
+
+    def test_effective_nelecas_honors_solver_spin(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=2, ncore=0)
+
+        self.assertEqual(mc._effective_nelecas(), (1, 1))
+        mc.fcisolver.spin = 2
+        self.assertEqual(mc._effective_nelecas(), (2, 0))
+
+    def test_gasscf_gasdm_wrappers_match_solver_methods(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        ci = numpy.random.default_rng(71).normal(size=4)
+        mc.ci = ci
+
+        dm1s = mc.make_gasdm1s()
+        dm1 = mc.make_gasdm1()
+        dm1_ref, dm2_ref = mc.fcisolver.make_rdm12(ci, 2, (1, 1))
+        dm1s_ref, dm2s_ref = mc.fcisolver.make_rdm12s(ci, 2, (1, 1))
+
+        for actual, expected in zip(dm1s, dm1s_ref):
+            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(dm1, dm1_ref, atol=1e-12, rtol=0)
+        dm1_from_pair, dm2 = mc.make_gasdm12()
+        dm1s_from_pair, dm2s = mc.make_gasdm12s()
+        numpy.testing.assert_allclose(
+            dm1_from_pair, dm1_ref, atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(dm2, dm2_ref, atol=1e-12, rtol=0)
+        for actual, expected in zip(dm1s_from_pair, dm1s_ref):
+            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+        for actual, expected in zip(dm2s, dm2s_ref):
+            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(mc.make_gasdm2(), dm2_ref,
+                                      atol=1e-12, rtol=0)
+
+    def test_gasscf_transition_dm_and_spin_wrappers_match_solver(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        rng = numpy.random.default_rng(72)
+        bra = rng.normal(size=4)
+        ket = rng.normal(size=4)
+        mc.ci = ket
+
+        numpy.testing.assert_allclose(
+            mc.trans_gasdm1(bra, ket),
+            mc.fcisolver.trans_rdm1(bra, ket, 2, (1, 1)),
+            atol=1e-12, rtol=0)
+        ref_dm1, ref_dm2 = mc.fcisolver.trans_rdm12(bra, ket, 2, (1, 1))
+        dm1, dm2 = mc.trans_gasdm12(bra, ket)
+        numpy.testing.assert_allclose(dm1, ref_dm1, atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(dm2, ref_dm2, atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(mc.trans_gasdm2(bra, ket), ref_dm2,
+                                      atol=1e-12, rtol=0)
+
+        ref_dm1s = mc.fcisolver.trans_rdm1s(bra, ket, 2, (1, 1))
+        for actual, expected in zip(mc.trans_gasdm1s(bra, ket), ref_dm1s):
+            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+        ref_dm1s_pair, ref_dm2s_pair = mc.fcisolver.trans_rdm12s(
+            bra, ket, 2, (1, 1))
+        dm1s_pair, dm2s_pair = mc.trans_gasdm12s(bra, ket)
+        for actual, expected in zip(dm1s_pair, ref_dm1s_pair):
+            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+        for actual, expected in zip(dm2s_pair, ref_dm2s_pair):
+            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(
+            numpy.asarray(mc.spin_square(ket)),
+            numpy.asarray(mc.fcisolver.spin_square(ket, 2, (1, 1))),
+            atol=1e-12, rtol=0)
+
+    def test_gasscf_property_wrappers_require_single_ci_vector(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+
+        with self.assertRaisesRegex(ValueError, "CI vector is not available"):
+            mc.make_gasdm1()
+        with self.assertRaisesRegex(NotImplementedError, "state-averaged"):
+            mc.make_gasdm1([numpy.ones(4), numpy.ones(4)])
+
     def test_requires_gas_orbs_without_explicit_solver(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
