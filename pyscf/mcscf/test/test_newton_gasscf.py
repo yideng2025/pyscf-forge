@@ -28,6 +28,7 @@ from pyscf.fci import direct_spin1
 from pyscf.mcscf import addons_gas
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
+from pyscf.mcscf import newton_casscf
 from pyscf.mcscf import newton_gasscf
 
 
@@ -479,6 +480,40 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "state-averaged"):
             mc.make_gasdm1([numpy.ones(4), numpy.ones(4)])
 
+    def test_newton_solver_hides_native_cas_only_hooks(self):
+        base = fci_gas.FCISolver(gas_orbs=(2,))
+        self.assertTrue(callable(getattr(base, "gen_linkstr", None)))
+        self.assertTrue(callable(getattr(
+            base, "transform_ci_for_orbital_rotation", None)))
+
+        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        self.assertIsNone(getattr(solver, "gen_linkstr", None))
+        self.assertIsNone(getattr(
+            solver, "transform_ci_for_orbital_rotation", None))
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        explicit = fci_gas.FCISolver(mol, gas_orbs=(2,))
+        mc = newton_gasscf.GASSCF(
+            mf, fcisolver=explicit, nelecas=(1, 1), ncore=0)
+        self.assertIsNone(getattr(mc.fcisolver, "gen_linkstr", None))
+        self.assertIsNone(getattr(
+            mc.fcisolver, "transform_ci_for_orbital_rotation", None))
+
+    def test_native_singleton_ci_list_is_accepted_by_rdm_dispatch(self):
+        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        ci = numpy.random.default_rng(81).normal(size=4)
+
+        dm1, dm2 = solver.make_rdm12([ci], 2, (1, 1))
+        ref_dm1, ref_dm2 = solver.make_rdm12(ci, 2, (1, 1))
+
+        numpy.testing.assert_allclose(dm1, ref_dm1, atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(dm2, ref_dm2, atol=1e-12, rtol=0)
+        with self.assertRaisesRegex(NotImplementedError,
+                                    "multiroot CI density dispatch"):
+            solver.make_rdm12([ci, ci], 2, (1, 1))
+        solver.close()
+
     def test_fixed_orbital_gasci_bridge_matches_gasci_object(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
@@ -522,18 +557,39 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Multiple roots"):
             mc.casci(mf.mo_coeff)
 
-    def test_full_kernel_is_guarded_until_derivative_adapter(self):
+    def test_full_kernel_gas_as_cas_smoke_matches_newton_casscf(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
+        ref = newton_casscf.CASSCF(mf, 2, (1, 1), ncore=1)
+        for obj in (mc, ref):
+            obj.max_cycle_macro = 12
+            obj.max_cycle_micro = 4
+            obj.conv_tol = 1e-9
+            obj.conv_tol_grad = 1e-5
+            obj.canonicalization = False
+
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
+        ref_e_tot, ref_e_cas, _, _, _ = ref.kernel(mf.mo_coeff)
+
+        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
+        self.assertIsNone(mo_energy)
+        self.assertIs(mc.mo_coeff, mo_coeff)
+        self.assertIs(mc.mo_energy, mo_energy)
+        self.assertIs(mc.ci, ci)
+        self.assertEqual(mc.converged, ref.converged)
+        self.assertAlmostEqual(e_tot, ref_e_tot, places=7)
+        self.assertAlmostEqual(e_gas, ref_e_cas, places=7)
+
+    def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
         mc = newton_gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
 
-        with self.assertRaisesRegex(NotImplementedError,
-                                    "full Newton GASSCF kernel"):
-            mc.kernel()
-        with self.assertRaisesRegex(NotImplementedError,
-                                    "full Newton GASSCF kernel"):
-            mc.mc1step()
         with self.assertRaisesRegex(NotImplementedError,
                                     "two-step Newton GASSCF kernel"):
             mc.mc2step()

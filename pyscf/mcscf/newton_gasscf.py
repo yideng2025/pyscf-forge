@@ -21,8 +21,9 @@
 This module is introduced in small reviewable stages.  Current commits define
 object construction, explicit GASCI solver adaptation, GAS orbital-rotation
 masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
-those plans, GASCI-like object-level wrappers, and a fixed-orbital GASCI
-bridge.  The native Newton/CIAH derivative adapter is added separately.
+those plans, GASCI-like object-level wrappers, a fixed-orbital GASCI bridge,
+and a minimal native Newton/CIAH driver bridge.  State averaging, spin penalty
+and scanner support are added separately.
 """
 
 from collections import OrderedDict
@@ -56,6 +57,14 @@ class _GASFCISolver(fci_gas.FCISolver):
 
     _keys = set(fci_gas.FCISolver._keys) | {"cache_plans"}
     _MAX_CONTRACT_PLANS = 3
+
+    # PySCF native Newton probes these optional FCI hooks with ``getattr``.
+    # GASCI deliberately does not provide CAS linkstr arrays, and arbitrary
+    # active-space CI transformations do not preserve a restricted GAS space.
+    # Hide the inherited GASCI diagnostics here so native CASSCF falls back to
+    # link_index=None and does not call CAS-only helper APIs.
+    gen_linkstr = None
+    transform_ci_for_orbital_rotation = None
 
     def __init__(self, mol=None, gas_orbs=None, gas_restr=None,
                  gas_restr_type=addons_gas.GAS_RESTR_SPIN_SUPERGROUP,
@@ -176,13 +185,33 @@ class _GASFCISolver(fci_gas.FCISolver):
                 *args, compress_links=compress_links, **kwargs)
         return self._get_contract_plan(eri, norb, nelec).contract(fcivec)
 
+    @staticmethod
+    def _as_state_specific_ci(ci):
+        """Unwrap native Newton's singleton CI-list convention.
+
+        PySCF's native Newton CASSCF helper packs a state-specific CI vector as
+        ``[ci]`` when building initial density matrices.  GASCI public methods
+        operate on one flattened GAS CI vector.  This bridge accepts only the
+        singleton state-specific form here; true multiroot/state-average logic
+        is staged later at the GASSCF object level.
+        """
+
+        if isinstance(ci, (list, tuple)):
+            if len(ci) != 1:
+                _unsupported("multiroot CI density dispatch")
+            return ci[0]
+        return ci
+
     def make_rdm1s(self, ci, norb, nelec, link_index=None):
+        ci = self._as_state_specific_ci(ci)
         return self.trans_rdm1s(ci, ci, norb, nelec, link_index)
 
     def make_rdm1(self, ci, norb, nelec, link_index=None):
+        ci = self._as_state_specific_ci(ci)
         return self.trans_rdm1(ci, ci, norb, nelec, link_index)
 
     def make_rdm12s(self, ci, norb, nelec, link_index=None, reorder=True):
+        ci = self._as_state_specific_ci(ci)
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
         if not self.cache_plans:
@@ -191,6 +220,7 @@ class _GASFCISolver(fci_gas.FCISolver):
         return self._get_rdm_plan(norb, nelec).make_rdm12s(ci, ci)
 
     def make_rdm12(self, ci, norb, nelec, link_index=None, reorder=True):
+        ci = self._as_state_specific_ci(ci)
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
         if not self.cache_plans:
@@ -202,12 +232,16 @@ class _GASFCISolver(fci_gas.FCISolver):
         return self.make_rdm12(ci, norb, nelec, link_index, reorder)[1]
 
     def trans_rdm1s(self, cibra, ciket, norb, nelec, link_index=None):
+        cibra = self._as_state_specific_ci(cibra)
+        ciket = self._as_state_specific_ci(ciket)
         if not self.cache_plans:
             return super().trans_rdm1s(
                 cibra, ciket, norb, nelec, link_index=link_index)
         return self._get_rdm_plan(norb, nelec).make_rdm1s(cibra, ciket)
 
     def trans_rdm1(self, cibra, ciket, norb, nelec, link_index=None):
+        cibra = self._as_state_specific_ci(cibra)
+        ciket = self._as_state_specific_ci(ciket)
         if not self.cache_plans:
             return super().trans_rdm1(
                 cibra, ciket, norb, nelec, link_index=link_index)
@@ -215,6 +249,8 @@ class _GASFCISolver(fci_gas.FCISolver):
 
     def trans_rdm12s(self, cibra, ciket, norb, nelec, link_index=None,
                      reorder=True):
+        cibra = self._as_state_specific_ci(cibra)
+        ciket = self._as_state_specific_ci(ciket)
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
         if not self.cache_plans:
@@ -229,6 +265,8 @@ class _GASFCISolver(fci_gas.FCISolver):
 
     def trans_rdm12(self, cibra, ciket, norb, nelec, link_index=None,
                     reorder=True):
+        cibra = self._as_state_specific_ci(cibra)
+        ciket = self._as_state_specific_ci(ciket)
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
         if not self.cache_plans:
@@ -240,6 +278,7 @@ class _GASFCISolver(fci_gas.FCISolver):
     def contract_ss(self, fcivec, norb, nelec):
         """Contract ``S^2`` with a GAS CI vector, reusing a spin plan."""
 
+        fcivec = self._as_state_specific_ci(fcivec)
         if not self.cache_plans:
             return super().contract_ss(fcivec, norb, nelec)
         return self._get_spin_plan(norb, nelec).contract(fcivec)
@@ -613,15 +652,18 @@ class GASSCF(newton_casscf.CASSCF):
                 "support.")
         return e_tot, e_gas, ci
 
-    def kernel(self, mo_coeff=None, ci0=None, callback=None):
-        """Run full Newton GASSCF orbital optimization.
+    gen_g_hop = newton_casscf.gen_g_hop
 
-        The full driver is deliberately disabled until the GAS derivative
-        adapter is added and tested.  Use :meth:`gasci` for fixed-orbital GASCI
-        checks in the staged development window.
+    def kernel(self, mo_coeff=None, ci0=None, callback=None):
+        """Run full Newton GASSCF orbital optimization with native CIAH.
+
+        This staged bridge reuses PySCF's native Newton/CIAH macro/micro
+        control flow.  GAS-specific behavior enters through the GAS orbital
+        mask, the fixed-orbital GASCI ``casci`` bridge, and the Newton-owned
+        GASCI solver dispatch methods staged above.
         """
 
-        _unsupported("full Newton GASSCF kernel")
+        return super().kernel(mo_coeff, ci0, callback)
 
     def mc1step(self, mo_coeff=None, ci0=None, callback=None):
         return self.kernel(mo_coeff, ci0, callback)
