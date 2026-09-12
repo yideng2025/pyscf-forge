@@ -16,9 +16,11 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""Small construction tests for the staged Newton GASSCF module."""
+"""Small tests for the GASSCF module."""
 
 from functools import reduce
+import io
+import sys
 import unittest
 
 import numpy
@@ -32,18 +34,111 @@ from pyscf.mcscf import addons_gas
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
 from pyscf.mcscf import newton_casscf
-from pyscf.mcscf import newton_gasscf
+from pyscf.mcscf import gasscf
 
 
 class KnownValues(unittest.TestCase):
 
-    def test_constructs_newton_gasscf_with_gasci_solver(self):
+    def test_public_gasscf_module_exports_gasscf(self):
+        from pyscf.mcscf import gasscf as imported_gasscf
+
+        self.assertIs(imported_gasscf.GASSCF, gasscf.GASSCF)
+        self.assertEqual(imported_gasscf.__all__, ["GASSCF"])
+        self.assertEqual(gasscf.GASSCF.__module__, "pyscf.mcscf.gasscf")
+
+    def test_log_filter_relabels_native_newton_output(self):
+        buf = io.StringIO()
+        stream = gasscf._GASSCFLogFilter(buf)
+        stream.write(
+            "WARN: SO-CASSCF (Second order CASSCF) is an experimental "
+            "feature. Its performance is bad for large systems.\n"
+            "Start SO-CASSCF (newton CASSCF)\n"
+            "newton CASSCF converged in 6 macro steps\n"
+            "CASSCF canonicalization\n"
+            "CASSCF energy = -1.0\n"
+            "CASCI E = -1.0  E(CI) = -0.2\n"
+            "CAS (1e+1e, 2o), ncore = 1\n")
+        stream.flush()
+        out = buf.getvalue()
+
+        self.assertIn("Start SO-GASSCF", out)
+        self.assertIn("GASSCF converged", out)
+        self.assertIn("GASSCF canonicalization", out)
+        self.assertIn("GASSCF energy", out)
+        self.assertIn("GASCI E", out)
+        self.assertIn("E(GASCI)", out)
+        self.assertIn("GAS (1e+1e, 2o)", out)
+        self.assertNotIn("SO-CASSCF", out)
+        self.assertNotIn("experimental feature", out)
+        self.assertNotIn("performance is bad for large systems", out)
+        self.assertNotIn("newton CASSCF", out)
+        self.assertNotIn("CASCI E", out)
+
+
+    def test_log_filter_suppresses_native_warning_on_stderr(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        out = io.StringIO()
+        err = io.StringIO()
+        mc.stdout = out
+        mc.verbose = 4
+        old_sys_stderr = sys.stderr
+
+        try:
+            sys.stderr = err
+            (stdout, restore_stdout, stderr, restore_stderr) = (
+                mc._push_gasscf_log_labels())
+            try:
+                gasscf.logger.warn(
+                    mc,
+                    "SO-CASSCF (Second order CASSCF) is an experimental "
+                    "feature. Its performance is bad for large systems.")
+            finally:
+                if restore_stdout:
+                    mc.stdout.flush()
+                    mc.stdout = stdout
+                if restore_stderr:
+                    sys.stderr.flush()
+                    sys.stderr = stderr
+        finally:
+            sys.stderr = old_sys_stderr
+
+        self.assertNotIn("SO-CASSCF", out.getvalue())
+        self.assertNotIn("experimental feature", out.getvalue())
+        self.assertNotIn("performance is bad for large systems", out.getvalue())
+        self.assertNotIn("SO-CASSCF", err.getvalue())
+        self.assertNotIn("experimental feature", err.getvalue())
+        self.assertNotIn("performance is bad for large systems", err.getvalue())
+
+    def test_dump_flags_uses_gas_labels(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        buf = io.StringIO()
+        mc.stdout = buf
+        mc.verbose = 4
+
+        returned = mc.dump_flags()
+        out = buf.getvalue()
+
+        self.assertIs(returned, mc)
+        self.assertIn("GAS (1e+1e, 2o)", out)
+        self.assertIn("gas_orbs = (2,)", out)
+        self.assertIn("gas_restr_type = spin-supergroup", out)
+        self.assertIn("cache GAS helper plans", out)
+        self.assertNotIn("CAS (1e+1e, 2o)", out)
+        self.assertIs(mc.stdout, buf)
+
+    def test_constructs_gasscf_with_gasci_solver(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.75",
             basis="sto-3g",
             verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=0)
 
@@ -63,7 +158,7 @@ class KnownValues(unittest.TestCase):
     def test_default_restriction_type_matches_gasci(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0,
             cache_plans=False)
 
@@ -77,7 +172,7 @@ class KnownValues(unittest.TestCase):
             basis="sto-3g",
             verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 2, 1), gas_restr=None,
             nelecas=(2, 2), ncore=1)
 
@@ -114,7 +209,7 @@ class KnownValues(unittest.TestCase):
             basis="sto-3g",
             verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(4,), gas_restr=None, nelecas=(2, 2), ncore=1)
 
         mask = mc.uniq_var_indices(6, 1, 4, None)
@@ -129,7 +224,7 @@ class KnownValues(unittest.TestCase):
             basis="sto-3g",
             verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 2, 1), gas_restr=None,
             nelecas=(2, 2), ncore=1)
         mc.extrasym = numpy.asarray([0, 0, 1, 1, 0, 0])
@@ -152,7 +247,7 @@ class KnownValues(unittest.TestCase):
         solver.nroots = 2
         solver.spin = 0
 
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, fcisolver=solver, nelecas=(1, 1), ncore=0,
             cache_plans=False)
 
@@ -171,11 +266,11 @@ class KnownValues(unittest.TestCase):
     def test_explicit_newton_gas_solver_is_copied(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        source = newton_gasscf.GASSCF(
+        source = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0,
             cache_plans=False).fcisolver
 
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, fcisolver=source, nelecas=(1, 1), ncore=0)
 
         self.assertIsNot(mc.fcisolver, source)
@@ -190,7 +285,7 @@ class KnownValues(unittest.TestCase):
         solver = fci_gas.FCISolver(mol, gas_orbs=(2,))
 
         with self.assertRaisesRegex(ValueError, "explicit fcisolver"):
-            newton_gasscf.GASSCF(
+            gasscf.GASSCF(
                 mf, gas_orbs=(2,), fcisolver=solver,
                 nelecas=(1, 1), ncore=0)
 
@@ -200,7 +295,7 @@ class KnownValues(unittest.TestCase):
         solver = fci_gas.FCISolver(mol)
 
         with self.assertRaisesRegex(ValueError, "explicit GASCI solver"):
-            newton_gasscf.GASSCF(
+            gasscf.GASSCF(
                 mf, fcisolver=solver, nelecas=(1, 1), ncore=0)
 
     def test_rejects_external_fci_solver(self):
@@ -209,11 +304,11 @@ class KnownValues(unittest.TestCase):
         solver = direct_spin1.FCISolver(mol)
 
         with self.assertRaisesRegex(NotImplementedError, "external/non-GASCI"):
-            newton_gasscf.GASSCF(
+            gasscf.GASSCF(
                 mf, fcisolver=solver, nelecas=(1, 1), ncore=0)
 
     def test_owned_rdm_and_spin_plans_are_reused_and_closed(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
 
         rdm_plan = solver._get_rdm_plan(2, (1, 1))
         spin_plan = solver._get_spin_plan(2, (1, 1))
@@ -231,7 +326,7 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(solver._topology_key)
 
     def test_topology_change_invalidates_owned_plans(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         old_plan = solver._get_rdm_plan(2, (1, 1))
 
         solver.gas_orbs = (1, 1)
@@ -245,7 +340,7 @@ class KnownValues(unittest.TestCase):
         solver.close()
 
     def test_contract_plan_cache_reuses_and_evicts_plans(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         eri0 = numpy.zeros((3, 3))
         plan0 = solver._get_contract_plan(eri0, 2, (1, 1))
         self.assertIs(plan0, solver._get_contract_plan(eri0.copy(), 2, (1, 1)))
@@ -266,7 +361,7 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(solver._contract_space)
 
     def test_copy_detaches_owned_plan_caches(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         rdm_plan = solver._get_rdm_plan(2, (1, 1))
         solver._get_spin_plan(2, (1, 1))
         solver._get_contract_plan(numpy.zeros((3, 3)), 2, (1, 1))
@@ -285,7 +380,7 @@ class KnownValues(unittest.TestCase):
         solver.close()
 
     def test_public_contract_2e_reuses_owned_plan(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         reference = fci_gas.FCISolver(gas_orbs=(2,))
         eri = numpy.zeros((3, 3))
         ci = numpy.random.default_rng(61).normal(size=4)
@@ -303,7 +398,7 @@ class KnownValues(unittest.TestCase):
         solver.close()
 
     def test_public_rdm_methods_reuse_owned_plan(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         reference = fci_gas.FCISolver(gas_orbs=(2,))
         rng = numpy.random.default_rng(62)
         bra = rng.normal(size=4)
@@ -334,7 +429,7 @@ class KnownValues(unittest.TestCase):
         solver.close()
 
     def test_public_spin_square_methods_reuse_owned_plans(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         reference = fci_gas.FCISolver(gas_orbs=(2,))
         ci = numpy.random.default_rng(63).normal(size=4)
 
@@ -352,7 +447,7 @@ class KnownValues(unittest.TestCase):
         solver.close()
 
     def test_cache_plans_false_delegates_public_methods(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,), cache_plans=False)
+        solver = gasscf._GASFCISolver(gas_orbs=(2,), cache_plans=False)
         eri = numpy.zeros((3, 3))
         ci = numpy.random.default_rng(64).normal(size=4)
 
@@ -366,7 +461,7 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(solver._spin_plan)
 
     def test_explicit_contract_plan_bypasses_owned_cache(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         eri = numpy.zeros((3, 3))
         ci = numpy.random.default_rng(65).normal(size=4)
         with solver.make_space(2, (1, 1), compress_links=True) as gas:
@@ -381,7 +476,7 @@ class KnownValues(unittest.TestCase):
     def test_gasscf_space_info_uses_gasci_normalization(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=0)
 
@@ -401,7 +496,7 @@ class KnownValues(unittest.TestCase):
     def test_effective_nelecas_honors_solver_spin(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=2, ncore=0)
 
         self.assertEqual(mc._effective_nelecas(), (1, 1))
@@ -411,7 +506,7 @@ class KnownValues(unittest.TestCase):
     def test_gasscf_gasdm_wrappers_match_solver_methods(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         ci = numpy.random.default_rng(71).normal(size=4)
         mc.ci = ci
@@ -439,7 +534,7 @@ class KnownValues(unittest.TestCase):
     def test_gasscf_transition_dm_and_spin_wrappers_match_solver(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         rng = numpy.random.default_rng(72)
         bra = rng.normal(size=4)
@@ -475,7 +570,7 @@ class KnownValues(unittest.TestCase):
     def test_gasscf_property_wrappers_require_single_ci_vector(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
 
         with self.assertRaisesRegex(ValueError, "CI vector is not available"):
@@ -489,7 +584,7 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(callable(getattr(
             base, "transform_ci_for_orbital_rotation", None)))
 
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         self.assertIsNone(getattr(solver, "gen_linkstr", None))
         self.assertIsNone(getattr(
             solver, "transform_ci_for_orbital_rotation", None))
@@ -497,14 +592,14 @@ class KnownValues(unittest.TestCase):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
         explicit = fci_gas.FCISolver(mol, gas_orbs=(2,))
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, fcisolver=explicit, nelecas=(1, 1), ncore=0)
         self.assertIsNone(getattr(mc.fcisolver, "gen_linkstr", None))
         self.assertIsNone(getattr(
             mc.fcisolver, "transform_ci_for_orbital_rotation", None))
 
     def test_native_singleton_ci_list_is_accepted_by_rdm_dispatch(self):
-        solver = newton_gasscf._GASFCISolver(gas_orbs=(2,))
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
         ci = numpy.random.default_rng(81).normal(size=4)
 
         dm1, dm2 = solver.make_rdm12([ci], 2, (1, 1))
@@ -520,7 +615,7 @@ class KnownValues(unittest.TestCase):
     def test_fixed_orbital_gasci_bridge_matches_gasci_object(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         ref = gasci.GASCI(
             mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None)
@@ -540,7 +635,7 @@ class KnownValues(unittest.TestCase):
     def test_casci_bridge_returns_native_three_tuple(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
 
         result = mc.casci(mf.mo_coeff)
@@ -553,7 +648,7 @@ class KnownValues(unittest.TestCase):
     def test_casci_bridge_rejects_multiroot_energy(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         mc.fcisolver.nroots = 2
 
@@ -565,7 +660,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
         ref = newton_casscf.CASSCF(mf, 2, (1, 1), ncore=1)
         for obj in (mc, ref):
@@ -592,7 +687,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
         mc.max_cycle_macro = 1
@@ -618,13 +713,13 @@ class KnownValues(unittest.TestCase):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
 
-        gas_as_cas = newton_gasscf.GASSCF(
+        gas_as_cas = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         gas_as_cas.internal_rotation = True
         self.assertIs(gas_as_cas.newton(), gas_as_cas)
         self.assertFalse(gas_as_cas.internal_rotation)
 
-        restricted = newton_gasscf.GASSCF(
+        restricted = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=0)
         self.assertIs(restricted.validate_capabilities(), restricted)
@@ -633,7 +728,7 @@ class KnownValues(unittest.TestCase):
     def test_kernel_rejects_multiroot_until_state_average_stage(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         mc.fcisolver.nroots = 2
 
@@ -643,7 +738,7 @@ class KnownValues(unittest.TestCase):
     def test_copy_detaches_object_level_solver_caches(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         source_plan = mc.fcisolver._get_rdm_plan(2, (1, 1))
 
@@ -660,7 +755,7 @@ class KnownValues(unittest.TestCase):
     def test_full_active_gas_as_cas_kernel_without_canonicalization(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         ref = gasci.GASCI(
             mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None)
@@ -682,7 +777,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
         e_tot, e_gas, ci, mo_coeff, _ = mc.gasci(mf.mo_coeff)
@@ -705,7 +800,7 @@ class KnownValues(unittest.TestCase):
     def test_natural_orbital_rotations_are_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
 
         with self.assertRaisesRegex(NotImplementedError, "natural-orbital"):
@@ -722,7 +817,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
         mc.max_cycle_macro = 1
@@ -743,20 +838,20 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
 
         sa = mc.state_average((1.0, 0.0))
 
         self.assertIsInstance(sa, addons.StateAverageMCSCF)
-        self.assertIsInstance(sa, newton_gasscf.GASSCF)
+        self.assertIsInstance(sa, gasscf.GASSCF)
         numpy.testing.assert_allclose(sa.weights, (1.0, 0.0), atol=0, rtol=0)
         self.assertEqual(sa.fcisolver.nroots, 2)
         self.assertEqual(sa.gas_orbs, (2,))
         self.assertIs(sa.validate_capabilities(), sa)
 
         undone = sa.undo_state_average()
-        self.assertIsInstance(undone, newton_gasscf.GASSCF)
+        self.assertIsInstance(undone, gasscf.GASSCF)
         self.assertNotIsInstance(undone, addons.StateAverageMCSCF)
         self.assertEqual(undone.fcisolver.nroots, 1)
         self.assertIs(undone.validate_capabilities(), undone)
@@ -764,7 +859,7 @@ class KnownValues(unittest.TestCase):
     def test_state_average_rejects_invalid_weights_and_wfnsym(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
 
         for weights in ((1.0,), (0.7, 0.4), (1.1, -0.1), (float("nan"), 1.0)):
@@ -779,7 +874,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
         mc = mc.state_average((1.0, 0.0))
         mc.max_cycle_macro = 1
@@ -802,7 +897,7 @@ class KnownValues(unittest.TestCase):
     def test_fix_spin_sets_gas_native_penalty_and_undoes(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
 
         self.assertIs(mc.fix_spin_(shift=.15, ss=0), mc)
@@ -826,14 +921,14 @@ class KnownValues(unittest.TestCase):
     def test_fix_spin_rejects_spin_incomplete_gas_and_invalid_target(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        incomplete = newton_gasscf.GASSCF(
+        incomplete = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 0, 0, 1]],
             gas_restr_type="spin-supergroup", nelecas=(1, 1), ncore=0)
 
         with self.assertRaisesRegex(ValueError, "spin-complete"):
             incomplete.fix_spin_(shift=.2, ss=0)
 
-        complete = newton_gasscf.GASSCF(
+        complete = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         with self.assertRaisesRegex(ValueError, "target S"):
             complete.fix_spin_(shift=.2, ss=.5)
@@ -843,7 +938,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=1)
         mc.max_cycle_macro = 1
         mc.max_cycle_micro = 1
@@ -872,7 +967,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
         mc.max_cycle_macro = 1
@@ -897,7 +992,7 @@ class KnownValues(unittest.TestCase):
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
             gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
         scanner = mc.as_scanner()
@@ -911,20 +1006,20 @@ class KnownValues(unittest.TestCase):
     def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
-        mc = newton_gasscf.GASSCF(
+        mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
 
         with self.assertRaisesRegex(NotImplementedError,
-                                    "two-step Newton GASSCF kernel"):
+                                    "two-step GASSCF kernel"):
             mc.mc2step()
 
     def test_requires_gas_orbs_without_explicit_solver(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
         with self.assertRaisesRegex(ValueError, "gas_orbs is required"):
-            newton_gasscf.GASSCF(mf, nelecas=(1, 1), ncore=0)
+            gasscf.GASSCF(mf, nelecas=(1, 1), ncore=0)
 
 
 if __name__ == "__main__":
-    print("Full Tests for staged Newton GASSCF skeleton")
+    print("Full Tests for GASSCF")
     unittest.main()

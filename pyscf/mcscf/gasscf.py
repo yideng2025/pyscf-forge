@@ -20,22 +20,24 @@
 
 This module is introduced in small reviewable stages.  Current commits define
 object construction, explicit GASCI solver adaptation, GAS orbital-rotation
-masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
+masks, GASSCF-owned GAS helper plan lifetimes, public solver dispatch through
 those plans, GASCI-like object-level wrappers, a fixed-orbital GASCI bridge,
 and a minimal native Newton/CIAH driver bridge.  Current validation also
 guards unsupported staged feature combinations, kernel lifetimes and
-ordinary state-average wrappers, GAS-safe canonicalization, energy scanner support
-and GASCI-native spin-penalty hooks.
+ordinary state-average wrappers, GAS-safe canonicalization, energy scanner support,
+GASCI-native spin-penalty hooks and GAS-labeled native driver output.
 """
 
 from collections import OrderedDict
 import hashlib
 import json
+import sys
 
 import numpy
 
 from pyscf import gto
 from pyscf import lib
+from pyscf.lib import logger
 from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
@@ -47,14 +49,85 @@ __all__ = ["GASSCF"]
 
 
 def _unsupported(feature):
-    raise NotImplementedError(feature + " is not implemented for Newton GASSCF")
+    raise NotImplementedError(feature + " is not implemented for GASSCF")
+
+
+
+class _GASSCFLogFilter:
+    """Write-through stream filter for native Newton/CASSCF messages.
+
+    GASSCF deliberately reuses PySCF's native ``newton_casscf`` driver.
+    The numerical driver still contains CASSCF/CASCI text labels and one
+    CASSCF-specific experimental-feature warning.  This filter changes only
+    user-visible text while leaving the driver and all numerical data untouched.
+    """
+
+    _DROP_SUBSTRINGS = (
+        "SO-CASSCF (Second order CASSCF) is an experimental feature. "
+        "Its performance is bad for large systems.",
+    )
+    _REPLACEMENTS = (
+        ("Start SO-CASSCF (newton CASSCF)", "Start SO-GASSCF"),
+        ("newton CASSCF", "GASSCF"),
+        ("Second order CASSCF", "Second order GASSCF"),
+        ("SO-CASSCF", "SO-GASSCF"),
+        ("CASSCF", "GASSCF"),
+        ("CASCI", "GASCI"),
+        ("CAS (", "GAS ("),
+        ("CAS space", "GAS active space"),
+        ("CAS-space", "GAS active-space"),
+        ("E(CI)", "E(GASCI)"),
+    )
+
+    def __init__(self, stream):
+        self._stream = sys.stdout if stream is None else stream
+        self._pending = ""
+
+    def _rewrite_line(self, line):
+        if any(text in line for text in self._DROP_SUBSTRINGS):
+            return ""
+        if "SO-CASSCF" in line and "experimental feature" in line:
+            return ""
+        for old, new in self._REPLACEMENTS:
+            line = line.replace(old, new)
+        return line
+
+    def write(self, text):
+        original_length = len(text)
+        text = self._pending + text
+        if not text:
+            return original_length
+        if text.endswith("\n"):
+            self._pending = ""
+            lines = text.splitlines(True)
+        else:
+            lines = text.splitlines(True)
+            if lines and not lines[-1].endswith("\n"):
+                self._pending = lines.pop()
+            else:
+                self._pending = ""
+        rewritten = "".join(self._rewrite_line(line) for line in lines)
+        if rewritten:
+            self._stream.write(rewritten)
+        return original_length
+
+    def flush(self):
+        if self._pending:
+            rewritten = self._rewrite_line(self._pending)
+            self._pending = ""
+            if rewritten:
+                self._stream.write(rewritten)
+        return self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 class _GASFCISolver(fci_gas.FCISolver):
-    """GASCI solver shell with Newton GASSCF-owned helper plans.
+    """GASCI solver shell with GASSCF-owned helper plans.
 
     Ordinary GASCI remains implemented by :mod:`fci_gas`.  This subclass owns
-    only reusable helper plans needed by the staged Newton orbital optimizer.
+    only reusable helper plans needed by the staged GASSCF orbital optimizer.
     Adapted or copied solvers always start with empty caches, so C workspaces
     are never borrowed across solver objects.
     """
@@ -585,7 +658,7 @@ class _StateAverageGASSCF(addons.StateAverageMCSCF):
 
 
 class GASSCF(newton_casscf.CASSCF):
-    """Joint Newton orbital optimizer for a determinant GASCI active space.
+    """Joint GASSCF orbital optimizer for a determinant GASCI active space.
 
     Args:
         mf : SCF object
@@ -635,8 +708,81 @@ class GASSCF(newton_casscf.CASSCF):
         self.fcisolver = solver
         self.fcisolver.mol = self.mol
 
+
+    def _push_gasscf_log_labels(self):
+        """Install temporary stream filters for native Newton log labels."""
+
+        stdout = getattr(self, "stdout", None)
+        restore_stdout = not isinstance(stdout, _GASSCFLogFilter)
+        if restore_stdout:
+            self.stdout = _GASSCFLogFilter(stdout)
+
+        stderr = sys.stderr
+        restore_stderr = not isinstance(stderr, _GASSCFLogFilter)
+        if restore_stderr:
+            sys.stderr = _GASSCFLogFilter(stderr)
+
+        return stdout, restore_stdout, stderr, restore_stderr
+
+    def dump_flags(self, verbose=None):
+        """Print GASSCF flags using GAS terminology."""
+
+        log = logger.new_logger(self, verbose)
+        log.info("")
+        log.info("******** %s ********", self.__class__)
+        ncore = self.ncore
+        ncas = self.ncas
+        if self.mo_coeff is None:
+            log.info("GAS (%de+%de, %do), ncore = %d",
+                     self.nelecas[0], self.nelecas[1], ncas, ncore)
+        else:
+            nvir = self.mo_coeff.shape[1] - ncore - ncas
+            log.info("GAS (%de+%de, %do), ncore = %d, nvir = %d",
+                     self.nelecas[0], self.nelecas[1], ncas, ncore, nvir)
+        log.info("gas_orbs = %s", self.gas_orbs)
+        log.info("gas_restr_type = %s", self.gas_restr_type)
+        log.info("gas_restr = %s", self.gas_restr)
+        log.info("cache GAS helper plans = %s",
+                 getattr(self.fcisolver, "cache_plans", None))
+        if self.frozen is not None:
+            log.info("frozen orbitals %s", str(self.frozen))
+        if hasattr(self.fcisolver, "ss_penalty"):
+            target = getattr(self.fcisolver, "ss_value", None)
+            log.info("spin penalty shift = %g", self.fcisolver.ss_penalty)
+            log.info("target S^2 = %s", "minimum" if target is None else target)
+        log.info("max_cycle_macro = %d", self.max_cycle_macro)
+        log.info("max_cycle_micro = %d", self.max_cycle_micro)
+        log.info("conv_tol = %g", self.conv_tol)
+        log.info("conv_tol_grad = %s", self.conv_tol_grad)
+        log.info("orbital rotation max_stepsize = %g", self.max_stepsize)
+        log.info("augmented hessian ah_max_cycle = %d", self.ah_max_cycle)
+        log.info("augmented hessian ah_conv_tol = %g", self.ah_conv_tol)
+        log.info("augmented hessian ah_linear dependence = %g", self.ah_lindep)
+        log.info("augmented hessian ah_level shift = %g", self.ah_level_shift)
+        log.info("augmented hessian ah_start_tol = %g", self.ah_start_tol)
+        log.info("augmented hessian ah_start_cycle = %d", self.ah_start_cycle)
+        log.info("augmented hessian ah_grad_trust_region = %g",
+                 self.ah_grad_trust_region)
+        log.info("kf_trust_region = %g", self.kf_trust_region)
+        log.info("kf_interval = %d", self.kf_interval)
+        log.info("natorb = %s", self.natorb)
+        log.info("canonicalization = %s", self.canonicalization)
+        log.info("chkfile = %s", self.chkfile)
+        log.info("max_memory %d MB (current use %d MB)",
+                 self.max_memory, lib.current_memory()[0])
+        log.info("internal_rotation = %s", self.internal_rotation)
+        try:
+            self.fcisolver.dump_flags(self.verbose)
+        except AttributeError:
+            pass
+        if self.mo_coeff is None:
+            log.warn("Orbital for GASSCF is not specified.  You probably need "
+                     "call SCF.kernel() to initialize orbitals.")
+        return self
+
+
     def validate_capabilities(self):
-        """Validate the currently staged Newton GASSCF feature set.
+        """Validate the currently staged GASSCF feature set.
 
         The production algorithm is still assembled in small commits.  This
         guard makes unsupported combinations fail before entering the native
@@ -687,7 +833,7 @@ class GASSCF(newton_casscf.CASSCF):
         return self
 
     def close(self):
-        """Release Newton-owned GAS helper plans; repeated calls are safe."""
+        """Release GASSCF-owned GAS helper plans; repeated calls are safe."""
 
         self.fcisolver.close()
         return self
@@ -709,7 +855,7 @@ class GASSCF(newton_casscf.CASSCF):
         return result
 
     def newton(self):
-        """Return this already-Newton GASSCF object after validation."""
+        """Return this GASSCF object after validation."""
 
         return self.validate_capabilities()
 
@@ -959,7 +1105,7 @@ class GASSCF(newton_casscf.CASSCF):
             mo_coeff, ci0, verbose)
         if numpy.ndim(e_gas) != 0:
             raise RuntimeError(
-                "Multiple roots are detected in fcisolver.  Newton GASSCF "
+                "Multiple roots are detected in fcisolver.  GASSCF "
                 "does not yet know which state to optimize.\n"
                 "Use a state-specific solver or wait for staged state-average "
                 "support.")
@@ -1016,7 +1162,7 @@ class GASSCF(newton_casscf.CASSCF):
         return tuple(float(value) for value in weights)
 
     def state_average(self, weights=(.5, .5), wfnsym=None):
-        """Return an ordinary state-average Newton GASSCF object.
+        """Return an ordinary state-average GASSCF object.
 
         Zero-weight roots are retained exactly as requested, so they may still
         contribute to the native CI-response path even though they do not enter
@@ -1042,7 +1188,7 @@ class GASSCF(newton_casscf.CASSCF):
         return self
 
     def state_average_mix(self, *args, **kwargs):
-        _unsupported("state-average-mix Newton GASSCF")
+        _unsupported("state-average-mix GASSCF")
 
     state_average_mix_ = state_average_mix
 
@@ -1080,7 +1226,7 @@ class GASSCF(newton_casscf.CASSCF):
         return self
 
     def fix_spin_(self, shift=.2, ss=None):
-        """Enable GASCI-native spin penalty for Newton GASSCF.
+        """Enable GASCI-native spin penalty for GASSCF.
 
         ``ss`` is the target ``S(S+1)`` value, matching PySCF's
         ``fix_spin_`` convention.  The implementation uses the
@@ -1111,7 +1257,7 @@ class GASSCF(newton_casscf.CASSCF):
         return self.validate_capabilities()
 
     def fix_spin(self, shift=.2, ss=None):
-        """Return a copied Newton GASSCF object with spin penalty enabled."""
+        """Return a copied GASSCF object with spin penalty enabled."""
 
         return self.copy().fix_spin_(shift=shift, ss=ss)
 
@@ -1128,7 +1274,7 @@ class GASSCF(newton_casscf.CASSCF):
         return self.validate_capabilities()
 
     def undo_fix_spin(self):
-        """Return a copied Newton GASSCF object without spin penalty."""
+        """Return a copied GASSCF object without spin penalty."""
 
         return self.copy().undo_fix_spin_()
 
@@ -1166,19 +1312,19 @@ class GASSCF(newton_casscf.CASSCF):
 
 
     def as_scanner(self):
-        """Return an energy-only scanner for a fixed Newton GASSCF objective."""
+        """Return an energy-only scanner for a fixed GASSCF objective."""
 
         return _as_scanner(self)
 
     def state_specific_(self, *args, **kwargs):
-        _unsupported("state-specific Newton GASSCF")
+        _unsupported("state-specific GASSCF")
 
     state_specific = state_specific_
 
     gen_g_hop = newton_casscf.gen_g_hop
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
-        """Run full Newton GASSCF orbital optimization with native CIAH.
+        """Run full GASSCF orbital optimization with native CIAH.
 
         This staged bridge reuses PySCF's native Newton/CIAH macro/micro
         control flow.  GAS-specific behavior enters through the GAS orbital
@@ -1193,18 +1339,26 @@ class GASSCF(newton_casscf.CASSCF):
             e_tot, e_gas, ci = self._run_fixed_orbital_gasci(mo, ci0)
             self.mo_energy = None
             return e_tot, e_gas, ci, self.mo_coeff, self.mo_energy
+        (stdout, restore_stdout, stderr, restore_stderr) = (
+            self._push_gasscf_log_labels())
         try:
             result = super().kernel(mo_coeff, ci0, callback)
             self._sync_spin_penalty_results()
             return result
         finally:
             self.close()
+            if restore_stdout:
+                self.stdout.flush()
+                self.stdout = stdout
+            if restore_stderr:
+                sys.stderr.flush()
+                sys.stderr = stderr
 
     def mc1step(self, mo_coeff=None, ci0=None, callback=None):
         return self.kernel(mo_coeff, ci0, callback)
 
     def mc2step(self, mo_coeff=None, ci0=None, callback=None):
-        _unsupported("two-step Newton GASSCF kernel")
+        _unsupported("two-step GASSCF kernel")
 
     @property
     def gas_orbs(self):
@@ -1239,7 +1393,7 @@ class GASSCF(newton_casscf.CASSCF):
 
     @property
     def cache_plans(self):
-        """Whether Newton GASSCF may reuse owned GAS helper plans."""
+        """Whether GASSCF may reuse owned GAS helper plans."""
 
         return self.fcisolver.cache_plans
 
