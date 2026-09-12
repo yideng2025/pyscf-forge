@@ -18,6 +18,7 @@
 
 """Small construction tests for the staged Newton GASSCF module."""
 
+from functools import reduce
 import unittest
 
 import numpy
@@ -674,6 +675,67 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(numpy.asarray(ci).shape, numpy.asarray(ref_ci).shape)
         self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
         self.assertIsNone(mo_energy)
+
+    def test_canonicalize_keeps_restricted_gas_active_block_unchanged(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+        e_tot, e_gas, ci, mo_coeff, _ = mc.gasci(mf.mo_coeff)
+
+        mo1, ci1, mo_energy = mc.canonicalize(mo_coeff, ci, sort=False)
+
+        self.assertTrue(numpy.isfinite(e_tot))
+        self.assertTrue(numpy.isfinite(e_gas))
+        self.assertEqual(mo1.shape, mo_coeff.shape)
+        self.assertEqual(mo_energy.shape, (mo_coeff.shape[1],))
+        self.assertTrue(numpy.all(numpy.isfinite(mo_energy)))
+        self.assertEqual(numpy.asarray(ci1).shape, numpy.asarray(ci).shape)
+        overlap = mf.get_ovlp()
+        active = slice(mc.ncore, mc.ncore + mc.ncas)
+        active_metric = reduce(numpy.dot, (
+            mo_coeff[:, active].T, overlap, mo1[:, active]))
+        numpy.testing.assert_allclose(
+            active_metric, numpy.eye(mc.ncas), atol=1e-10, rtol=0)
+
+    def test_natural_orbital_rotations_are_guarded(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+
+        with self.assertRaisesRegex(NotImplementedError, "natural-orbital"):
+            mc.canonicalize(mf.mo_coeff, gas_natorb=True)
+        with self.assertRaisesRegex(NotImplementedError, "natural-orbital"):
+            mc.cas_natorb()
+
+        mc.natorb = True
+        with self.assertRaisesRegex(NotImplementedError, "natural-orbital"):
+            mc.validate_capabilities()
+
+    def test_restricted_gas_kernel_with_default_canonicalization_smoke(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+        mc.max_cycle_macro = 1
+        mc.max_cycle_micro = 1
+        mc.conv_tol = 1e-8
+        mc.conv_tol_grad = 1e-4
+
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
+
+        self.assertTrue(numpy.isfinite(e_tot))
+        self.assertTrue(numpy.isfinite(e_gas))
+        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
+        self.assertEqual(mo_energy.shape, (mf.mo_coeff.shape[1],))
+        self.assertEqual(numpy.asarray(ci).ndim, 1)
 
     def test_state_average_constructs_zero_weight_roots_and_undoes(self):
         mol = gto.M(

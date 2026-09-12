@@ -24,7 +24,7 @@ masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
 those plans, GASCI-like object-level wrappers, a fixed-orbital GASCI bridge,
 and a minimal native Newton/CIAH driver bridge.  Current validation also
 guards unsupported staged feature combinations, kernel lifetimes and
-ordinary state-average wrappers.
+ordinary state-average wrappers and GAS-safe canonicalization.
 """
 
 from collections import OrderedDict
@@ -454,6 +454,9 @@ class GASSCF(newton_casscf.CASSCF):
         if isinstance(self.fcisolver, addons.StateSpecificFCISolver):
             _unsupported("state-specific GASCI solver wrapper")
 
+        if getattr(self, "natorb", False):
+            _unsupported("GAS natural-orbital rotation")
+
         is_sa_mc = isinstance(self, addons.StateAverageMCSCF)
         is_sa_solver = isinstance(self.fcisolver, addons.StateAverageFCISolver)
         if is_sa_mc != is_sa_solver:
@@ -751,6 +754,42 @@ class GASSCF(newton_casscf.CASSCF):
                 "Use a state-specific solver or wait for staged state-average "
                 "support.")
         return e_tot, e_gas, ci
+
+    def canonicalize(self, mo_coeff=None, ci=None, eris=None, sort=False,
+                     gas_natorb=False, gasdm1=None, verbose=None,
+                     cas_natorb=None, **kwargs):
+        """Canonicalize core/external orbitals without rotating GAS subspaces.
+
+        Native CASSCF calls this method with its ``natorb`` flag as the fifth
+        positional argument.  In GASSCF, any automatic active-space natural
+        orbital rotation would generally mix GAS subspaces and invalidate the
+        restricted determinant space, so active-space natural orbitals are
+        explicitly guarded.  The active GAS block is otherwise kept fixed;
+        only inactive and external orbitals are canonicalized by the inherited
+        PySCF machinery.
+        """
+
+        if gas_natorb or cas_natorb:
+            _unsupported("GAS natural-orbital rotation")
+        return gasci.GASCI.canonicalize(
+            self, mo_coeff, ci, eris, sort=sort, gas_natorb=False,
+            gasdm1=gasdm1, verbose=verbose, **kwargs)
+
+    def canonicalize_(self, mo_coeff=None, ci=None, eris=None, sort=False,
+                      gas_natorb=False, gasdm1=None, verbose=None,
+                      cas_natorb=None, **kwargs):
+        mo_coeff, ci, mo_energy = self.canonicalize(
+            mo_coeff, ci, eris, sort=sort, gas_natorb=gas_natorb,
+            gasdm1=gasdm1, verbose=verbose, cas_natorb=cas_natorb, **kwargs)
+        self.mo_coeff = mo_coeff
+        self.ci = ci
+        self.mo_energy = mo_energy
+        return mo_coeff, ci, mo_energy
+
+    def cas_natorb(self, *args, **kwargs):
+        _unsupported("CAS/GAS natural-orbital rotation")
+
+    cas_natorb_ = cas_natorb
 
     @staticmethod
     def _validate_weights(weights):
