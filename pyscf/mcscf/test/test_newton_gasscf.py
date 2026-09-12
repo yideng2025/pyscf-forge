@@ -20,6 +20,8 @@
 
 import unittest
 
+import numpy
+
 from pyscf import gto
 from pyscf import scf
 from pyscf.fci import direct_spin1
@@ -63,6 +65,78 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(
             mc.gas_restr_type, addons_gas.GAS_RESTR_SPIN_SUPERGROUP)
         self.assertFalse(mc.cache_plans)
+
+    def test_gas_orbital_rotation_mask_enables_only_intergas_internal_rotations(self):
+        mol = gto.M(
+            atom="; ".join("H 0 0 %g" % value for value in range(6)),
+            basis="sto-3g",
+            verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 2, 1), gas_restr=None,
+            nelecas=(2, 2), ncore=1)
+
+        mask = mc.uniq_var_indices(6, 1, 4, None)
+
+        self.assertEqual(mask.shape, (6, 6))
+        self.assertEqual(numpy.count_nonzero(mask), 14)
+
+        # Native CASSCF-like external/core rotations are retained.
+        self.assertTrue(mask[1, 0])
+        self.assertTrue(mask[4, 0])
+        self.assertTrue(mask[5, 0])
+        self.assertTrue(mask[5, 1])
+        self.assertTrue(mask[5, 4])
+
+        # Active-active rotations are enabled only between GAS subspaces in the
+        # lower-triangular orbital-rotation convention used by pack_uniq_var.
+        self.assertTrue(mask[2, 1])
+        self.assertTrue(mask[3, 1])
+        self.assertTrue(mask[4, 1])
+        self.assertTrue(mask[4, 2])
+        self.assertTrue(mask[4, 3])
+
+        # Same-subspace active rotations and opposite triangular entries remain
+        # inactive.
+        self.assertFalse(mask[3, 2])
+        self.assertFalse(mask[1, 2])
+        self.assertFalse(mask[0, 1])
+        self.assertFalse(mask[1, 5])
+
+    def test_gas_as_cas_mask_has_no_active_internal_rotation(self):
+        mol = gto.M(
+            atom="; ".join("H 0 0 %g" % value for value in range(6)),
+            basis="sto-3g",
+            verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(4,), gas_restr=None, nelecas=(2, 2), ncore=1)
+
+        mask = mc.uniq_var_indices(6, 1, 4, None)
+
+        self.assertEqual(numpy.count_nonzero(mask), 9)
+        active = mask[1:5, 1:5]
+        self.assertFalse(numpy.any(active[numpy.tril_indices(4, -1)]))
+
+    def test_gas_orbital_rotation_mask_honors_extrasym_and_frozen(self):
+        mol = gto.M(
+            atom="; ".join("H 0 0 %g" % value for value in range(6)),
+            basis="sto-3g",
+            verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(1, 2, 1), gas_restr=None,
+            nelecas=(2, 2), ncore=1)
+        mc.extrasym = numpy.asarray([0, 0, 1, 1, 0, 0])
+
+        mask = mc.uniq_var_indices(6, 1, 4, [2])
+
+        self.assertFalse(numpy.any(mask[2]))
+        self.assertFalse(numpy.any(mask[:, 2]))
+        self.assertTrue(mask[4, 1])
+        self.assertTrue(mask[5, 4])
+        self.assertFalse(mask[3, 1])
+        self.assertFalse(mask[5, 3])
 
     def test_explicit_gasci_solver_is_adapted_by_copy(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)

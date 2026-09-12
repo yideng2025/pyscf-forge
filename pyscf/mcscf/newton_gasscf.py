@@ -23,6 +23,8 @@ provides the public object skeleton and GASCI solver ownership convention.  It
 does not yet replace the native Newton/CIAH orbital-gradient machinery.
 """
 
+import numpy
+
 from pyscf import lib
 from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
@@ -185,6 +187,48 @@ class GASSCF(newton_casscf.CASSCF):
             mf, sum(solver.gas_orbs), nelecas, ncore=ncore, frozen=frozen)
         self.fcisolver = solver
         self.fcisolver.mol = self.mol
+
+    def uniq_var_indices(self, nmo, ncore, ncas, frozen):
+        """Return the independent orbital-rotation mask for GAS orbital optimization.
+
+        The native CASSCF mask contains core-active, core-external and
+        active-external rotations.  GASSCF adds active-active rotations between
+        different GAS subspaces because such rotations change the constrained
+        GAS wave function.  Rotations within one GAS subspace remain redundant
+        orbital gauge degrees of freedom and are excluded.
+        """
+
+        nmo = int(nmo)
+        ncore = int(ncore)
+        ncas = int(ncas)
+        nocc = ncore + ncas
+        gas_orbs = tuple(int(value) for value in self.gas_orbs)
+        if sum(gas_orbs) != ncas:
+            raise ValueError("sum(gas_orbs) must equal ncas")
+
+        mask = numpy.zeros((nmo, nmo), dtype=bool)
+        mask[ncore:nocc, :ncore] = True
+        mask[nocc:, :nocc] = True
+
+        first_active = ncore
+        offset = ncore
+        for norb in gas_orbs:
+            start = offset
+            stop = start + norb
+            mask[start:stop, first_active:start] = True
+            offset = stop
+
+        if self.extrasym is not None:
+            extrasym = numpy.asarray(self.extrasym)
+            extrasym_allowed = extrasym.reshape(-1, 1) == extrasym
+            mask = mask * extrasym_allowed
+        if frozen is not None:
+            if isinstance(frozen, (int, numpy.integer)):
+                mask[:frozen] = mask[:, :frozen] = False
+            else:
+                frozen = numpy.asarray(frozen)
+                mask[frozen] = mask[:, frozen] = False
+        return mask
 
     @property
     def gas_orbs(self):
