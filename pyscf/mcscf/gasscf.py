@@ -16,16 +16,21 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""PySCF-style generalized active-space self-consistent field.
+"""Generalized active-space self-consistent field.
 
-This module is introduced in small reviewable stages.  Current commits define
-object construction, explicit GASCI solver adaptation, GAS orbital-rotation
-masks, GASSCF-owned GAS helper plan lifetimes, public solver dispatch through
-those plans, GASCI-like object-level wrappers, a fixed-orbital GASCI bridge,
-and a minimal native Newton/CIAH driver bridge.  Current validation also
-guards unsupported staged feature combinations, kernel lifetimes and
-ordinary state-average wrappers, GAS-safe canonicalization, energy scanner support,
-GASCI-native spin-penalty hooks and GAS-labeled native driver output.
+The public API is :class:`GASSCF` in ``pyscf.mcscf.gasscf``.  The
+implementation reuses PySCF's native Newton/CIAH orbital-optimization driver
+and replaces the active-space CI, RDM and spin operations with the
+restricted determinant GASCI kernels.
+
+Supported GAS definitions follow :mod:`pyscf.mcscf.gasci`: ``gas_orbs``,
+``gas_restr`` and ``gas_restr_type`` are normalized by the same GAS helper
+routines.  This module supports ordinary state averaging, including
+zero-weight roots, GAS-safe canonicalization of inactive/external orbitals,
+energy-only scanners and the GASCI-native spin-penalty Hamiltonian.  It does
+not implement state-average-mix, state-specific excited-state wrappers,
+active-space natural-orbital rotations, analytic gradients/NACs or the
+legacy two-step CASSCF driver.
 """
 
 from collections import OrderedDict
@@ -771,10 +776,24 @@ class GASSCF(newton_casscf.CASSCF):
         log.info("max_memory %d MB (current use %d MB)",
                  self.max_memory, lib.current_memory()[0])
         log.info("internal_rotation = %s", self.internal_rotation)
+        solver_stdout = getattr(self.fcisolver, "stdout", None)
+        had_solver_stdout = hasattr(self.fcisolver, "stdout")
         try:
+            # ``direct_spin1.FCISolver`` stores its own stdout at construction
+            # time.  Route the GASCI solver flags to the current GASSCF stream
+            # so redirected/captured output remains self-contained.
+            self.fcisolver.stdout = self.stdout
             self.fcisolver.dump_flags(self.verbose)
         except AttributeError:
             pass
+        finally:
+            if had_solver_stdout:
+                self.fcisolver.stdout = solver_stdout
+            else:
+                try:
+                    del self.fcisolver.stdout
+                except AttributeError:
+                    pass
         if self.mo_coeff is None:
             log.warn("Orbital for GASSCF is not specified.  You probably need "
                      "call SCF.kernel() to initialize orbitals.")

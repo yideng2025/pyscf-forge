@@ -118,10 +118,17 @@ class KnownValues(unittest.TestCase):
         mc = gasscf.GASSCF(
             mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
         buf = io.StringIO()
+        terminal = io.StringIO()
+        original_solver_stdout = mc.fcisolver.stdout
         mc.stdout = buf
         mc.verbose = 4
+        old_sys_stdout = sys.stdout
 
-        returned = mc.dump_flags()
+        try:
+            sys.stdout = terminal
+            returned = mc.dump_flags()
+        finally:
+            sys.stdout = old_sys_stdout
         out = buf.getvalue()
 
         self.assertIs(returned, mc)
@@ -129,8 +136,11 @@ class KnownValues(unittest.TestCase):
         self.assertIn("gas_orbs = (2,)", out)
         self.assertIn("gas_restr_type = spin-supergroup", out)
         self.assertIn("cache GAS helper plans", out)
+        self.assertIn("max. cycles = 100", out)
         self.assertNotIn("CAS (1e+1e, 2o)", out)
+        self.assertEqual(terminal.getvalue(), "")
         self.assertIs(mc.stdout, buf)
+        self.assertIs(mc.fcisolver.stdout, original_solver_stdout)
 
     def test_constructs_gasscf_with_gasci_solver(self):
         mol = gto.M(
