@@ -27,6 +27,7 @@ from pyscf import scf
 from pyscf.fci import direct_spin1
 from pyscf.mcscf import addons_gas
 from pyscf.mcscf import fci_gas
+from pyscf.mcscf import gasci
 from pyscf.mcscf import newton_gasscf
 
 
@@ -477,6 +478,65 @@ class KnownValues(unittest.TestCase):
             mc.make_gasdm1()
         with self.assertRaisesRegex(NotImplementedError, "state-averaged"):
             mc.make_gasdm1([numpy.ones(4), numpy.ones(4)])
+
+    def test_fixed_orbital_gasci_bridge_matches_gasci_object(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        ref = gasci.GASCI(
+            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None)
+        ref.canonicalization = False
+
+        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.gasci(mf.mo_coeff)
+        ref_e_tot, ref_e_gas, ref_ci, _, _ = ref.kernel(mf.mo_coeff)
+
+        self.assertAlmostEqual(e_tot, ref_e_tot, places=11)
+        self.assertAlmostEqual(e_gas, ref_e_gas, places=11)
+        self.assertIs(mc.mo_coeff, mo_coeff)
+        self.assertIs(mc.mo_energy, mo_energy)
+        self.assertIs(mc.ci, ci)
+        self.assertEqual(numpy.asarray(ci).shape, numpy.asarray(ref_ci).shape)
+        self.assertTrue(mc.converged)
+
+    def test_casci_bridge_returns_native_three_tuple(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+
+        result = mc.casci(mf.mo_coeff)
+
+        self.assertEqual(len(result), 3)
+        self.assertAlmostEqual(result[0], mc.e_tot, places=12)
+        self.assertAlmostEqual(result[1], mc.e_gas, places=12)
+        self.assertIs(result[2], mc.ci)
+
+    def test_casci_bridge_rejects_multiroot_energy(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+        mc.fcisolver.nroots = 2
+
+        with self.assertRaisesRegex(RuntimeError, "Multiple roots"):
+            mc.casci(mf.mo_coeff)
+
+    def test_full_kernel_is_guarded_until_derivative_adapter(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        mc = newton_gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+
+        with self.assertRaisesRegex(NotImplementedError,
+                                    "full Newton GASSCF kernel"):
+            mc.kernel()
+        with self.assertRaisesRegex(NotImplementedError,
+                                    "full Newton GASSCF kernel"):
+            mc.mc1step()
+        with self.assertRaisesRegex(NotImplementedError,
+                                    "two-step Newton GASSCF kernel"):
+            mc.mc2step()
 
     def test_requires_gas_orbs_without_explicit_solver(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)

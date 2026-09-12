@@ -21,8 +21,8 @@
 This module is introduced in small reviewable stages.  Current commits define
 object construction, explicit GASCI solver adaptation, GAS orbital-rotation
 masks, Newton-owned GAS helper plan lifetimes, public solver dispatch through
-those plans, and GASCI-like object-level wrappers.  The native Newton/CIAH
-derivative adapter is added separately.
+those plans, GASCI-like object-level wrappers, and a fixed-orbital GASCI
+bridge.  The native Newton/CIAH derivative adapter is added separately.
 """
 
 from collections import OrderedDict
@@ -35,6 +35,7 @@ from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
 from pyscf.mcscf import fci_gas
+from pyscf.mcscf import gasci
 from pyscf.mcscf import newton_casscf
 
 __all__ = ["GASSCF"]
@@ -559,6 +560,74 @@ class GASSCF(newton_casscf.CASSCF):
         """Return active-space two-electron integrals for GASSCF."""
 
         return self.get_h2eff(mo_coeff)
+
+    def _prepare_fixed_orbital_gasci(self, mo_coeff=None, ci0=None):
+        """Return orbitals and CI guess for a fixed-orbital GASCI call."""
+
+        if mo_coeff is None:
+            if self.mo_coeff is None and self._scf.mol.nelectron > 0:
+                self._scf.run()
+                self.mo_coeff = self._scf.mo_coeff
+            mo_coeff = self.mo_coeff
+        else:
+            self.mo_coeff = mo_coeff
+        if ci0 is None:
+            ci0 = self.ci
+        self.fcisolver.mol = self.mol
+        return mo_coeff, ci0
+
+    def _run_fixed_orbital_gasci(self, mo_coeff=None, ci0=None, verbose=None):
+        """Run fixed-orbital GASCI and update PySCF-style result slots."""
+
+        mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(mo_coeff, ci0)
+        self.e_tot, self.e_cas, self.ci = gasci.kernel(
+            self, mo_coeff, ci0=ci0, verbose=verbose)
+        if getattr(self.fcisolver, "converged", None) is not None:
+            self.converged = bool(numpy.all(self.fcisolver.converged))
+        else:
+            self.converged = True
+        return self.e_tot, self.e_gas, self.ci
+
+    def gasci(self, mo_coeff=None, ci0=None, verbose=None):
+        """Run the fixed-orbital GASCI problem associated with this object.
+
+        This method is a convenience bridge used while the Newton/CIAH
+        derivative adapter is staged separately.  It does not optimize
+        orbitals.
+        """
+
+        e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
+            mo_coeff, ci0, verbose)
+        return e_tot, e_gas, ci, self.mo_coeff, self.mo_energy
+
+    def casci(self, mo_coeff=None, ci0=None, eris=None, verbose=None, envs=None):
+        """Run a fixed-orbital GASCI solve with native-CASSCF call signature."""
+
+        e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
+            mo_coeff, ci0, verbose)
+        if numpy.ndim(e_gas) != 0:
+            raise RuntimeError(
+                "Multiple roots are detected in fcisolver.  Newton GASSCF "
+                "does not yet know which state to optimize.\n"
+                "Use a state-specific solver or wait for staged state-average "
+                "support.")
+        return e_tot, e_gas, ci
+
+    def kernel(self, mo_coeff=None, ci0=None, callback=None):
+        """Run full Newton GASSCF orbital optimization.
+
+        The full driver is deliberately disabled until the GAS derivative
+        adapter is added and tested.  Use :meth:`gasci` for fixed-orbital GASCI
+        checks in the staged development window.
+        """
+
+        _unsupported("full Newton GASSCF kernel")
+
+    def mc1step(self, mo_coeff=None, ci0=None, callback=None):
+        return self.kernel(mo_coeff, ci0, callback)
+
+    def mc2step(self, mo_coeff=None, ci0=None, callback=None):
+        _unsupported("two-step Newton GASSCF kernel")
 
     @property
     def gas_orbs(self):
