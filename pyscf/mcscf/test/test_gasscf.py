@@ -22,6 +22,7 @@ from functools import reduce
 import io
 import sys
 import unittest
+from unittest import mock
 
 import numpy
 
@@ -1315,42 +1316,35 @@ class KnownValues(unittest.TestCase):
         self.assertNotIn("CASCI E", out)
 
 
-    def test_log_filter_suppresses_native_warning_on_stderr(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+    def test_log_filter_suppresses_native_warning_without_global_stderr(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75",
+                    basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
         mc = gasscf.GASSCF(
-            mf, gas_orbs=(2,), gas_restr=None, nelecas=(1, 1), ncore=0)
+            mf, gas_orbs=(2,), gas_restr=None,
+            nelecas=(1, 1), ncore=0)
         out = io.StringIO()
-        err = io.StringIO()
         mc.stdout = out
         mc.verbose = 4
         old_sys_stderr = sys.stderr
 
+        stdout, restore_stdout = mc._push_gasscf_log_labels()
         try:
-            sys.stderr = err
-            (stdout, restore_stdout, stderr, restore_stderr) = (
-                mc._push_gasscf_log_labels())
-            try:
-                gasscf.logger.warn(
-                    mc,
-                    "SO-CASSCF (Second order CASSCF) is an experimental "
-                    "feature. Its performance is bad for large systems.")
-            finally:
-                if restore_stdout:
-                    mc.stdout.flush()
-                    mc.stdout = stdout
-                if restore_stderr:
-                    sys.stderr.flush()
-                    sys.stderr = stderr
+            self.assertIs(sys.stderr, old_sys_stderr)
+            log = gasscf._GASSCFLogger(mc.stdout, mc.verbose)
+            log.warn(
+                "SO-CASSCF (Second order CASSCF) is an experimental "
+                "feature. Its performance is bad for large systems.")
         finally:
-            sys.stderr = old_sys_stderr
+            if restore_stdout:
+                mc.stdout.flush()
+                mc.stdout = stdout
 
+        self.assertIs(sys.stderr, old_sys_stderr)
         self.assertNotIn("SO-CASSCF", out.getvalue())
         self.assertNotIn("experimental feature", out.getvalue())
-        self.assertNotIn("performance is bad for large systems", out.getvalue())
-        self.assertNotIn("SO-CASSCF", err.getvalue())
-        self.assertNotIn("experimental feature", err.getvalue())
-        self.assertNotIn("performance is bad for large systems", err.getvalue())
+        self.assertNotIn("performance is bad for large systems",
+                         out.getvalue())
 
     def test_dump_flags_uses_gas_labels(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -1404,6 +1398,54 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mc.gas_restr_type, "cumulative-occ")
         self.assertEqual(mc.fcisolver.gas_restr_type, "cumulative-occ")
         self.assertTrue(mc.cache_plans)
+
+    def test_gas_orbs_uses_strict_gasci_integer_validation(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75",
+                    basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+
+        for bad in ((2.5,), (True,)):
+            with self.subTest(path="constructor", gas_orbs=bad):
+                with self.assertRaisesRegex(TypeError, "gas_orbs.*integers"):
+                    gasscf.GASSCF(
+                        mf, gas_orbs=bad, gas_restr=None,
+                        nelecas=(1, 1), ncore=0)
+
+        solver = fci_gas.FCISolver(mol, gas_orbs=(2,))
+        solver.gas_orbs = (2.5,)
+        with self.assertRaisesRegex(TypeError, "gas_orbs.*integers"):
+            gasscf.GASSCF(
+                mf, fcisolver=solver, nelecas=(1, 1), ncore=0)
+
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None,
+            nelecas=(1, 1), ncore=0)
+        with self.assertRaisesRegex(TypeError, "gas_orbs.*integers"):
+            mc.gas_orbs = (True,)
+
+    def test_ras_zero_sized_edge_spaces_match_gasci_contract(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75",
+                    basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        restriction = {"max_holes": 0, "max_particles": 0}
+
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(0, 2, 0), gas_restr=restriction,
+            gas_restr_type="ras", nelecas=(1, 1), ncore=0)
+        self.assertEqual(mc.gas_orbs, (0, 2, 0))
+        self.assertEqual(mc.ncas, 2)
+        kernel_orbs, _ = mc._normalized_restriction()
+        self.assertEqual(kernel_orbs, (2,))
+        self.assertIs(mc.validate_capabilities(), mc)
+        self.assertFalse(mc.internal_rotation)
+
+        solver = fci_gas.FCISolver(
+            mol, gas_orbs=(0, 2, 0), gas_restr=restriction,
+            gas_restr_type="ras")
+        adapted = gasscf.GASSCF(
+            mf, fcisolver=solver, nelecas=(1, 1), ncore=0)
+        self.assertEqual(adapted.gas_orbs, (0, 2, 0))
+        self.assertEqual(adapted._normalized_restriction()[0], (2,))
 
     def test_default_restriction_type_matches_gasci(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -1882,6 +1924,23 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(numpy.asarray(ci).shape, numpy.asarray(ref_ci).shape)
         self.assertTrue(mc.converged)
 
+    def test_casci_bridge_reuses_native_newton_eris(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75",
+                    basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(2,), gas_restr=None,
+            nelecas=(1, 1), ncore=0)
+
+        reference = mc.gasci(mf.mo_coeff)[0]
+        eris = mc.ao2mo(mf.mo_coeff)
+        with mock.patch.object(
+                mc, "get_h2eff",
+                side_effect=AssertionError("redundant active AO2MO")):
+            e_tot = mc.casci(mf.mo_coeff, eris=eris)[0]
+
+        self.assertAlmostEqual(e_tot, reference, places=11)
+
     def test_casci_bridge_returns_native_three_tuple(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
@@ -2284,6 +2343,41 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(scanner.scan_info["problem"]["nroots"], 1)
         self.assertIn("GASSCF", scanner.__class__.__name__)
         self.assertIs(scanner.as_scanner(), scanner)
+
+    def test_as_scanner_rejects_changed_extrasym_constraint(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+
+        scanner = mc.as_scanner()
+        scanner.extrasym = numpy.zeros(
+            mf.mo_coeff.shape[1], dtype=int)
+        with self.assertRaisesRegex(ValueError, "create a new scanner"):
+            scanner(mol)
+
+    def test_df_scanner_reset_updates_with_df_molecule(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+            gas_restr_type="cumulative-occ", nelecas=(1, 1), ncore=1)
+        scanner = mc.density_fit().as_scanner()
+        moved = mol.set_geom_(
+            "H 0 0 0; H 0 0 0.92; H 0 0 2.2; H 0 0 3.1",
+            inplace=False)
+
+        scanner.reset(moved)
+
+        self.assertIs(scanner.with_df.mol, moved)
+        numpy.testing.assert_allclose(
+            scanner.with_df.mol.atom_coords(), moved.atom_coords(),
+            atol=0, rtol=0)
 
     def test_as_scanner_rejects_changed_system_model(self):
         mol = gto.M(

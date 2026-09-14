@@ -50,6 +50,7 @@ from pyscf.mcscf import addons_gas
 from pyscf.mcscf import df as mcdf
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
+from pyscf.mcscf import mc1step
 from pyscf.mcscf import newton_casscf
 
 __all__ = ["GASSCF", "DFGASSCF"]
@@ -131,11 +132,33 @@ class _GASSCFLogFilter:
         return getattr(self._stream, name)
 
 
+class _GASSCFLogger(logger.Logger):
+    """Logger for native Newton without global stream mutation."""
+
+    def warn(self, msg, *args):
+        rendered = msg % args if args else msg
+        if any(text in rendered for text in _GASSCFLogFilter._DROP_SUBSTRINGS):
+            return
+        if "SO-CASSCF" in rendered and "experimental feature" in rendered:
+            return
+        return super().warn(msg, *args)
+
+
+def _gasscf_newton_kernel(casscf, *args, **kwargs):
+    """Run native Newton with calculation-local GAS logging."""
+
+    verbose = kwargs.get("verbose", logger.NOTE)
+    if not isinstance(verbose, logger.Logger):
+        verbose = _GASSCFLogger(casscf.stdout, verbose)
+    kwargs["verbose"] = verbose
+    return newton_casscf.kernel(casscf, *args, **kwargs)
+
+
 class _GASFCISolver(fci_gas.FCISolver):
     """GASCI solver shell with GASSCF-owned helper plans.
 
     Ordinary GASCI remains implemented by :mod:`fci_gas`.  This subclass owns
-    only reusable helper plans needed by the staged GASSCF orbital optimizer.
+    only reusable helper plans needed by the joint GASSCF orbital optimizer.
     Adapted or copied solvers always start with empty caches, so C workspaces
     are never borrowed across solver objects.
     """
@@ -302,8 +325,8 @@ class _GASFCISolver(fci_gas.FCISolver):
         PySCF's native Newton CASSCF helper packs a state-specific CI vector as
         ``[ci]`` when building initial density matrices.  GASCI public methods
         operate on one flattened GAS CI vector.  This bridge accepts only the
-        singleton state-specific form here; true multiroot/state-average logic
-        is staged later at the GASSCF object level.
+        singleton state-specific form here; multiroot/state-average logic
+        is handled at the outer GASSCF object level.
         """
 
         if isinstance(ci, (list, tuple)):
@@ -399,13 +422,17 @@ class _GASFCISolver(fci_gas.FCISolver):
         return result
 
 
+def _validated_user_gas_orbs(gas_orbs):
+    """Validate GAS orbital counts with the GASCI integer contract."""
+
+    return addons_gas._integer_vector(gas_orbs, "gas_orbs")
+
+
 def _new_gas_solver(mf, gas_orbs, gas_restr, gas_restr_type, cache_plans):
     if gas_orbs is None:
         raise ValueError(
             "gas_orbs is required without an explicit GASCI solver")
-    gas_orbs = tuple(int(value) for value in gas_orbs)
-    if any(value <= 0 for value in gas_orbs):
-        raise ValueError("gas_orbs entries must be positive integers")
+    gas_orbs = _validated_user_gas_orbs(gas_orbs)
     if gas_restr_type is None:
         gas_restr_type = addons_gas.GAS_RESTR_SPIN_SUPERGROUP
     if cache_plans is None:
@@ -414,7 +441,6 @@ def _new_gas_solver(mf, gas_orbs, gas_restr, gas_restr_type, cache_plans):
         getattr(mf, "mol", None), gas_orbs=gas_orbs,
         gas_restr=gas_restr, gas_restr_type=gas_restr_type,
         cache_plans=cache_plans)
-
 
 def _decorated_solver_classes():
     """Return native wrapper classes that should decorate GASSCF, not solver."""
@@ -448,9 +474,7 @@ def _adapt_solver(fcisolver, cache_plans):
 
     if solver.gas_orbs is None:
         raise ValueError("explicit GASCI solver must define gas_orbs")
-    solver.gas_orbs = tuple(int(value) for value in solver.gas_orbs)
-    if any(value <= 0 for value in solver.gas_orbs):
-        raise ValueError("explicit GASCI solver gas_orbs entries must be positive")
+    solver.gas_orbs = _validated_user_gas_orbs(solver.gas_orbs)
     if solver.gas_restr_type is None:
         solver.gas_restr_type = addons_gas.GAS_RESTR_SPIN_SUPERGROUP
     if cache_plans is None:
@@ -499,6 +523,7 @@ def _problem_signature(mc):
              None if getattr(mc.fcisolver, "ss_value", None) is None else
              float(mc.fcisolver.ss_value))),
         "frozen": _digest(mc.frozen),
+        "extrasym": _digest(mc.extrasym),
     }
 
 
@@ -594,8 +619,8 @@ class _GASSCFScanner(lib.SinglePointScanner):
         signature = _problem_signature(self)
         if signature != self._scan_problem:
             raise ValueError(
-                "GAS definition, roots, weights or frozen orbitals changed; "
-                "create a new scanner")
+                "GAS definition, roots, weights or orbital constraints "
+                "changed; create a new scanner")
 
         old_mol = self.mol
         previous_mo = None if self.mo_coeff is None else numpy.array(
@@ -709,12 +734,12 @@ class GASSCF(newton_casscf.CASSCF):
         frozen : int or sequence of ints, optional
             Frozen orbital specification forwarded to the native Newton class.
         cache_plans : bool, optional
-            Future policy for Newton-owned GAS contraction/RDM/spin plans.
+            Whether GASSCF reuses owned GAS contraction/RDM/spin plans.
 
     Notes:
-        This first implementation stage establishes the public object and
-        solver ownership convention only.  Later commits add the GAS orbital
-        rotation mask and native CIAH derivative adapter.
+        The optimizer reuses PySCF's native Newton/CIAH driver.  GAS-specific
+        CI, RDM, spin and orbital-rotation operations are supplied by the
+        determinant GASCI adapter.
     """
 
     _keys = set(newton_casscf.CASSCF._keys) | {
@@ -741,19 +766,13 @@ class GASSCF(newton_casscf.CASSCF):
 
 
     def _push_gasscf_log_labels(self):
-        """Install temporary stream filters for native Newton log labels."""
+        """Install a calculation-local filter for native Newton labels."""
 
         stdout = getattr(self, "stdout", None)
         restore_stdout = not isinstance(stdout, _GASSCFLogFilter)
         if restore_stdout:
             self.stdout = _GASSCFLogFilter(stdout)
-
-        stderr = sys.stderr
-        restore_stderr = not isinstance(stderr, _GASSCFLogFilter)
-        if restore_stderr:
-            sys.stderr = _GASSCFLogFilter(stderr)
-
-        return stdout, restore_stdout, stderr, restore_stderr
+        return stdout, restore_stdout
 
     def dump_flags(self, verbose=None):
         """Print GASSCF flags using GAS terminology."""
@@ -827,11 +846,11 @@ class GASSCF(newton_casscf.CASSCF):
 
 
     def validate_capabilities(self):
-        """Validate the currently staged GASSCF feature set.
+        """Validate the supported GASSCF feature set.
 
-        The production algorithm is still assembled in small commits.  This
+        This
         guard makes unsupported combinations fail before entering the native
-        CASSCF driver and sets the native ``internal_rotation`` flag whenever
+        CASSCF driver and sets ``internal_rotation`` whenever
         active-active inter-GAS rotations are part of the orbital variables.
         Ordinary state averaging is supported only when both the outer MCSCF
         object and the inner GASCI solver carry PySCF's matching SA wrappers.
@@ -918,7 +937,7 @@ class GASSCF(newton_casscf.CASSCF):
         ncore = int(ncore)
         ncas = int(ncas)
         nocc = ncore + ncas
-        gas_orbs = tuple(int(value) for value in self.gas_orbs)
+        gas_orbs = _validated_user_gas_orbs(self.gas_orbs)
         if sum(gas_orbs) != ncas:
             raise ValueError("sum(gas_orbs) must equal ncas")
 
@@ -956,7 +975,7 @@ class GASSCF(newton_casscf.CASSCF):
     def _normalized_restriction(self, return_info=False):
         """Return the normalized GAS definition used by GASCI kernels."""
 
-        gas_orbs = tuple(int(value) for value in self.gas_orbs)
+        gas_orbs = _validated_user_gas_orbs(self.gas_orbs)
         return addons_gas.normalize_gas_spec(
             gas_orbs, self._effective_nelecas(),
             self.gas_restr, self.gas_restr_type,
@@ -1118,12 +1137,16 @@ class GASSCF(newton_casscf.CASSCF):
         self.fcisolver.mol = self.mol
         return mo_coeff, ci0
 
-    def _run_fixed_orbital_gasci(self, mo_coeff=None, ci0=None, verbose=None):
+    def _run_fixed_orbital_gasci(
+            self, mo_coeff=None, ci0=None, verbose=None, eris=None):
         """Run fixed-orbital GASCI and update PySCF-style result slots."""
 
         mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(mo_coeff, ci0)
+        gasci_obj = (
+            self if eris is None else
+            mc1step._fake_h_for_fast_casci(self, mo_coeff, eris))
         self.e_tot, self.e_cas, self.ci = gasci.kernel(
-            self, mo_coeff, ci0=ci0, verbose=verbose)
+            gasci_obj, mo_coeff, ci0=ci0, verbose=verbose)
         if getattr(self.fcisolver, "converged", None) is not None:
             self.converged = bool(numpy.all(self.fcisolver.converged))
         else:
@@ -1134,9 +1157,8 @@ class GASSCF(newton_casscf.CASSCF):
     def gasci(self, mo_coeff=None, ci0=None, verbose=None):
         """Run the fixed-orbital GASCI problem associated with this object.
 
-        This method is a convenience bridge used while the Newton/CIAH
-        derivative adapter is staged separately.  It does not optimize
-        orbitals.
+        This convenience method solves the GASCI problem associated with the
+        current orbitals without performing orbital optimization.
         """
 
         e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
@@ -1149,7 +1171,7 @@ class GASSCF(newton_casscf.CASSCF):
 
         log = logger.new_logger(self, verbose)
         e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
-            mo_coeff, ci0, verbose)
+            mo_coeff, ci0, verbose, eris=eris)
 
         if numpy.ndim(e_gas) != 0:
             raise RuntimeError(
@@ -1262,7 +1284,7 @@ class GASSCF(newton_casscf.CASSCF):
 
         Zero-weight roots are retained exactly as requested, so they may still
         contribute to the native CI-response path even though they do not enter
-        the scalar energy objective.  ``wfnsym`` and SA-mix are staged later.
+        the scalar energy objective.  ``wfnsym`` and SA-mix are not supported.
         """
 
         if wfnsym is not None:
@@ -1438,10 +1460,9 @@ class GASSCF(newton_casscf.CASSCF):
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
         """Run full GASSCF orbital optimization with native CIAH.
 
-        This staged bridge reuses PySCF's native Newton/CIAH macro/micro
-        control flow.  GAS-specific behavior enters through the GAS orbital
-        mask, the fixed-orbital GASCI ``casci`` bridge, and the Newton-owned
-        GASCI solver dispatch methods staged above.
+        The native Newton/CIAH macro/micro control flow is reused directly.
+        GAS-specific behavior enters through the orbital mask, fixed-orbital
+        GASCI bridge, and GASCI solver dispatch methods above.
         """
 
         self.validate_capabilities()
@@ -1451,10 +1472,10 @@ class GASSCF(newton_casscf.CASSCF):
             e_tot, e_gas, ci = self._run_fixed_orbital_gasci(mo, ci0)
             self.mo_energy = None
             return e_tot, e_gas, ci, self.mo_coeff, self.mo_energy
-        (stdout, restore_stdout, stderr, restore_stderr) = (
-            self._push_gasscf_log_labels())
+        stdout, restore_stdout = self._push_gasscf_log_labels()
         try:
-            result = super().kernel(mo_coeff, ci0, callback)
+            result = mc1step.CASSCF.kernel(
+                self, mo_coeff, ci0, callback, _gasscf_newton_kernel)
             self._sync_spin_penalty_results()
             return result
         finally:
@@ -1462,10 +1483,6 @@ class GASSCF(newton_casscf.CASSCF):
             if restore_stdout:
                 self.stdout.flush()
                 self.stdout = stdout
-            if restore_stderr:
-                sys.stderr.flush()
-                sys.stderr = stderr
-
     def mc1step(self, mo_coeff=None, ci0=None, callback=None):
         return self.kernel(mo_coeff, ci0, callback)
 
@@ -1481,7 +1498,7 @@ class GASSCF(newton_casscf.CASSCF):
     @gas_orbs.setter
     def gas_orbs(self, value):
         self.fcisolver.gas_orbs = (
-            None if value is None else tuple(int(item) for item in value))
+            None if value is None else _validated_user_gas_orbs(value))
 
     @property
     def gas_restr(self):
