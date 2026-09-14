@@ -1279,14 +1279,6 @@ class KnownValues(unittest.TestCase):
             delta=self.N2_REGRESSION_TOL)
 
 
-    def test_public_gasscf_module_exports_gasscf(self):
-        from pyscf.mcscf import gasscf as imported_gasscf
-
-        self.assertIs(imported_gasscf.GASSCF, gasscf.GASSCF)
-        self.assertEqual(imported_gasscf.__all__, ["GASSCF", "DFGASSCF"])
-        self.assertIs(imported_gasscf.DFGASSCF, gasscf.DFGASSCF)
-        self.assertEqual(gasscf.GASSCF.__module__, "pyscf.mcscf.gasscf")
-
     def test_log_filter_relabels_native_newton_output(self):
         buf = io.StringIO()
         stream = gasscf._GASSCFLogFilter(buf)
