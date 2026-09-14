@@ -74,15 +74,16 @@ class _GASSCFLogFilter:
         "Its performance is bad for large systems.",
     )
     _REPLACEMENTS = (
-        ("Start SO-CASSCF (newton CASSCF)", "Start SO-GASSCF"),
-        ("newton CASSCF", "GASSCF"),
+        ("Start SO-CASSCF (newton CASSCF)",
+         "Start SO-GASSCF (newton GASSCF)"),
+        ("newton CASSCF", "newton GASSCF"),
         ("Second order CASSCF", "Second order GASSCF"),
         ("SO-CASSCF", "SO-GASSCF"),
         ("CASSCF", "GASSCF"),
         ("CASCI", "GASCI"),
         ("CAS (", "GAS ("),
-        ("CAS space", "GAS active space"),
-        ("CAS-space", "GAS active-space"),
+        ("CAS space", "GAS space"),
+        ("CAS-space", "GAS-space"),
         ("E(CI)", "E(GASCI)"),
     )
 
@@ -1142,17 +1143,68 @@ class GASSCF(newton_casscf.CASSCF):
             mo_coeff, ci0, verbose)
         return e_tot, e_gas, ci, self.mo_coeff, self.mo_energy
 
-    def casci(self, mo_coeff=None, ci0=None, eris=None, verbose=None, envs=None):
-        """Run a fixed-orbital GASCI solve with native-CASSCF call signature."""
+    def casci(self, mo_coeff=None, ci0=None, eris=None,
+              verbose=None, envs=None):
+        """Run fixed-orbital GASCI with native Newton-CASSCF log semantics."""
 
+        log = logger.new_logger(self, verbose)
         e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
             mo_coeff, ci0, verbose)
+
         if numpy.ndim(e_gas) != 0:
             raise RuntimeError(
-                "Multiple roots are detected in fcisolver.  GASSCF "
-                "does not yet know which state to optimize.\n"
-                "Use a state-specific solver or wait for staged state-average "
-                "support.")
+                "Multiple roots are detected in fcisolver.  GASSCF does not "
+                "know which state to optimize.\n"
+                "Use state_average(weights) for a multiroot GASSCF objective.")
+
+        # Mirror pyscf.mcscf.newton_casscf.CASSCF.casci logging exactly,
+        # changing only CAS/CASSCF terminology to GAS/GASSCF.
+        if envs is not None and log.verbose >= logger.INFO:
+            log.debug("GAS space CI energy = %.15g", e_gas)
+
+            ss = None
+            if getattr(self.fcisolver, "spin_square", None):
+                try:
+                    ss = self.fcisolver.spin_square(
+                        ci, self.ncas, self.nelecas)
+                except NotImplementedError:
+                    ss = None
+
+            if "imacro" in envs:
+                stat = envs["stat"]
+                if ss is None:
+                    log.info(
+                        "macro %d (%d JK  %d micro), "
+                        "GASSCF E = %.15g  dE = %.4g  |grad|=%5.3g",
+                        envs["imacro"],
+                        stat.tot_hop + stat.tot_kf,
+                        stat.imic,
+                        e_tot,
+                        e_tot - envs["elast"],
+                        envs["norm_gall"],
+                    )
+                else:
+                    log.info(
+                        "macro %d (%d JK  %d micro), "
+                        "GASSCF E = %.15g  dE = %.4g  |grad|=%5.3g  "
+                        "S^2 = %.7f",
+                        envs["imacro"],
+                        stat.tot_hop + stat.tot_kf,
+                        stat.imic,
+                        e_tot,
+                        e_tot - envs["elast"],
+                        envs["norm_gall"],
+                        ss[0],
+                    )
+            else:
+                elast = envs.get("elast", 0)
+                if ss is None:
+                    log.info("GASCI E = %.15g", e_tot)
+                else:
+                    log.info(
+                        "GASCI E = %.15g  dE = %.8g  S^2 = %.7f",
+                        e_tot, e_tot - elast, ss[0])
+
         return e_tot, e_gas, ci
 
     def canonicalize(self, mo_coeff=None, ci=None, eris=None, sort=False,
