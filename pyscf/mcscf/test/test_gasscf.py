@@ -20,6 +20,8 @@
 
 from functools import reduce
 import io
+from pathlib import Path
+import tempfile
 import sys
 import unittest
 from unittest import mock
@@ -28,6 +30,7 @@ import numpy
 
 from pyscf import gto
 from pyscf import scf
+from pyscf.tools import molden
 from pyscf.fci import addons as fci_addons
 from pyscf.fci import direct_spin1
 from pyscf.mcscf import addons
@@ -2074,6 +2077,189 @@ class KnownValues(unittest.TestCase):
             obj.close()
             obj.cache_plans = False
             self.assertAlmostEqual(obj.spin_square()[0], expected, places=11)
+
+    def test_n2_sort_mo_preserves_requested_gas_order(self):
+        mc, ref, _ = self._n2_property_pair()
+        before = mc.mo_coeff.copy()
+        gaslst = [[4, 2], [7, 5, 6, 3], [9, 8]]
+        order = [0, 1, 4, 2, 7, 5, 6, 3, 9, 8] + list(range(10, before.shape[1]))
+        actual = mc.sort_mo(gaslst, base=0)
+        numpy.testing.assert_array_equal(actual, before[:, order])
+        numpy.testing.assert_array_equal(actual, ref.sort_mo(gaslst, base=0))
+        one_based = [[i + 1 for i in block] for block in gaslst]
+        numpy.testing.assert_array_equal(mc.sort_mo(one_based), actual)
+        numpy.testing.assert_array_equal(mc.mo_coeff, before)
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            mc.sort_mo([[2, 2], [4, 5, 6, 7], [8, 9]], base=0)
+        with self.assertRaisesRegex(ValueError, "subspace lists"):
+            mc.sort_mo(list(range(2, 10)), base=0)
+
+    def test_n2_get_fock_supports_gas_density_and_native_calls(self):
+        mc, _, _ = self._n2_property_pair()
+        for use_df in (False, True):
+            obj = mc.density_fit() if use_df else mc.copy()
+            obj = obj.state_average((.25, .75))
+            self.addCleanup(obj.close)
+            dm = obj.make_gasdm1()
+            dm_ao = obj.make_rdm1()
+            vj, vk = obj._scf.get_jk(obj.mol, dm_ao)
+            expected = obj.get_hcore() + vj - .5 * vk
+            numpy.testing.assert_allclose(obj.get_fock(), expected,
+                                          atol=2e-10, rtol=0)
+            eris = obj.ao2mo(obj.mo_coeff)
+            for density in (dm, obj.make_gasdm1(state=1)):
+                with self.subTest(df=use_df), mock.patch.object(
+                        obj._scf, "get_jk", side_effect=AssertionError("reuse ERIS")):
+                    actual = obj.get_fock(eris=eris, gasdm1=density)
+                    numpy.testing.assert_allclose(
+                        obj.get_fock(eris=eris, casdm1=density), actual,
+                        atol=2e-10, rtol=0)
+                    numpy.testing.assert_allclose(
+                        obj.get_fock(obj.mo_coeff, obj.ci, eris, density, 0),
+                        actual, atol=2e-10, rtol=0)
+            with self.assertRaisesRegex(ValueError, "only one"):
+                obj.get_fock(gasdm1=dm, casdm1=dm)
+
+    def test_n2_natural_orbitals_reconstruct_selected_and_average_density(self):
+        mc, ref, roots = self._n2_property_pair()
+        overlap = mc._scf.get_ovlp()
+        ncore, nocc = mc.ncore, mc.ncore + mc.ncas
+        active = slice(ncore, nocc)
+        for weights in (None, (.25, .75), (1., 0.)):
+            obj = mc.copy() if weights is None else mc.state_average(weights)
+            reference = ref if weights is None else ref.state_average(weights)
+            self.addCleanup(obj.close)
+            before = obj.mo_coeff.copy()
+            for state in (0, 1, None):
+                if state is None:
+                    if weights is None:
+                        with self.assertRaisesRegex(ValueError, "state-average"):
+                            obj.get_gas_average_natorb()
+                        continue
+                    mo, occ = obj.get_gas_average_natorb()
+                    _, ref_occ = reference.get_gas_average_natorb()
+                else:
+                    mo, occ = obj.get_gas_natorb(state=state)
+                    _, ref_occ = reference.get_gas_natorb(state=state)
+                with self.subTest(weights=weights, state=state):
+                    self.assertEqual(mo.shape, before.shape)
+                    self.assertEqual(occ.shape, (obj.ncas,))
+                    numpy.testing.assert_allclose(occ, ref_occ, atol=2e-12, rtol=0)
+                    numpy.testing.assert_allclose(mo.T @ overlap @ mo,
+                                                  numpy.eye(mo.shape[1]), atol=2e-9)
+                    numpy.testing.assert_array_equal(mo[:, :ncore], before[:, :ncore])
+                    numpy.testing.assert_array_equal(mo[:, nocc:], before[:, nocc:])
+                    dm = 2 * mo[:, :ncore] @ mo[:, :ncore].T
+                    dm += (mo[:, active] * occ) @ mo[:, active].T
+                    numpy.testing.assert_allclose(dm, obj.make_rdm1(state=state),
+                                                  atol=2e-11, rtol=0)
+            # No orbital/CI replacement is allowed for analysis-only methods.
+            numpy.testing.assert_array_equal(obj.mo_coeff, before)
+            for original, actual in zip(roots, obj.ci):
+                numpy.testing.assert_array_equal(actual, original)
+            with self.assertRaisesRegex(ValueError, "explicit state"):
+                obj.get_gas_natorb(state=None)
+
+    def test_n2_pseudo_natural_orbitals_preserve_gas_subspaces(self):
+        mc, ref, roots = self._n2_property_pair()
+        obj = mc.state_average((.25, .75))
+        self.addCleanup(obj.close)
+        overlap = obj._scf.get_ovlp()
+        before = obj.mo_coeff.copy()
+        active = slice(obj.ncore, obj.ncore + obj.ncas)
+        for state in (None, 0, 1):
+            mo, occupations = obj.get_gas_pseudo_natorb(state=state)
+            self.assertIsInstance(occupations, tuple)
+            self.assertEqual(tuple(len(o) for o in occupations), obj.gas_orbs)
+            self._assert_property_close(
+                occupations, obj.get_gas_pseudo_natorb_occupations(state=state))
+            dm = obj.make_gasdm1(state=state)
+            rotation = before[:, active].T @ overlap @ mo[:, active]
+            allowed = numpy.zeros_like(rotation, dtype=bool)
+            offset = 0
+            for size, occ in zip(obj.gas_orbs, occupations):
+                block = slice(offset, offset + size)
+                allowed[block, block] = True
+                u = rotation[block, block]
+                numpy.testing.assert_allclose(
+                    u.T @ dm[block, block] @ u, numpy.diag(occ), atol=2e-9)
+                offset += size
+            numpy.testing.assert_allclose(rotation[~allowed], 0., atol=2e-9)
+            numpy.testing.assert_allclose(mo.T @ overlap @ mo,
+                                          numpy.eye(mo.shape[1]), atol=2e-9)
+            numpy.testing.assert_array_equal(obj.mo_coeff, before)
+            for original, actual in zip(roots, obj.ci):
+                numpy.testing.assert_array_equal(actual, original)
+        _, ref_occ = ref.get_gas_pseudo_natorb(state=1)
+        self._assert_property_close(occupations, ref_occ)
+
+    def test_n2_analysis_orbitals_can_be_exported_to_molden(self):
+        mc, _, roots = self._n2_property_pair()
+        obj = mc.state_average((.25, .75))
+        self.addCleanup(obj.close)
+        before = obj.mo_coeff.copy()
+        orbitals = (
+            obj.get_gas_natorb(state=1), obj.get_gas_average_natorb(),
+            obj.get_gas_pseudo_natorb())
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (mo, active_occ) in enumerate(orbitals):
+                if isinstance(active_occ, tuple):
+                    active_occ = numpy.concatenate(active_occ)
+                occ = numpy.zeros(mo.shape[1])
+                occ[:obj.ncore] = 2.
+                occ[obj.ncore:obj.ncore + obj.ncas] = active_occ
+                path = str(Path(directory) / ("gas_%d.molden" % index))
+                molden.from_mo(obj.mol, path, mo, occ=occ,
+                               ene=numpy.zeros(mo.shape[1]), ignore_h=False)
+                loaded_mol, energies, loaded_mo, loaded_occ, _, _ = molden.load(path)
+                self.assertEqual(loaded_mol.nao_nr(), obj.mol.nao_nr())
+                numpy.testing.assert_allclose(loaded_mo, mo, atol=1e-12, rtol=0)
+                # Molden writes occupation numbers with five decimal places.
+                numpy.testing.assert_allclose(loaded_occ, occ, atol=5.1e-6, rtol=0)
+                numpy.testing.assert_array_equal(energies, numpy.zeros(mo.shape[1]))
+        numpy.testing.assert_array_equal(obj.mo_coeff, before)
+        for original, actual in zip(roots, obj.ci):
+            numpy.testing.assert_array_equal(actual, original)
+
+    def test_n2_analyze_reports_gas_properties_and_returns_ao_density(self):
+        mc, ref, roots = self._n2_property_pair()
+        # Supply consistent fixed-orbital energies for the analysis report.
+        h1, ecore = mc.get_h1gas()
+        h2 = mc.get_h2gas()
+        energies = [ref.fcisolver.energy(h1, h2, ci, mc.ncas, mc.nelecas)
+                    + ecore for ci in roots]
+        for weights in (None, (.25, .75), (1., 0.)):
+            obj = mc.copy() if weights is None else mc.state_average(weights)
+            self.addCleanup(obj.close)
+            if weights is None:
+                obj.ci = roots[0].copy()
+                obj.e_tot = energies[0]
+                states = (None,)
+            else:
+                obj.fcisolver.e_states = numpy.array(energies)
+                obj.e_tot = numpy.dot(weights, energies)
+                states = (None, 1)
+            before_mo = obj.mo_coeff.copy()
+            before_ci = numpy.array(obj.ci, copy=True)
+            before_energy = obj.e_tot
+            for state in states:
+                obj.stdout = io.StringIO()
+                # Full population-analysis output, including the GAS labels.
+                actual = obj.analyze(verbose=4, state=state, with_meta_lowdin=False)
+                self._assert_property_close(actual, obj.make_rdm1s(state=state))
+                log = obj.stdout.getvalue()
+                self.assertIn("GASSCF analysis", log)
+                self.assertIn("GASSCF state", log)
+                self.assertIn("GAS subspace 3", log)
+                self.assertIn("pseudo-natural occupations", log)
+                self.assertIn("Largest GAS CI components", log)
+            numpy.testing.assert_array_equal(obj.mo_coeff, before_mo)
+            numpy.testing.assert_array_equal(numpy.asarray(obj.ci), before_ci)
+            self.assertEqual(obj.e_tot, before_energy)
+        ref.stdout = io.StringIO()
+        ref.e_tot = numpy.array(energies)
+        ref.analyze(verbose=4, state=0, with_meta_lowdin=False)
+        self.assertIn("GASCI analysis", ref.stdout.getvalue())
 
     def test_newton_solver_hides_native_cas_only_hooks(self):
         base = fci_gas.FCISolver(gas_orbs=(2,))

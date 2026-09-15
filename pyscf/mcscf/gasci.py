@@ -1085,7 +1085,8 @@ class GASCI(casci.CASCI):
             root_labels = [selected]
 
         log.info("")
-        log.info("******** GASCI analysis ********")
+        label_name = getattr(self, "_gas_analysis_label", "GASCI")
+        log.info("******** %s analysis ********", label_name)
         weights = self._state_weights()
         energies = numpy.asarray(self.e_states if weights is not None else
                                  self.e_tot).reshape(-1)
@@ -1095,13 +1096,13 @@ class GASCI(casci.CASCI):
             ss, mult = spin
             energy_index = label if energies.size > 1 else 0
             if weights is None:
-                log.note("GASCI state %3d  E = %#.15g  S^2 = %.7f  "
-                         "multiplicity = %.7f", label,
+                log.note("%s state %3d  E = %#.15g  S^2 = %.7f  "
+                         "multiplicity = %.7f", label_name, label,
                          energies[energy_index], ss, mult)
             else:
-                log.note("GASCI state %3d  weight = %g  E = %#.15g  "
+                log.note("%s state %3d  weight = %g  E = %#.15g  "
                          "S^2 = %.7f  multiplicity = %.7f",
-                         label, weights[label], energies[energy_index],
+                         label_name, label, weights[label], energies[energy_index],
                          ss, mult)
 
         density_state = None if weights is not None and state is None else (

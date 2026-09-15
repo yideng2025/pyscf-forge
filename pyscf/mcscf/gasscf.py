@@ -748,6 +748,28 @@ class GASSCF(newton_casscf.CASSCF):
         The optimizer reuses PySCF's native Newton/CIAH driver.  GAS-specific
         CI, RDM, spin and orbital-rotation operations are supplied by the
         determinant GASCI adapter.
+
+    Natural-orbital analysis:
+        ``get_gas_natorb(state=i)`` returns a full MO matrix and active-space
+        occupations for root i. ``get_gas_average_natorb()`` uses the SA
+        density. ``get_gas_pseudo_natorb()`` diagonalizes each GAS block and
+        returns occupations as one array per subspace. These methods leave
+        the computational orbitals and CI vectors unchanged.
+
+        Analysis orbitals can be exported with PySCF's Molden writer::
+
+            from pyscf.tools import molden
+            mo_no, active_occ = mc.get_gas_natorb(state=0)
+            occupations = numpy.zeros(mo_no.shape[1])
+            occupations[:mc.ncore] = 2
+            occupations[mc.ncore:mc.ncore + mc.ncas] = active_occ
+            # Zero energy placeholders; occupations are not orbital energies.
+            molden.from_mo(mc.mol, "gas_natorb.molden", mo_no,
+                           occ=occupations, ene=numpy.zeros(mo_no.shape[1]))
+
+        For pseudo-natural orbitals, concatenate the occupation arrays in
+        GAS order before filling the active slice. These block occupations
+        alone do not represent off-diagonal density between GAS subspaces.
     """
 
     _keys = set(newton_casscf.CASSCF._keys) | {
@@ -1085,6 +1107,34 @@ class GASSCF(newton_casscf.CASSCF):
     make_rdm1 = gasci.GASCI.make_rdm1
     make_rdm1s = gasci.GASCI.make_rdm1s
     spin_square = gasci.GASCI.spin_square
+
+    # Reuse GASCI analysis without installing analysis orbitals on this object.
+    _check_mo_orthonormality = gasci.GASCI._check_mo_orthonormality
+    _natural_eigensystem = staticmethod(gasci.GASCI._natural_eigensystem)
+    _rotate_gas_orbitals = gasci.GASCI._rotate_gas_orbitals
+    sort_mo = gasci.GASCI.sort_mo
+    get_gas_natorb = gasci.GASCI.get_gas_natorb
+    get_gas_average_natorb = gasci.GASCI.get_gas_average_natorb
+    get_gas_pseudo_natorb = gasci.GASCI.get_gas_pseudo_natorb
+    get_gas_pseudo_natorb_occupations = gasci.GASCI.get_gas_pseudo_natorb_occupations
+    _gas_analysis_label = "GASSCF"
+    analyze = gasci.GASCI.analyze
+
+    def get_fock(self, mo_coeff=None, ci=None, eris=None, gasdm1=None,
+                 verbose=None, *, casdm1=None):
+        """Build the AO generalized Fock matrix with GASCI's density API.
+
+        ``gasdm1`` can select a root-specific density on an SA object.
+        ``casdm1`` is a compatibility alias for native PySCF callers; supply
+        only one of the two. Positional arguments retain the native order.
+        """
+
+        if casdm1 is not None:
+            if gasdm1 is not None:
+                raise ValueError("supply only one of gasdm1 and casdm1")
+            gasdm1 = casdm1
+        return gasci.GASCI.get_fock(
+            self, mo_coeff, ci, eris, gasdm1, verbose)
 
     def get_h1gas(self, mo_coeff=None, ncas=None, ncore=None):
         """Return the effective one-electron Hamiltonian in the GAS space."""
