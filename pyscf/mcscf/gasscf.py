@@ -751,7 +751,9 @@ class GASSCF(newton_casscf.CASSCF):
     """
 
     _keys = set(newton_casscf.CASSCF._keys) | {
-        "gas_orbs", "gas_restr", "gas_restr_type", "cache_plans"}
+        "gas_orbs", "gas_restr", "gas_restr_type", "cache_plans",
+        "e_spin_penalty", "e_tot_physical", "e_gas_physical",
+        "spin_penalty_method"}
 
     def __init__(self, mf, ncas=None, nelecas=None, gas_orbs=None,
                  gas_restr=None, gas_restr_type=None, *, ncore=None, frozen=None,
@@ -789,6 +791,10 @@ class GASSCF(newton_casscf.CASSCF):
         super().__init__(mf, ncas, nelecas, ncore=ncore, frozen=frozen)
         self.fcisolver = solver
         self.fcisolver.mol = self.mol
+        self.e_spin_penalty = None
+        self.e_tot_physical = None
+        self.e_gas_physical = None
+        self.spin_penalty_method = None
 
 
     def _push_gasscf_log_labels(self):

@@ -2421,6 +2421,49 @@ class KnownValues(unittest.TestCase):
         self.assertIn("GASSCF", scanner.__class__.__name__)
         self.assertIs(scanner.as_scanner(), scanner)
 
+    def test_repeated_kernel_and_scanner_spin_results_pass_sanity(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
+            basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        for spin_penalty in (False, True):
+            with self.subTest(spin_penalty=spin_penalty):
+                mc = gasscf.GASSCF(
+                    mf, 2, (1, 1), gas_orbs=(2,), ncore=1)
+                mc.max_cycle_macro = 1
+                mc.max_cycle_micro = 1
+                mc.canonicalization = False
+                if spin_penalty:
+                    mc.fix_spin_(shift=.2, ss=0)
+                mc.verbose = 4
+                mc.stdout = io.StringIO()
+                errors = io.StringIO()
+                # Do not let earlier tests hide a warning through warn-once.
+                with mock.patch.dict(gasscf.lib.misc._warn_once_registry,
+                                     {}, clear=True), \
+                        mock.patch.object(sys, "stderr", errors):
+                    mc.kernel(mf.mo_coeff)
+                    mc.kernel(mc.mo_coeff, mc.ci)
+                    scanner = mc.as_scanner()
+                    for distance in (.92, .94):
+                        energy = scanner(
+                            "H 0 0 0; H 0 0 %s; H 0 0 2.2; H 0 0 3.1"
+                            % distance)
+                        self.assertTrue(numpy.isfinite(energy))
+                        penalty = scanner.e_spin_penalty
+                        if spin_penalty:
+                            self.assertIsNotNone(penalty)
+                        else:
+                            self.assertIsNone(penalty)
+                            penalty = 0.
+                        self.assertAlmostEqual(
+                            scanner.e_tot_physical + penalty, energy, 10)
+                        self.assertAlmostEqual(
+                            scanner.e_gas_physical + penalty,
+                            scanner.e_gas, 10)
+                self.assertNotIn("does not have attributes", errors.getvalue())
+                self.assertNotIn("does not have attributes", mc.stdout.getvalue())
+
     def test_as_scanner_rejects_changed_extrasym_constraint(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
