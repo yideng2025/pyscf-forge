@@ -236,6 +236,32 @@ def _spin_penalty_parameters(solver, norb, nelec):
     return shift, target, minimum, tuple(float(x) for x in eigenvalues)
 
 
+def _spin_penalty_action(contract_ss, vector, parameters):
+    """Apply the GAS spin penalty, without adding the physical Hamiltonian.
+
+    Shared by the fixed-orbital solver and the Newton CI derivatives. The
+    supplied contraction owns/reuses its spin plan; the input is not modified.
+    """
+    shift, target, minimum, _ = parameters
+    delta = numpy.asarray(contract_ss(vector)) - target * vector
+    if target >= minimum + 0.1:
+        delta = numpy.asarray(contract_ss(delta)) - target * delta
+    return shift * delta
+
+
+def _spin_penalty_diagonal(spin_diagonal, parameters):
+    """Return the shared Davidson/Newton penalty preconditioner diagonal.
+
+    For the quadratic penalty this is (diag(S^2)-target)^2, an inexpensive
+    approximation, not diag((S^2-target)^2). Operator actions remain exact.
+    """
+    shift, target, minimum, _ = parameters
+    delta = spin_diagonal - target
+    if target >= minimum + 0.1:
+        delta = delta * delta
+    return shift * delta
+
+
 class _GasSpinPlan:
     """Reusable block-sparse ``S^2`` contraction plan.
 
@@ -1173,11 +1199,8 @@ class FCISolver(direct_spin1.FCISolver):
                     if full_spin_pspace:
                         s2 = spin_plan.matrix()
                         s2 = s2[numpy.ix_(addresses, addresses)]
-                        delta_s2 = s2 - spin_target * numpy.eye(gas.ndet)
-                        if linear_spin_penalty:
-                            h0 += spin_shift * delta_s2
-                        else:
-                            h0 += spin_shift * numpy.dot(delta_s2, delta_s2)
+                        h0 += _spin_penalty_action(
+                            s2.dot, numpy.eye(gas.ndet), spin_penalty)
                         self.spin_penalty_method = "exact-small-space"
                     eigenvalues, eigenvectors = numpy.linalg.eigh(h0)
                     e = eigenvalues[:nroots]
@@ -1263,33 +1286,14 @@ class FCISolver(direct_spin1.FCISolver):
                             h2e, vec, norb, nelec, plan=plan).reshape(-1)
                         if spin_penalty is None:
                             return result
-                        ss_vector = numpy.asarray(
-                            spin_plan.contract(vec)).reshape(-1)
-                        if linear_spin_penalty:
-                            ss_vector -= spin_target * vec
-                            result += spin_shift * ss_vector
-                            return result
-                        tmp = ss_vector - spin_target * vec
-                        correction = numpy.asarray(
-                            spin_plan.contract(tmp)).reshape(-1)
-                        correction -= spin_target * tmp
-                        result += spin_shift * correction
+                        result += _spin_penalty_action(
+                            spin_plan.contract, vec, spin_penalty)
                         return result
 
                     preconditioner_diagonal = hdiag
                     if spin_penalty is not None:
-                        spin_diagonal = spin_plan.diagonal_vector()
-                        delta_diagonal = spin_diagonal - spin_target
-                        if linear_spin_penalty:
-                            penalty_diagonal = spin_shift * delta_diagonal
-                        else:
-                            # This is the inexpensive diagonal approximation to
-                            # (S^2-target)^2.  The projected trial vectors
-                            # improve access to the target sector; this term
-                            # only improves Davidson conditioning.
-                            penalty_diagonal = (
-                                spin_shift * delta_diagonal * delta_diagonal)
-                        preconditioner_diagonal = hdiag + penalty_diagonal
+                        preconditioner_diagonal = hdiag + _spin_penalty_diagonal(
+                            spin_plan.diagonal_vector(), spin_penalty)
 
                     def precond(dx, e, *args):
                         denom = preconditioner_diagonal - e

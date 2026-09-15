@@ -36,6 +36,7 @@ from pyscf import scf
 from pyscf.tools import molden
 from pyscf.fci import addons as fci_addons
 from pyscf.fci import direct_spin1
+from pyscf.fci import spin_op
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
 from pyscf.mcscf import df as mcdf
@@ -2919,6 +2920,180 @@ class KnownValues(unittest.TestCase):
             mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=0)
         with self.assertRaisesRegex(ValueError, "target S"):
             complete.fix_spin_(shift=.2, ss=.5)
+
+    def _check_spin_penalty_newton_derivatives(self, use_df=False, weights=None):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+            gas_restr=((0, 1), (2, 2)), gas_restr_type='cumulative-occ')
+        self.addCleanup(mc.close)
+        if use_df:
+            mc = mc.density_fit()
+            self.addCleanup(mc.close)
+        if weights is not None:
+            mc = mc.state_average(weights)
+            self.addCleanup(mc.close)
+        mc.validate_capabilities()
+        mo = mf.mo_coeff
+        eris = mc.ao2mo(mo)
+        h1, core = mc.get_h1gas(mo)
+        h2 = mc.get_h2gas(mo)
+        absorbed = direct_spin1.absorb_h1e(h1, h2, mc.ncas, mc.nelecas, .5)
+        # Independent full-FCI operators projected into a genuine restricted
+        # GAS space. Deliberately mix spin sectors: pure-spin eigenvectors can
+        # hide a missing penalty in the CI gradient and curvature.
+        with mc.fcisolver.make_space(mc.ncas, mc.nelecas) as space:
+            eye = numpy.eye(space.ndet)
+            def project_action(action, column):
+                full = fci_gas.gas2fci(column, space)
+                return fci_gas.fci2gas(action(full), space).ravel()
+            hmat = numpy.column_stack([
+                project_action(lambda c: direct_spin1.contract_2e(
+                    absorbed, c, mc.ncas, mc.nelecas), c) for c in eye])
+            s2 = numpy.column_stack([
+                project_action(lambda c: spin_op.contract_ss(
+                    c, mc.ncas, mc.nelecas), c) for c in eye])
+        nroots = mc.fcisolver.nroots
+        rng = numpy.random.default_rng(211)
+        columns = numpy.linalg.qr(rng.normal(size=(eye.shape[0], nroots)))[0]
+        roots = [columns[:, i].copy() for i in range(nroots)]
+        directions = []
+        for c in roots:
+            v = rng.normal(size=c.size)
+            v -= c.dot(v) * c
+            directions.append(v / numpy.linalg.norm(v))
+        ci = roots[0] if weights is None else roots
+        w = (1.,) if weights is None else weights
+        native = newton_casscf.gen_g_hop(mc, mo, ci, eris)
+        ngorb = native[0].size - sum(c.size for c in roots)
+        ci_direction = numpy.r_[numpy.zeros(ngorb), numpy.concatenate(directions)]
+        orbital_direction = numpy.r_[rng.normal(size=ngorb),
+                                    numpy.zeros(native[0].size-ngorb)]
+        u = scipy.linalg.expm(.02 * mc.unpack_uniq_var(orbital_direction[:ngorb]))
+
+        for target in (0., 2.):  # Linear minimum-spin and quadratic penalties.
+            mc.fix_spin_(shift=.2, ss=target)
+            delta = s2 - target * eye
+            penalty = .2 * (delta if target == 0 else delta @ delta)
+            operator = hmat + penalty
+            def energy(angle):
+                vectors = [numpy.cos(angle)*c + numpy.sin(angle)*v
+                           for c, v in zip(roots, directions)]
+                return core + sum(a * c.dot(operator @ c)
+                                  for a, c in zip(w, vectors))
+            previous = None
+            for cache in (True, False):
+                mc.cache_plans = cache
+                with self.subTest(df=use_df, weights=weights,
+                                  target=target, cache=cache):
+                    g, update, hop, diagonal = mc.gen_g_hop(mo, ci, eris)
+                    # Public contraction remains physical, even with fix_spin.
+                    numpy.testing.assert_allclose(
+                        mc.fcisolver.contract_2e(absorbed, roots[0],
+                                                mc.ncas, mc.nelecas),
+                        hmat @ roots[0], atol=1e-12, rtol=0)
+                    first = numpy.dot(g, ci_direction)
+                    second = numpy.dot(ci_direction, hop(ci_direction))
+                    self.assertGreater(abs(first-native[0].dot(ci_direction)), 1e-3)
+                    for step in (2e-4, 1e-4):
+                        plus, minus, center = energy(step), energy(-step), energy(0)
+                        self.assertAlmostEqual(first, (plus-minus)/(2*step), delta=2e-7)
+                        self.assertAlmostEqual(second, (plus-2*center+minus)/step**2,
+                                               delta=2e-6)
+                    # Compare the full tangent CI response with an independent
+                    # projected full-FCI matrix, not just one quadratic form.
+                    response = hop(ci_direction)[ngorb:]
+                    start = 0
+                    for a, c, v in zip(w, roots, directions):
+                        block = response[start:start+c.size]
+                        expected = 2*a*(operator @ v - c.dot(operator @ c)*v)
+                        numpy.testing.assert_allclose(
+                            block-c*c.dot(block), expected-c*c.dot(expected),
+                            atol=1e-11, rtol=0)
+                        start += c.size
+                    # P is orbital independent: no extra orbital or mixed block.
+                    numpy.testing.assert_allclose(g[:ngorb], native[0][:ngorb], atol=0, rtol=0)
+                    numpy.testing.assert_allclose(hop(orbital_direction),
+                                                  native[2](orbital_direction), atol=1e-12)
+                    numpy.testing.assert_allclose(hop(ci_direction)[:ngorb],
+                                                  native[2](ci_direction)[:ngorb], atol=1e-12)
+                    # Check the keyframe update at changed, unnormalized CI and
+                    # rotated orbitals. Only the normalized CI penalty changes.
+                    current = [(1.2+i)*(c+.13*v)
+                               for i, (c, v) in enumerate(zip(roots, directions))]
+                    current_arg = current[0] if weights is None else current
+                    actual = update(u, current_arg)
+                    expected = native[1](u, current_arg)
+                    start = ngorb
+                    for a, c in zip(w, current):
+                        c = c / numpy.linalg.norm(c)
+                        expected[start:start+c.size] += 2*a*(penalty @ c-c.dot(penalty @ c)*c)
+                        start += c.size
+                    numpy.testing.assert_allclose(actual, expected, atol=1e-11)
+                    # Quadratic diagonal is a documented preconditioner
+                    # approximation, shared with Davidson; the HVP is exact.
+                    pd = .2 * (s2.diagonal()-target)
+                    if target != 0:
+                        pd = .2 * (s2.diagonal()-target)**2
+                    expected = native[3].copy()
+                    start = ngorb
+                    for a, c in zip(w, roots):
+                        ep = c.dot(penalty @ c)
+                        residual = penalty @ c-ep*c
+                        expected[start:start+c.size] += 2*a*(pd-ep-2*residual*c)
+                        start += c.size
+                    numpy.testing.assert_allclose(diagonal, expected, atol=1e-12)
+                    if weights is not None and weights[-1] == 0:
+                        numpy.testing.assert_allclose(g[-roots[-1].size:], 0, atol=0)
+                        numpy.testing.assert_allclose(hop(ci_direction)[-roots[-1].size:], 0, atol=0)
+                    values = (g, hop(ci_direction+orbital_direction), diagonal)
+                    if previous is not None:
+                        for a, b in zip(values, previous):
+                            numpy.testing.assert_allclose(a, b, atol=1e-12)
+                    previous = values
+            mc.undo_fix_spin_()
+
+    def test_spin_penalty_newton_derivatives(self):
+        self._check_spin_penalty_newton_derivatives()
+
+    def test_spin_penalty_sa_newton_derivatives(self):
+        for weights in ((.3, .7), (1., 0.)):
+            self._check_spin_penalty_newton_derivatives(weights=weights)
+
+    def test_spin_penalty_df_newton_derivatives(self):
+        for weights in (None, (.3, .7), (1., 0.)):
+            self._check_spin_penalty_newton_derivatives(use_df=True, weights=weights)
+
+    def test_spin_penalty_kernel_uses_local_newton_response(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        original = tuple(getattr(newton_casscf, name) for name in
+                         ('kernel', 'update_orb_ci', 'gen_g_hop'))
+        for weights in (None, (.3, .7), (1., 0.)):
+            mc = gasscf.GASSCF(mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                              gas_restr=((0, 1), (2, 2)),
+                              gas_restr_type='cumulative-occ')
+            if weights is not None:
+                mc = mc.state_average(weights)
+            self.addCleanup(mc.close)
+            mc.fix_spin_(shift=.2, ss=0.)
+            mc.max_cycle_macro = mc.max_cycle_micro = 1
+            seen = []
+            def callback(env):
+                # Native module functions stay unchanged even while the
+                # calculation is running, not merely restored on return.
+                for name, function in zip(('kernel', 'update_orb_ci', 'gen_g_hop'), original):
+                    self.assertIs(getattr(newton_casscf, name), function)
+                self.assertAlmostEqual(env['e_tot'], mc.spin_energy_report()['objective'], 10)
+                seen.append(True)
+            with mock.patch.object(gasscf, 'gen_g_hop', wraps=gasscf.gen_g_hop) as response:
+                result = mc.kernel(callback=callback)
+                self.assertGreater(response.call_count, 0)
+            self.assertTrue(seen)
+            self.assertAlmostEqual(result[0], mc.spin_energy_report()['physical'], 10)
 
     def _check_physical_energy_result(self, mc, result):
         report = mc.spin_energy_report()

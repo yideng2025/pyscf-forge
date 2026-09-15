@@ -39,6 +39,7 @@ from collections import OrderedDict
 import hashlib
 import json
 import sys
+from types import FunctionType
 
 import numpy
 
@@ -154,10 +155,104 @@ def _gasscf_newton_kernel(casscf, *args, **kwargs):
     kwargs["verbose"] = verbose
     # Native Newton consumes objectives throughout its complete trajectory.
     # Convert only the returned tuple before mc1step assigns/logs public slots.
-    result = newton_casscf.kernel(casscf, *args, **kwargs)
+    native_kernel = newton_casscf.kernel
+    if hasattr(casscf.fcisolver, 'ss_penalty'):
+        # PySCF kernel -> update_orb_ci -> gen_g_hop uses module globals,
+        # not casscf.gen_g_hop. Reuse the original function code/defaults in
+        # a private namespace, changing only the response entry point. Never
+        # patch the imported module: other CASSCF calculations keep their
+        # native operators, including during callbacks and nested calls.
+        namespace = dict(vars(newton_casscf))
+        namespace['gen_g_hop'] = gen_g_hop
+        for name in ('update_orb_ci', 'kernel'):
+            original = getattr(newton_casscf, name)
+            rebound = FunctionType(original.__code__, namespace, original.__name__,
+                                   original.__defaults__, original.__closure__)
+            rebound.__kwdefaults__ = original.__kwdefaults__
+            namespace[name] = rebound
+        native_kernel = namespace['kernel']
+    result = native_kernel(casscf, *args, **kwargs)
     physical, gas_physical = gasci._publish_energy_results(
         casscf, result[1], result[2])
     return (result[0], physical, gas_physical) + result[3:]
+
+
+def gen_g_hop(mc, mo, ci0, eris, verbose=None):
+    """Add spin-penalty CI derivatives to the native Newton operators.
+
+    The spin penalty P has no orbital dependence. Keep contract_2e physical:
+    native Newton uses that hook for both H and orbital variations of H.
+    Only the CI gradient, CI-CI Hessian and CI preconditioner need corrections.
+    For a normalized root c, p = <c|P|c> and r = Pc - pc, these are
+    2 w r and 2 w [(P-p) v - r(c.v) - c(r.v)], respectively, in the native
+    Newton normalization convention. The keyframe gradient uses the same P.
+    """
+    gradient, update, hop, hdiag = newton_casscf.gen_g_hop(
+        mc, mo, ci0, eris, verbose)
+    solver = mc.fcisolver
+    parameters = fci_gas._spin_penalty_parameters(
+        solver, mc.ncas, mc._effective_nelecas())
+    if parameters is None or parameters[0] == 0:
+        return gradient, update, hop, hdiag
+
+    # The spin plan owns only Python/NumPy data and remains valid after the
+    # solver drops its cache. No borrowed C pointers escape in these closures.
+    if solver.cache_plans:
+        plan = solver._get_spin_plan(mc.ncas, mc.nelecas)
+    else:
+        plan = solver.make_spin_plan(mc.ncas, mc.nelecas)
+
+    def penalty(vector):
+        return fci_gas._spin_penalty_action(plan.contract, vector, parameters)
+
+    roots = [ci0] if solver.nroots == 1 else ci0
+    roots = [numpy.asarray(c).ravel() for c in roots]
+    weights = tuple(getattr(mc, 'weights', (1.,)))
+    ngorb = gradient.size - sum(c.size for c in roots)
+    diagonal = fci_gas._spin_penalty_diagonal(
+        plan.diagonal_vector(), parameters)
+    gradient = gradient.copy()
+    hdiag = hdiag.copy()
+    terms = []
+    start = ngorb
+    for c, weight in zip(roots, weights):
+        block = slice(start, start + c.size)
+        start += c.size
+        if weight == 0:
+            continue
+        pc = penalty(c)
+        energy = c.dot(pc)
+        residual = pc - energy * c
+        gradient[block] += 2 * weight * residual
+        hdiag[block] += 2 * weight * (diagonal - energy - 2 * residual * c)
+        terms.append((block, c, weight, energy, residual))
+
+    def penalized_hop(vector):
+        result = hop(vector)
+        for block, c, weight, energy, residual in terms:
+            v = vector[block]
+            result[block] += 2 * weight * (
+                penalty(v) - energy * v - residual * c.dot(v)
+                - c * residual.dot(v))
+        return result
+
+    def penalized_update(u, ci):
+        result = update(u, ci)
+        current = [ci] if solver.nroots == 1 else ci
+        start = ngorb
+        for c, weight in zip(current, weights):
+            c = numpy.asarray(c).ravel()
+            block = slice(start, start + c.size)
+            start += c.size
+            if weight == 0:
+                continue
+            # Native g_update normalizes each current CI vector as well.
+            c = c / numpy.linalg.norm(c)
+            pc = penalty(c)
+            result[block] += 2 * weight * (pc - c.dot(pc) * c)
+        return result
+
+    return gradient, penalized_update, penalized_hop, hdiag
 
 
 class _GASFCISolver(fci_gas.FCISolver):
@@ -1511,7 +1606,7 @@ class GASSCF(newton_casscf.CASSCF):
 
     state_specific = state_specific_
 
-    gen_g_hop = newton_casscf.gen_g_hop
+    gen_g_hop = gen_g_hop
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
         """Run full GASSCF orbital optimization with native CIAH.
