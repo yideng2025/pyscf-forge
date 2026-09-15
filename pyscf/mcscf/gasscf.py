@@ -27,10 +27,11 @@ Supported GAS definitions follow :mod:`pyscf.mcscf.gasci`: ``gas_orbs``,
 ``gas_restr`` and ``gas_restr_type`` are normalized by the same GAS helper
 routines.  This module supports ordinary state averaging, including
 zero-weight roots, GAS-safe canonicalization of inactive/external orbitals,
+optional within-GAS pseudo-natural orbitals with synchronized CI rotation,
 density fitting through PySCF's ``mcscf.df`` machinery, energy-only scanners
 and the GASCI-native spin-penalty Hamiltonian.  It does not implement
 state-average-mix, state-specific excited-state wrappers,
-active-space natural-orbital rotations, analytic gradients/NACs or the
+unrestricted active-space natural-orbital rotations, analytic gradients/NACs or the
 legacy two-step CASSCF driver.
 """
 
@@ -756,6 +757,10 @@ class GASSCF(newton_casscf.CASSCF):
         returns occupations as one array per subspace. These methods leave
         the computational orbitals and CI vectors unchanged.
 
+        To rotate computational orbitals and CI together, explicitly call
+        ``mc.canonicalize_(gas_pseudo_natorb=True)``. The variant without the
+        trailing underscore returns the transformed results without writeback.
+
         Analysis orbitals can be exported with PySCF's Molden writer::
 
             from pyscf.tools import molden
@@ -1255,30 +1260,112 @@ class GASSCF(newton_casscf.CASSCF):
 
     def canonicalize(self, mo_coeff=None, ci=None, eris=None, sort=False,
                      gas_natorb=False, gasdm1=None, verbose=None,
-                     cas_natorb=None, **kwargs):
-        """Canonicalize core/external orbitals without rotating GAS subspaces.
+                     cas_natorb=None, *, gas_pseudo_natorb=False, **kwargs):
+        """Return ``(mo_coeff, ci, mo_energy)`` without writing to this object.
 
-        Native CASSCF calls this method with its ``natorb`` flag as the fifth
-        positional argument.  In GASSCF, any automatic active-space natural
-        orbital rotation would generally mix GAS subspaces and invalidate the
-        restricted determinant space, so active-space natural orbitals are
-        explicitly guarded.  The active GAS block is otherwise kept fixed;
-        only inactive and external orbitals are canonicalized by the inherited
-        PySCF machinery.
+        By default only core/external orbitals are canonicalized. Opt in with
+        ``gas_pseudo_natorb=True`` to diagonalize the density separately within
+        each GAS subspace and transform every CI root into the new basis,
+        including zero-weight roots. SA uses the weighted density unless
+        ``gasdm1`` is supplied in the input active-orbital basis.
+
+        Active occupations are ordered from largest to smallest within each
+        unfrozen symmetry block of a GAS subspace. Frozen orbitals and orbital
+        symmetry/``extrasym`` labels are respected. ``sort`` retains its native
+        meaning for core/external orbital energies. ``mo_energy`` contains
+        Fock diagonal elements, not pseudo-natural occupations.
+
+        These are pseudo-natural orbitals: density between GAS subspaces need
+        not vanish. Rotations across GAS subspaces remain unsupported, as do
+        ``gas_natorb=True`` and ``cas_natorb=True``. Use ``canonicalize_`` to
+        write the returned orbitals, CI and orbital energies to this object.
         """
 
         if gas_natorb or cas_natorb:
             _unsupported("GAS natural-orbital rotation")
-        return gasci.GASCI.canonicalize(
-            self, mo_coeff, ci, eris, sort=sort, gas_natorb=False,
+        if not gas_pseudo_natorb:
+            return gasci.GASCI.canonicalize(
+                self, mo_coeff, ci, eris, sort=sort, gas_natorb=False,
+                gasdm1=gasdm1, verbose=verbose, **kwargs)
+
+        mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
+        ci = self.ci if ci is None else ci
+        if mo_coeff is None or ci is None:
+            raise ValueError("pseudo-natural canonicalization requires orbitals and CI")
+        if gasdm1 is None:
+            gasdm1 = self.make_gasdm1(
+                ci=ci, state=None if self._has_state_weights() else 0)
+        gasdm1 = numpy.asarray(gasdm1)
+        if (gasdm1.shape != (self.ncas, self.ncas)
+                or numpy.iscomplexobj(gasdm1)
+                or not numpy.all(numpy.isfinite(gasdm1))):
+            raise ValueError("gasdm1 must be a finite real (ncas, ncas) matrix")
+
+        nmo = mo_coeff.shape[1]
+        frozen = numpy.zeros(nmo, dtype=bool)
+        if isinstance(self.frozen, (int, numpy.integer)):
+            frozen[:self.frozen] = True
+        elif self.frozen is not None:
+            frozen[self.frozen] = True
+        orbsym = getattr(mo_coeff, 'orbsym', numpy.zeros(nmo, dtype=int))
+        extrasym = getattr(self, 'extrasym', None)
+        if extrasym is None:
+            extrasym = numpy.zeros(nmo, dtype=int)
+        rotation = numpy.eye(self.ncas)
+        offset = 0
+        for size in self.gas_orbs:
+            groups = {}
+            for p in range(offset, offset + size):
+                i = self.ncore + p
+                if not frozen[i]:
+                    groups.setdefault((orbsym[i], extrasym[i]), []).append(p)
+            for indices in groups.values():
+                block = numpy.ix_(indices, indices)
+                _, vectors = self._natural_eigensystem(gasdm1[block], sort=True)
+                rotation[block] = vectors
+            offset += size
+
+        # Transform CI explicitly, without exposing a general rotation hook to
+        # Newton. In particular, never solve GASCI again in the rotated basis.
+        def transform(vector):
+            return self.fcisolver.transform_ci_within_gas(
+                vector, self.ncas, self.nelecas, rotation)
+
+        if isinstance(ci, (list, tuple)):
+            ci_new = type(ci)(transform(vector) for vector in ci)
+        elif numpy.ndim(ci) == 2 and self.fcisolver.nroots > 1:
+            ci_new = numpy.asarray([transform(vector) for vector in ci])
+        else:
+            ci_new = transform(ci)
+        # The native routine may reorder orbital labels when sort=True;
+        # own the metadata as well as the MO array to keep this call nonmutating.
+        mo_input = mo_coeff.copy()
+        if getattr(mo_coeff, 'orbsym', None) is not None:
+            mo_input = lib.tag_array(mo_input, orbsym=numpy.array(orbsym, copy=True))
+        # Both calls use the original basis, so a supplied ERIS remains valid.
+        fock = self.get_fock(mo_coeff, ci, eris, gasdm1, verbose)
+        mo_new, _, mo_energy = gasci.GASCI.canonicalize(
+            self, mo_input, ci, eris, sort=sort, gas_natorb=False,
             gasdm1=gasdm1, verbose=verbose, **kwargs)
+        active = slice(self.ncore, self.ncore + self.ncas)
+        mo_new[:, active] = mo_coeff[:, active] @ rotation
+        mo_energy[active] = numpy.einsum(
+            'pi,pi->i', mo_new[:, active], fock @ mo_new[:, active])
+        return mo_new, ci_new, mo_energy
 
     def canonicalize_(self, mo_coeff=None, ci=None, eris=None, sort=False,
                       gas_natorb=False, gasdm1=None, verbose=None,
-                      cas_natorb=None, **kwargs):
+                      cas_natorb=None, *, gas_pseudo_natorb=False, **kwargs):
+        """Write the canonicalized MO, CI and orbital energies to this object.
+
+        Returns the same three values as :meth:`canonicalize`; the method
+        without the trailing underscore leaves these result attributes intact.
+        """
+
         mo_coeff, ci, mo_energy = self.canonicalize(
             mo_coeff, ci, eris, sort=sort, gas_natorb=gas_natorb,
-            gasdm1=gasdm1, verbose=verbose, cas_natorb=cas_natorb, **kwargs)
+            gasdm1=gasdm1, verbose=verbose, cas_natorb=cas_natorb,
+            gas_pseudo_natorb=gas_pseudo_natorb, **kwargs)
         self.mo_coeff = mo_coeff
         self.ci = ci
         self.mo_energy = mo_energy

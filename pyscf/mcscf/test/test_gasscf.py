@@ -31,6 +31,7 @@ import scipy.linalg
 
 from pyscf import ao2mo
 from pyscf import gto
+from pyscf import lib
 from pyscf import scf
 from pyscf.tools import molden
 from pyscf.fci import addons as fci_addons
@@ -2345,6 +2346,151 @@ class KnownValues(unittest.TestCase):
         ref.e_tot = numpy.array(energies)
         ref.analyze(verbose=4, state=0, with_meta_lowdin=False)
         self.assertIn("GASCI analysis", ref.stdout.getvalue())
+
+    def test_n2_pseudo_canonicalize_preserves_roots_and_density(self):
+        mc, _, roots = self._n2_property_pair()
+        for use_df in (False, True):
+            for weights in (None, (.3, .7), (1., 0.)):
+                obj = mc.density_fit() if use_df else mc.copy()
+                self.addCleanup(obj.close)
+                if weights is None:
+                    obj.ci = roots[0].copy()
+                else:
+                    obj = obj.state_average(weights)
+                    self.addCleanup(obj.close)
+                before_mo = obj.mo_coeff.copy()
+                before_ci = numpy.array(obj.ci, copy=True)
+                before_energy = obj.mo_energy
+                eris = obj.ao2mo(before_mo)
+                fock = obj.get_fock(eris=eris)
+                # Canonicalization changes representation, without solving CI.
+                with mock.patch.object(obj.fcisolver, 'kernel',
+                                       side_effect=AssertionError('no CI solve')):
+                    mo, ci, mo_energy = obj.canonicalize(
+                        eris=eris, gas_pseudo_natorb=True)
+                with self.subTest(df=use_df, weights=weights):
+                    numpy.testing.assert_array_equal(obj.mo_coeff, before_mo)
+                    numpy.testing.assert_array_equal(numpy.asarray(obj.ci), before_ci)
+                    self.assertIs(obj.mo_energy, before_energy)
+                    numpy.testing.assert_allclose(
+                        mo.T @ obj._scf.get_ovlp() @ mo,
+                        numpy.eye(mo.shape[1]), atol=2e-9, rtol=0)
+                    numpy.testing.assert_allclose(
+                        mo_energy, numpy.einsum('pi,pi->i', mo, fock @ mo),
+                        atol=2e-11, rtol=0)
+                    dm = obj.make_gasdm1(ci=ci)
+                    offset = 0
+                    for size in obj.gas_orbs:
+                        block = dm[offset:offset+size, offset:offset+size]
+                        numpy.testing.assert_allclose(
+                            block, numpy.diag(block.diagonal()), atol=2e-11, rtol=0)
+                        self.assertTrue(numpy.all(numpy.diff(block.diagonal()) <= 1e-11))
+                        offset += size
+                    h1_old, core_old = obj.get_h1gas(before_mo)
+                    h2_old = ao2mo.restore(1, obj.get_h2gas(before_mo), obj.ncas)
+                    h1_new, core_new = obj.get_h1gas(mo)
+                    h2_new = ao2mo.restore(1, obj.get_h2gas(mo), obj.ncas)
+                    states = (0,) if weights is None else (0, 1)
+                    for state in states:
+                        old_dm = obj.make_rdm1(mo_coeff=before_mo, state=state)
+                        new_dm = obj.make_rdm1(mo_coeff=mo, ci=ci, state=state)
+                        numpy.testing.assert_allclose(new_dm, old_dm, atol=2e-11, rtol=0)
+                        d1, d2 = obj.make_gasdm12(state=state)
+                        old_e = (core_old + numpy.einsum('pq,qp', h1_old, d1)
+                                 + .5 * numpy.einsum('pqrs,pqrs', h2_old, d2))
+                        d1, d2 = obj.make_gasdm12(ci=ci, state=state)
+                        new_e = (core_new + numpy.einsum('pq,qp', h1_new, d1)
+                                 + .5 * numpy.einsum('pqrs,pqrs', h2_new, d2))
+                        self.assertAlmostEqual(new_e, old_e, delta=2e-10)
+                    old_roots = before_ci.reshape(len(states), -1)
+                    new_roots = numpy.asarray(ci).reshape(len(states), -1)
+                    numpy.testing.assert_allclose(new_roots @ new_roots.T,
+                                                  old_roots @ old_roots.T,
+                                                  atol=2e-12, rtol=0)
+                    self.assertIsNone(obj.fcisolver.transform_ci_for_orbital_rotation)
+
+    def test_n2_pseudo_canonicalize_writeback_and_selected_density(self):
+        mc, _, roots = self._n2_property_pair()
+        obj = mc.state_average((1., 0.))
+        self.addCleanup(obj.close)
+        density = obj.make_gasdm1(state=1)
+        expected = obj.canonicalize(gas_pseudo_natorb=True, gasdm1=density)
+        e_before = obj.e_tot
+        actual = obj.canonicalize_(gas_pseudo_natorb=True, gasdm1=density)
+        for returned, stored in zip(actual, (obj.mo_coeff, obj.ci, obj.mo_energy)):
+            self.assertIs(returned, stored)
+        # Near-degenerate external Fock eigenvectors can differ between calls;
+        # compare their subspaces rather than individual virtual MO columns.
+        active = slice(obj.ncore, obj.ncore + obj.ncas)
+        numpy.testing.assert_allclose(actual[0][:, active], expected[0][:, active],
+                                      atol=2e-11, rtol=0)
+        self._assert_property_close(actual[1], expected[1])
+        numpy.testing.assert_allclose(actual[2], expected[2], atol=1e-9, rtol=0)
+        for block in (slice(0, obj.ncore), slice(obj.ncore + obj.ncas, None)):
+            old, new = expected[0][:, block], actual[0][:, block]
+            numpy.testing.assert_allclose(old @ old.T, new @ new.T,
+                                          atol=2e-11, rtol=0)
+        self.assertEqual(obj.e_tot, e_before)
+        dm = obj.make_gasdm1(state=1)
+        offset = 0
+        for size in obj.gas_orbs:
+            block = dm[offset:offset+size, offset:offset+size]
+            numpy.testing.assert_allclose(block, numpy.diag(block.diagonal()),
+                                          atol=2e-11, rtol=0)
+            offset += size
+        # The zero-weight root has also been transformed, not silently retained.
+        self.assertGreater(numpy.linalg.norm(obj.ci[1] - roots[1]), 1e-3)
+
+    def test_n2_pseudo_canonicalize_respects_frozen_and_extra_symmetry(self):
+        mc, _, roots = self._n2_property_pair()
+        mc.ci = roots[0]
+        mc.frozen = [0, 2]
+        mc.extrasym = numpy.zeros(mc.mo_coeff.shape[1], dtype=int)
+        mc.extrasym[[5, 7]] = 1
+        labels_before = numpy.zeros(mc.mo_coeff.shape[1], dtype=int)
+        labels_before[9] = 1
+        mc.mo_coeff = lib.tag_array(mc.mo_coeff, orbsym=labels_before.copy())
+        before = mc.mo_coeff.copy()
+        mo, ci, _ = mc.canonicalize(gas_pseudo_natorb=True)
+        numpy.testing.assert_array_equal(mo[:, mc.frozen], before[:, mc.frozen])
+        numpy.testing.assert_array_equal(mc.mo_coeff.orbsym, labels_before)
+        numpy.testing.assert_array_equal(mo.orbsym, labels_before)
+        active = slice(mc.ncore, mc.ncore + mc.ncas)
+        rotation = before[:, active].T @ mc._scf.get_ovlp() @ mo[:, active]
+        orb_labels = labels_before[active]
+        numpy.testing.assert_allclose(rotation[orb_labels[:, None] != orb_labels],
+                                      0., atol=2e-9)
+        labels = mc.extrasym[active]
+        numpy.testing.assert_allclose(rotation[labels[:, None] != labels], 0., atol=2e-9)
+        numpy.testing.assert_allclose(
+            mc.make_rdm1(mo_coeff=mo, ci=ci), mc.make_rdm1(), atol=2e-11, rtol=0)
+        dm = mc.make_gasdm1(ci=ci)
+        # GAS2 is split into extra-symmetry groups (MO4,6) and (MO5,7).
+        for group in ([2, 4], [3, 5]):
+            block = dm[numpy.ix_(group, group)]
+            numpy.testing.assert_allclose(block, numpy.diag(block.diagonal()),
+                                          atol=2e-11, rtol=0)
+
+    def test_n2_pseudo_canonicalize_with_spin_penalty_and_restart(self):
+        _, mf, mo = self._n2_regression_fixture()
+        mc = self._n2_regression_mc(mf).fix_spin(shift=.2, ss=0)
+        self.addCleanup(mc.close)
+        mc.gasci(mo)
+        self.assertTrue(mc.converged)
+        e_before = mc.e_tot
+        dm_before = mc.make_rdm1()
+        spin_before = mc.spin_square()
+        mo_new, ci_new, _ = mc.canonicalize_(gas_pseudo_natorb=True)
+        numpy.testing.assert_allclose(mc.make_rdm1(), dm_before, atol=2e-11, rtol=0)
+        numpy.testing.assert_allclose(mc.spin_square(), spin_before, atol=2e-10, rtol=0)
+        h1, core = mc.get_h1gas()
+        e_new = mc.fcisolver.energy(h1, mc.get_h2gas(), ci_new, mc.ncas, mc.nelecas) + core
+        self.assertAlmostEqual(e_new, e_before, delta=2e-10)
+        # The returned CI is directly reusable by the unchanged Newton driver.
+        e_restart = mc.kernel(mo_new, ci_new)[0]
+        self.assertTrue(mc.converged)
+        self.assertAlmostEqual(e_restart, self.N2_REF_SS_ENERGY,
+                               delta=self.N2_REGRESSION_TOL)
 
     def test_newton_solver_hides_native_cas_only_hooks(self):
         base = fci_gas.FCISolver(gas_orbs=(2,))

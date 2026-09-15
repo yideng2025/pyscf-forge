@@ -934,6 +934,96 @@ class FCISolver(direct_spin1.FCISolver):
         with self.make_space(norb, nelec, compress_links=False) as gas:
             return _GasSpinPlan(gas).contract(fcivec)
 
+    def transform_ci_within_gas(self, fcivec, norb, nelec, u):
+        """Return CI coefficients for ``mo_new = mo_old @ u`` within each GAS.
+
+        ``u`` must be real, orthogonal and block diagonal in the GAS partition.
+        Adjacent Givens rotations act on local string axes of each legal GAS
+        block; no full-CAS embedding or dense determinant rotation is formed.
+        Reflections and orbital permutations are included. The input is not
+        modified. This explicit method is separate from the unrestricted
+        ``transform_ci_for_orbital_rotation`` hook probed by native Newton.
+        """
+
+        gas_orbs, _, _ = self._space_spec(norb, nelec)
+        u = _as_c_double(u, (int(norb), int(norb)))
+        if not numpy.all(numpy.isfinite(u)) or not numpy.allclose(
+                u.T @ u, numpy.eye(norb), atol=1e-10, rtol=0):
+            raise ValueError("GAS orbital rotation must be finite and orthogonal")
+        allowed = numpy.zeros(u.shape, dtype=bool)
+        factors = []
+        offset = 0
+        for size in gas_orbs:
+            sl = slice(offset, offset + size)
+            allowed[sl, sl] = True
+            work = u[sl, sl].copy()
+            rotations = []
+            # L_m ... L_1 U = D, so the passive CI transform applies the
+            # exterior representations of L_1, ..., L_m, then diagonal D.
+            # Adjacent orbital pairs have no intervening fermionic sign.
+            for col in range(size - 1):
+                for q in range(size - 1, col, -1):
+                    p = q - 1
+                    a, b = work[p, col], work[q, col]
+                    if b == 0:
+                        continue
+                    norm = numpy.hypot(a, b)
+                    c, s = a / norm, b / norm
+                    row_p, row_q = work[p].copy(), work[q].copy()
+                    work[p] = c * row_p + s * row_q
+                    work[q] = -s * row_p + c * row_q
+                    rotations.append((p, q, c, s))
+            factors.append((rotations, numpy.where(work.diagonal() < 0, -1., 1.)))
+            offset += size
+        if numpy.any(numpy.abs(u[~allowed]) > 1e-12):
+            raise ValueError("orbital rotation must not mix different GAS subspaces")
+
+        source = _as_c_double(fcivec)
+        with self.make_space(norb, nelec, compress_links=False) as gas:
+            if source.size != gas.ndet:
+                raise ValueError("CI vector size does not match GAS determinant count")
+            result = source.reshape(-1).copy()
+            ngas = len(gas_orbs)
+            local = {}
+            for block in gas.block_descriptors():
+                occupations = [int(gas._gas.sector_occ[sid * ngas + g])
+                               for sid in (block['sa'], block['sb'])
+                               for g in range(ngas)]
+                shape = tuple(cistring.num_strings(gas_orbs[g % ngas], n)
+                              for g, n in enumerate(occupations))
+                begin = block['offset']
+                size = block['na'] * block['nb']
+                tensor = result[begin:begin + size].reshape(shape)
+                # C GAS sector strides have the last subspace varying fastest:
+                # (alpha GAS axes..., beta GAS axes...).
+                for axis, n in enumerate(occupations):
+                    g = axis % ngas
+                    key = (g, n)
+                    if key not in local:
+                        strings = cistring.make_strings(range(gas_orbs[g]), n)
+                        rotations, phases = factors[g]
+                        pairs = {}
+                        for p, q, _, _ in rotations:
+                            if (p, q) not in pairs:
+                                left = numpy.flatnonzero(
+                                    ((strings >> p) & 1) & ~((strings >> q) & 1))
+                                right = numpy.searchsorted(
+                                    strings, strings[left] ^ ((1 << p) | (1 << q)))
+                                pairs[p, q] = (left, right)
+                        signs = numpy.ones(strings.size)
+                        for p in numpy.flatnonzero(phases < 0):
+                            signs *= 1 - 2 * ((strings >> p) & 1)
+                        local[key] = pairs, signs
+                    pairs, signs = local[key]
+                    view = numpy.moveaxis(tensor, axis, 0)
+                    for p, q, c, s in factors[g][0]:
+                        left, right = pairs[p, q]
+                        old_left, old_right = view[left].copy(), view[right].copy()
+                        view[left] = c * old_left + s * old_right
+                        view[right] = -s * old_left + c * old_right
+                    view *= signs.reshape((-1,) + (1,) * (view.ndim - 1))
+        return result.reshape(source.shape)
+
     def transform_ci_for_orbital_rotation(self, fcivec, norb, nelec, u):
         raise NotImplementedError(
             "arbitrary active-orbital rotations do not preserve a GAS space")

@@ -275,6 +275,72 @@ class TestGASFCISolver(unittest.TestCase):
             numpy.testing.assert_array_equal(projected_twice, projected)
             self.assertEqual(numpy.count_nonzero(projected), gas.ndet)
 
+    def test_ci_rotation_within_gas_matches_full_fci(self):
+        rng = numpy.random.default_rng(211)
+        norb, nelec = 5, (3, 2)
+        gas_orbs = (3, 2)
+        bounds = ((2, 4), (5, 5))
+        _, blocks = addons_gas.normalize_gas_spec(
+            gas_orbs, nelec, bounds, 'cumulative-occ')
+        supergroups = numpy.unique(blocks[:, :2] + blocks[:, 2:], axis=0)
+        cases = [
+            (gas_orbs, nelec, bounds, 'cumulative-occ'),
+            (gas_orbs, nelec, supergroups, 'supergroup'),
+            (gas_orbs, nelec, blocks[::2], 'spin-supergroup'),
+            ((5,), nelec, ((3, 2),), 'spin-supergroup'),
+            (gas_orbs, (0, 0), ((0, 0, 0, 0),), 'spin-supergroup'),
+            (gas_orbs, (5, 5), ((3, 2, 3, 2),), 'spin-supergroup'),
+        ]
+        for sizes, electrons, restriction, kind in cases:
+            solver = fci_gas.FCISolver(
+                gas_orbs=sizes, gas_restr=restriction, gas_restr_type=kind)
+            u = numpy.zeros((norb, norb))
+            offset = 0
+            for size in sizes:
+                q = numpy.linalg.qr(rng.normal(size=(size, size)))[0]
+                # Explicitly include determinant -1, not just proper rotations.
+                if numpy.linalg.det(q) > 0:
+                    q[:, 0] *= -1
+                u[offset:offset+size, offset:offset+size] = q
+                offset += size
+            permutation = numpy.eye(norb)
+            permutation[:, [0, 1]] = permutation[:, [1, 0]]
+            with solver.make_space(norb, electrons) as gas:
+                ci = rng.normal(size=gas.ndet)
+                ci /= numpy.linalg.norm(ci)
+                before = ci.copy()
+                full = fci_gas.gas2fci(ci, gas)
+                for rotation in (u, permutation):
+                    with self.subTest(kind=kind, nelec=electrons, sizes=sizes):
+                        expected = fci_addons.transform_ci_for_orbital_rotation(
+                            full, norb, electrons, rotation)
+                        with mock.patch.object(fci_gas, 'gas2fci',
+                                               side_effect=AssertionError('no CAS embedding')):
+                            actual = solver.transform_ci_within_gas(
+                                ci, norb, electrons, rotation)
+                        numpy.testing.assert_allclose(
+                            fci_gas.gas2fci(actual, gas), expected, atol=2e-12, rtol=0)
+                        recovered = solver.transform_ci_within_gas(
+                            actual, norb, electrons, rotation.T)
+                        numpy.testing.assert_allclose(recovered, ci, atol=2e-12, rtol=0)
+                        self.assertAlmostEqual(numpy.linalg.norm(actual), 1., places=12)
+                        numpy.testing.assert_array_equal(ci, before)
+
+    def test_ci_rotation_within_gas_rejects_invalid_transforms(self):
+        solver = fci_gas.FCISolver(gas_orbs=(2, 2),
+                                  gas_restr=((1, 1, 1, 1),))
+        ci = numpy.ones(16) / 4
+        with self.assertRaisesRegex(ValueError, 'orthogonal'):
+            solver.transform_ci_within_gas(ci, 4, (2, 2), numpy.eye(4) * 2)
+        mixed = numpy.eye(4)
+        mixed[:, [1, 2]] = mixed[:, [2, 1]]
+        with self.assertRaisesRegex(ValueError, 'mix different GAS'):
+            solver.transform_ci_within_gas(ci, 4, (2, 2), mixed)
+        with self.assertRaisesRegex(TypeError, 'real-valued'):
+            solver.transform_ci_within_gas(ci, 4, (2, 2), numpy.eye(4, dtype=complex))
+        with self.assertRaisesRegex(ValueError, 'CI vector size'):
+            solver.transform_ci_within_gas(ci[:-1], 4, (2, 2), numpy.eye(4))
+
     def test_restricted_hamiltonian_projection(self):
         cases = (
             {
