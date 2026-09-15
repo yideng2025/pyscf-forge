@@ -56,7 +56,7 @@ openmolcas_energy = -3066.326994318111
 target_s2 = 20.0  # S=4, multiplicity 9.
 
 here = Path(__file__).resolve().parent
-data_file = here / "gasscf_openmolcas/data/alfe2o4_plus_mo.npz"
+data_file = here / "data/alfe2o4_plus_mo.npz"
 
 with numpy.load(data_file, allow_pickle=False) as data:
     mol = gto.loads(data["mol"].item())
