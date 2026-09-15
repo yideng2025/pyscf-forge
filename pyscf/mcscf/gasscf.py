@@ -1318,7 +1318,10 @@ class GASSCF(newton_casscf.CASSCF):
         return self
 
     def fix_spin_(self, shift=.2, ss=None):
-        """Enable GASCI-native spin penalty for GASSCF.
+        """Enable GASCI-native spin penalty in place and return ``self``.
+
+        Both ``fix_spin`` and ``fix_spin_`` modify this object, as in GASCI.
+        Use ``mc.copy().fix_spin(...)`` to configure an independent copy.
 
         ``ss`` is the target ``S(S+1)`` value, matching PySCF's
         ``fix_spin_`` convention.  The implementation uses the
@@ -1348,10 +1351,7 @@ class GASSCF(newton_casscf.CASSCF):
         self.fcisolver.spin_penalty_method = None
         return self.validate_capabilities()
 
-    def fix_spin(self, shift=.2, ss=None):
-        """Return a copied GASSCF object with spin penalty enabled."""
-
-        return self.copy().fix_spin_(shift=shift, ss=ss)
+    fix_spin = fix_spin_
 
     def undo_fix_spin_(self):
         """Disable GASCI-native spin penalty in place."""

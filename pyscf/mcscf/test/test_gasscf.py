@@ -2427,10 +2427,46 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(hasattr(mc.fcisolver, "ss_penalty"))
         self.assertFalse(hasattr(mc.fcisolver, "ss_value"))
 
-        copied = mc.fix_spin(shift=.25, ss=0)
+        copied = mc.copy().fix_spin(shift=.25, ss=0)
         self.assertIsNot(copied, mc)
+        self.assertIsNot(copied.fcisolver, mc.fcisolver)
         self.assertTrue(hasattr(copied.fcisolver, "ss_penalty"))
         self.assertFalse(hasattr(mc.fcisolver, "ss_penalty"))
+
+    def test_fix_spin_is_in_place_for_plain_df_and_sa_objects(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol)
+        for kind in ("plain", "df", "sa"):
+            for name in ("fix_spin", "fix_spin_"):
+                with self.subTest(kind=kind, method=name):
+                    mc = gasscf.GASSCF(
+                        mf, 2, (1, 1), gas_orbs=(2,), ncore=0)
+                    if kind == "df":
+                        mc = mc.density_fit()
+                    elif kind == "sa":
+                        mc = mc.state_average((.25, .75))
+                    self.addCleanup(mc.close)
+                    cls, solver = mc.__class__, mc.fcisolver
+                    ci = numpy.array([1., 0., 0., 0.])
+                    mc.make_gasdm1(ci=ci, state=0)
+                    self.assertIsNotNone(solver._rdm_plan)
+
+                    result = getattr(mc, name)(shift=.15, ss=0)
+                    self.assertIs(result, mc)
+                    self.assertIs(mc.__class__, cls)
+                    self.assertIs(mc.fcisolver, solver)
+                    self.assertEqual(solver.ss_penalty, .15)
+                    self.assertEqual(solver.ss_value, 0.)
+                    self.assertIsNone(solver._rdm_plan)
+                    self.assertNotIsInstance(solver, fci_addons.SpinPenaltyFCISolver)
+                    # A second call updates the same object even if its return
+                    # value is ignored, matching the GASCI public convention.
+                    getattr(mc, name)(shift=.25, ss=0)
+                    self.assertEqual(solver.ss_penalty, .25)
+                    self.assertIs(mc.undo_fix_spin_(), mc)
+                    self.assertFalse(hasattr(solver, "ss_penalty"))
+                    if kind == "sa":
+                        numpy.testing.assert_allclose(mc.weights, (.25, .75))
 
     def test_fix_spin_rejects_spin_incomplete_gas_and_invalid_target(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -2459,7 +2495,7 @@ class KnownValues(unittest.TestCase):
         mc.conv_tol = 1e-8
         mc.conv_tol_grad = 1e-4
         mc.canonicalization = False
-        mc.fix_spin_(shift=.2, ss=0)
+        mc.fix_spin(shift=.2, ss=0)
 
         e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
         report = mc.spin_energy_report()
