@@ -1360,14 +1360,33 @@ class KnownValues(unittest.TestCase):
         mc.fcisolver.spin = 0
         mc.fcisolver.max_cycle = 300
         mc.fcisolver.max_space = 30
-        mc.fcisolver.conv_tol = 1e-10
-        e_tot = float(mc.kernel(mo)[0])
+        self.addCleanup(mc.close)
+        # This is an energy regression at 1e-7 Eh, not a test of a particular
+        # Newton trajectory. Tighter outer thresholds can linger in a noisy
+        # SA tail and occasionally exhaust the macro limit across platforms.
+        # Keep the CI residual well below the orbital stopping threshold;
+        # Davidson otherwise defaults to sqrt(conv_tol) for its residual.
+        mc.conv_tol = 1e-9
+        mc.conv_tol_grad = 1e-4
+        mc.fcisolver.conv_tol = 1e-12
+        mc.fcisolver.conv_tol_residual = 1e-7
+        progress = {}
+
+        def record_progress(env):
+            for key in ('imacro', 'de', 'norm_gall'):
+                progress[key] = env[key]
+
+        e_tot = float(mc.kernel(mo, callback=record_progress)[0])
         weighted = float(numpy.dot(
             numpy.asarray(mc.weights, dtype=float),
             numpy.asarray(mc.e_states, dtype=float),
         ))
 
-        self.assertTrue(mc.converged)
+        self.assertTrue(mc.converged,
+                        "N2 SA failed to converge: E=%.15f, last macro=%s" %
+                        (e_tot, progress))
+        self.assertTrue(numpy.all(mc.fcisolver.converged),
+                        "N2 SA final CI roots did not converge")
         self.assertAlmostEqual(
             e_tot, self.N2_REF_SA_HALF_HALF_ENERGY,
             delta=self.N2_REGRESSION_TOL)
