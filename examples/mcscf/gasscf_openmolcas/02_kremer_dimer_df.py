@@ -90,7 +90,7 @@ mc.fix_spin_(shift=0.2, ss=target_s2)
 mc.kernel(mo_coeff)
 
 report = mc.spin_energy_report()
-pyscf_energy = report["physical"]
+pyscf_energy = mc.e_tot
 ss, _ = mc.spin_square()
 
 print()

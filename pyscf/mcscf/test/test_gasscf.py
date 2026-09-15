@@ -2344,6 +2344,7 @@ class KnownValues(unittest.TestCase):
                 obj.fcisolver.e_states = numpy.array(energies)
                 obj.e_tot = numpy.dot(weights, energies)
                 states = (None, 1)
+            gasci._publish_energy_results(obj, obj.e_tot, obj.e_tot - ecore)
             before_mo = obj.mo_coeff.copy()
             before_ci = numpy.array(obj.ci, copy=True)
             before_energy = obj.e_tot
@@ -2919,6 +2920,142 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target S"):
             complete.fix_spin_(shift=.2, ss=.5)
 
+    def _check_physical_energy_result(self, mc, result):
+        report = mc.spin_energy_report()
+        roots = mc.ci if isinstance(mc.ci, (list, tuple)) else [mc.ci]
+        h1, core = mc.get_h1gas(mc.mo_coeff)
+        h2 = ao2mo.restore(1, mc.get_h2gas(mc.mo_coeff), mc.ncas)
+        physical = []
+        with mc.fcisolver.make_rdm_plan(mc.ncas, mc.nelecas) as plan:
+            for ci in roots:
+                d1, d2 = plan.make_rdm12(ci, ci)
+                physical.append(core + numpy.einsum("pq,qp", h1, d1)
+                                + .5 * numpy.einsum("pqrs,pqrs", h2, d2))
+        numpy.testing.assert_allclose(report["root_physical"], physical, atol=1e-9, rtol=0)
+        self.assertGreater(max(report["root_penalty"]), 1e-3)
+        expected = numpy.dot(getattr(mc, "weights", (1.,)), physical)
+        self.assertAlmostEqual(result[0], expected, 9)
+        self.assertAlmostEqual(result[1], expected-core, 9)
+        self.assertAlmostEqual(mc.e_tot, result[0], 12)
+        self.assertAlmostEqual(mc.e_cas, result[1], 12)
+        numpy.testing.assert_allclose(report["root_objective"],
+                                      numpy.array(physical)+report["root_penalty"],
+                                      atol=1e-9, rtol=0)
+        if len(roots) > 1:
+            numpy.testing.assert_allclose(mc.e_states, physical, atol=1e-9, rtol=0)
+            numpy.testing.assert_allclose(mc.fcisolver.e_states, report["root_objective"])
+            self.assertAlmostEqual(mc.e_average, expected, 9)
+        self.assertFalse(hasattr(mc, "e_tot_physical"))
+        self.assertFalse(hasattr(mc, "e_gas_physical"))
+
+    def test_spin_physical_energy_boundaries(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1",
+                    basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        for use_df in (False, True):
+            for weights in (None, (.4, .6), (1., 0.)):
+                with self.subTest(df=use_df, weights=weights):
+                    mc = gasscf.GASSCF(
+                        mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                        gas_restr=((0, 1), (2, 2)), gas_restr_type="cumulative-occ")
+                    if use_df:
+                        mc = mc.density_fit()
+                    if weights is not None:
+                        mc = mc.state_average(weights)
+                    self.addCleanup(mc.close)
+                    # Intentionally nonzero penalty; one macro also exercises
+                    # the public energy convention for an unconverged result.
+                    mc.fix_spin_(shift=.001, ss=0.)
+                    mc.max_cycle_macro = mc.max_cycle_micro = 1
+                    mc.canonicalization = use_df
+                    mc.chk_ci = True
+                    result = mc.gasci(mf.mo_coeff)
+                    self._check_physical_energy_result(mc, result)
+                    seen = []
+                    def callback(env):
+                        report = mc.spin_energy_report()
+                        self.assertAlmostEqual(env["e_tot"], report["objective"], 10)
+                        self.assertAlmostEqual(mc.e_tot, report["physical"], 10)
+                        seen.append(env["e_tot"])
+                    for repeat in range(2):
+                        result = mc.kernel(mc.mo_coeff, callback=callback)
+                        self._check_physical_energy_result(mc, result)
+                    self.assertTrue(seen)
+                    saved = lib.chkfile.load(mc.chkfile, "mcscf")
+                    self.assertAlmostEqual(saved["e_tot"], mc.e_tot, 10)
+                    self.assertAlmostEqual(saved["e_cas"], mc.e_cas, 10)
+                    # Restore into a fresh object, using PySCF's native loader.
+                    # The standard file stores physical energies, orbitals and
+                    # (with chk_ci=True) CI, not our private spin-energy report.
+                    self.assertNotIn("gas_energy_convention", saved)
+                    self.assertNotIn("_gas_energy_results", saved)
+                    restored = gasscf.GASSCF(
+                        mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                        gas_restr=((0, 1), (2, 2)), gas_restr_type="cumulative-occ")
+                    if use_df:
+                        restored = restored.density_fit()
+                    if weights is not None:
+                        restored = restored.state_average(weights)
+                    restored.fix_spin_(shift=.001, ss=0.)
+                    restored.canonicalization = use_df
+                    restored.max_cycle_macro = restored.max_cycle_micro = 1
+                    self.addCleanup(restored.close)
+                    restored.update_from_chk(mc.chkfile)
+                    self.assertAlmostEqual(restored.e_tot, result[0], 10)
+                    self.assertAlmostEqual(restored.e_cas, result[1], 10)
+                    numpy.testing.assert_allclose(restored.mo_coeff, mc.mo_coeff)
+                    numpy.testing.assert_allclose(restored.ci, mc.ci)
+                    with self.assertRaises(ValueError):
+                        restored.spin_energy_report()
+                    self._check_physical_energy_result(
+                        restored, restored.kernel(restored.mo_coeff, restored.ci))
+                    scanner = mc.as_scanner()
+                    self.addCleanup(scanner.close)
+                    value = scanner("H 0 0 0; H 0 0 .92; H 0 0 2.2; H 0 0 3.1")
+                    self._check_physical_energy_result(scanner, (value, scanner.e_gas))
+                    mc.undo_fix_spin_()
+                    with self.assertRaises(ValueError):
+                        mc.spin_energy_report()
+                    mc.gasci(mc.mo_coeff)
+                    self.assertIsNone(mc.e_spin_penalty)
+                    if weights is not None:
+                        numpy.testing.assert_allclose(mc.e_states, mc.fcisolver.e_states)
+                    mc.reset(mol)
+                    with self.assertRaises(ValueError):
+                        mc.spin_energy_report()
+
+    def test_spin_physical_energy_full_active_shortcut_and_native_checkpoint(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 .75", basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(mf, 2, (1, 1), gas_orbs=(2,), ncore=0)
+        self.addCleanup(mc.close)
+        mc.canonicalization = False
+        # Ground singlet pays 4*shift for a triplet target at insufficient shift.
+        mc.fix_spin_(shift=.001, ss=2.)
+        result = mc.kernel(mf.mo_coeff)
+        self._check_physical_energy_result(mc, result)
+        with tempfile.TemporaryDirectory() as directory:
+            filename = str(Path(directory) / "energy.chk")
+            mc.dump_chk(filename)
+            mc.update_from_chk(filename)
+            self._check_physical_energy_result(mc, result)
+            # Native update() accepts ordinary PySCF fields without a marker.
+            lib.chkfile.dump(filename, "mcscf", {
+                "mo_coeff": mc.mo_coeff, "ci": mc.ci,
+                "e_tot": result[0], "e_cas": result[1],
+                "nelecas": numpy.asarray(mc.nelecas)})
+            restored = gasscf.GASSCF(mf, 2, (1, 1), gas_orbs=(2,), ncore=0)
+            self.addCleanup(restored.close)
+            restored.canonicalization = False
+            restored.fix_spin_(shift=.001, ss=2.)
+            restored.update(filename)
+            self.assertEqual(restored.e_tot, result[0])
+            self.assertEqual(restored.e_cas, result[1])
+            numpy.testing.assert_allclose(restored.mo_coeff, mc.mo_coeff)
+            numpy.testing.assert_allclose(restored.ci, mc.ci)
+            self._check_physical_energy_result(
+                restored, restored.kernel(restored.mo_coeff, restored.ci))
+
     def test_fix_spin_kernel_smoke_tracks_physical_energy(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
@@ -2943,7 +3080,7 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(mo_energy)
         self.assertTrue(numpy.isfinite(report["physical"]))
         self.assertTrue(numpy.isfinite(report["penalty"]))
-        self.assertAlmostEqual(report["objective"], e_tot, places=9)
+        self.assertAlmostEqual(report["physical"], e_tot, places=9)
         self.assertEqual(report["target_s2"], 0.0)
         self.assertIn(report["method"], (
             "exact-small-space", "projected-plus-global-davidson"))
@@ -3057,9 +3194,9 @@ class KnownValues(unittest.TestCase):
                             self.assertIsNone(penalty)
                             penalty = 0.
                         self.assertAlmostEqual(
-                            scanner.e_tot_physical + penalty, energy, 10)
+                            scanner.e_tot, energy, 10)
                         self.assertAlmostEqual(
-                            scanner.e_gas_physical + penalty,
+                            scanner.e_tot - scanner.get_h1gas(scanner.mo_coeff)[1],
                             scanner.e_gas, 10)
                 self.assertNotIn("does not have attributes", errors.getvalue())
                 self.assertNotIn("does not have attributes", mc.stdout.getvalue())

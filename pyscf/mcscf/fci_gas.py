@@ -737,7 +737,7 @@ class FCISolver(direct_spin1.FCISolver):
 
     _keys = direct_spin1.FCISolver._keys | {
         "gas_orbs", "gas_restr", "gas_restr_type", "e_spin_penalty",
-        "e_physical", "spin_penalty_method",
+        "e_physical", "spin_penalty_method", "ss_penalty", "ss_value",
     }
 
     def __init__(self, mol=None, gas_orbs=None, gas_restr=None,
@@ -862,8 +862,9 @@ class FCISolver(direct_spin1.FCISolver):
         if plan is not None:
             if not isinstance(plan, GasContractPlan):
                 raise TypeError("plan must be a GasContractPlan")
-            expected_nelec = fci_addons._unpack_nelec(nelec, self.spin)
-            if int(norb) != plan.norb or expected_nelec != plan.nelec:
+            expected_nelec = tuple(fci_addons._unpack_nelec(nelec, self.spin))
+            # Native PySCF checkpoint loading can supply a NumPy pair.
+            if int(norb) != plan.norb or expected_nelec != tuple(plan.nelec):
                 raise ValueError("contraction plan does not match norb/nelec")
             return plan.contract(fcivec)
 

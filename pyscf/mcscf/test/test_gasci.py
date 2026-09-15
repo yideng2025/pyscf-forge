@@ -24,6 +24,7 @@ from unittest import mock
 
 import numpy
 
+from pyscf import ao2mo
 from pyscf import gto
 from pyscf import mcscf
 from pyscf import scf
@@ -838,6 +839,68 @@ no_plus_openmolcas_energies = numpy.asarray([
 
 
 class TestGASCI(unittest.TestCase):
+
+    def test_physical_energy_with_nonzero_spin_penalty(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1",
+                    basis="sto-3g", verbose=0)
+        mf = scf.RHF(mol).run()
+        # This restricted space has a triplet ground root. A deliberately
+        # insufficient singlet penalty makes physical != objective, so the
+        # test cannot pass merely because the penalty vanishes.
+        for weights, nroots in ((None, 1), (None, 2), ((.4, .6), 2), ((1., 0.), 2)):
+            with self.subTest(weights=weights, nroots=nroots):
+                mc = gasci.GASCI(
+                    mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                    gas_restr=((0, 1), (2, 2)), gas_restr_type="cumulative-occ")
+                mc.fcisolver.nroots = nroots
+                if weights is not None:
+                    mc = mc.state_average(weights)
+                mc.fix_spin_(shift=.001, ss=0.)
+                returned = mc.kernel(mf.mo_coeff)
+                report = mc.spin_energy_report()
+                self.assertGreater(report["root_penalty"][0], 1e-3)
+                h1, core = mc.get_h1gas()
+                h2 = ao2mo.restore(1, mc.get_h2gas(), mc.ncas)
+                roots = mc.ci if nroots > 1 else [mc.ci]
+                physical = []
+                for ci in roots:
+                    with mc.fcisolver.make_rdm_plan(mc.ncas, mc.nelecas) as plan:
+                        d1, d2 = plan.make_rdm12(ci, ci)
+                    physical.append(core + numpy.einsum("pq,qp", h1, d1)
+                                    + .5 * numpy.einsum("pqrs,pqrs", h2, d2))
+                numpy.testing.assert_allclose(report["root_physical"], physical,
+                                              atol=1e-9, rtol=0)
+                expected = (numpy.dot(weights, physical) if weights is not None
+                            else physical[0] if nroots == 1 else physical)
+                numpy.testing.assert_allclose(returned[0], expected, atol=1e-9)
+                numpy.testing.assert_allclose(returned[1], numpy.asarray(expected)-core,
+                                              atol=1e-9)
+                numpy.testing.assert_allclose(mc.e_tot, returned[0])
+                numpy.testing.assert_allclose(mc.e_gas, returned[1])
+                numpy.testing.assert_allclose(
+                    report["root_objective"], numpy.array(physical)+report["root_penalty"],
+                    atol=1e-9)
+                if weights is not None:
+                    numpy.testing.assert_allclose(mc.e_states, physical, atol=1e-9)
+                    self.assertAlmostEqual(mc.e_average, returned[0], 9)
+                    numpy.testing.assert_allclose(mc.fcisolver.e_states,
+                                                  report["root_objective"])
+                self.assertFalse(hasattr(mc, "e_tot_physical"))
+                self.assertFalse(hasattr(mc, "e_gas_physical"))
+                # A later direct solver call must not rewrite the public report.
+                mc.fcisolver.e_physical = None
+                numpy.testing.assert_allclose(mc.spin_energy_report()["physical"], expected)
+                numpy.testing.assert_allclose(mc.kernel(mc.mo_coeff)[0], expected, atol=1e-9)
+                mc.undo_fix_spin_()
+                with self.assertRaises(ValueError):
+                    mc.spin_energy_report()
+                mc.kernel(mc.mo_coeff)
+                self.assertIsNone(mc.e_spin_penalty)
+                mc.fix_spin_(shift=.001, ss=0.)
+                scanner = mc.as_scanner()
+                value = scanner("H 0 0 0; H 0 0 .92; H 0 0 2.2; H 0 0 3.1")
+                numpy.testing.assert_allclose(value, scanner.spin_energy_report()["physical"])
+
 
     @classmethod
     def setUpClass(cls):

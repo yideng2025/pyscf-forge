@@ -152,7 +152,12 @@ def _gasscf_newton_kernel(casscf, *args, **kwargs):
     if not isinstance(verbose, logger.Logger):
         verbose = _GASSCFLogger(casscf.stdout, verbose)
     kwargs["verbose"] = verbose
-    return newton_casscf.kernel(casscf, *args, **kwargs)
+    # Native Newton consumes objectives throughout its complete trajectory.
+    # Convert only the returned tuple before mc1step assigns/logs public slots.
+    result = newton_casscf.kernel(casscf, *args, **kwargs)
+    physical, gas_physical = gasci._publish_energy_results(
+        casscf, result[1], result[2])
+    return (result[0], physical, gas_physical) + result[3:]
 
 
 class _GASFCISolver(fci_gas.FCISolver):
@@ -682,9 +687,21 @@ class _GASSCFScanner(lib.SinglePointScanner):
 class _StateAverageGASSCF(addons.StateAverageMCSCF):
     """State-average marker with GAS-specific undo/cache cleanup."""
 
+    @property
+    def e_states(self):
+        return self._physical_e_states()
+
+    @property
+    def e_average(self):
+        return float(numpy.dot(self.weights, self.e_states))
+
+    def _finalize(self):
+        return gasci.GASCI._finalize(self)
+
     def undo_state_average(self):
         self.close()
         result = super().undo_state_average()
+        gasci._clear_energy_results(result)
         result.fcisolver.nroots = 1
         result.fcisolver._init_plan_cache()
         result.fcisolver.mol = result.mol
@@ -779,7 +796,7 @@ class GASSCF(newton_casscf.CASSCF):
 
     _keys = set(newton_casscf.CASSCF._keys) | {
         "gas_orbs", "gas_restr", "gas_restr_type", "cache_plans",
-        "e_spin_penalty", "e_tot_physical", "e_gas_physical",
+        "e_spin_penalty", "_gas_energy_results",
         "spin_penalty_method"}
 
     def __init__(self, mf, ncas=None, nelecas=None, gas_orbs=None,
@@ -819,8 +836,7 @@ class GASSCF(newton_casscf.CASSCF):
         self.fcisolver = solver
         self.fcisolver.mol = self.mol
         self.e_spin_penalty = None
-        self.e_tot_physical = None
-        self.e_gas_physical = None
+        self._gas_energy_results = None
         self.spin_penalty_method = None
 
 
@@ -965,6 +981,7 @@ class GASSCF(newton_casscf.CASSCF):
         """Reset molecular data and drop GAS helper-plan caches."""
 
         self.close()
+        gasci._clear_energy_results(self)
         result = super().reset(mol)
         self.fcisolver.mol = self.mol
         return result
@@ -1080,6 +1097,10 @@ class GASSCF(newton_casscf.CASSCF):
     # Public density/property conventions are shared with GASCI: state=None
     # selects the weighted density on SA objects, while state=i selects root i.
     # Keep the Newton solver adapter and its singleton-CI/plan dispatch intact.
+    spin_energy_report = gasci.spin_energy_report
+    _physical_e_states = gasci._physical_e_states
+    _clear_energy_results = gasci._clear_energy_results
+
     _has_state_weights = gasci.GASCI._has_state_weights
     _state_weights = gasci.GASCI._state_weights
     _base_fcisolver_method = gasci.GASCI._base_fcisolver_method
@@ -1171,17 +1192,19 @@ class GASSCF(newton_casscf.CASSCF):
         """Run fixed-orbital GASCI and update PySCF-style result slots."""
 
         mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(mo_coeff, ci0)
+        gasci._clear_energy_results(self)
         gasci_obj = (
             self if eris is None else
             mc1step._fake_h_for_fast_casci(self, mo_coeff, eris))
-        self.e_tot, self.e_cas, self.ci = gasci.kernel(
+        objective, gas_objective, self.ci = gasci.kernel(
             gasci_obj, mo_coeff, ci0=ci0, verbose=verbose)
         if getattr(self.fcisolver, "converged", None) is not None:
             self.converged = bool(numpy.all(self.fcisolver.converged))
         else:
             self.converged = True
-        self._sync_spin_penalty_results()
-        return self.e_tot, self.e_gas, self.ci
+        gasci._publish_energy_results(self, objective, gas_objective)
+        # This return belongs to the internal Newton bridge, not the public API.
+        return objective, gas_objective, self.ci
 
     def gasci(self, mo_coeff=None, ci0=None, verbose=None):
         """Run the fixed-orbital GASCI problem associated with this object.
@@ -1192,13 +1215,19 @@ class GASSCF(newton_casscf.CASSCF):
 
         e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
             mo_coeff, ci0, verbose)
-        return e_tot, e_gas, ci, self.mo_coeff, self.mo_energy
+        return self.e_tot, self.e_gas, ci, self.mo_coeff, self.mo_energy
 
     def casci(self, mo_coeff=None, ci0=None, eris=None,
               verbose=None, envs=None):
-        """Run fixed-orbital GASCI with native Newton-CASSCF log semantics."""
+        """Internal Newton bridge: return objective energies, not public energies.
+
+        Use :meth:`gasci` for a public fixed-orbital calculation.
+        """
 
         log = logger.new_logger(self, verbose)
+        if hasattr(self.fcisolver, "ss_penalty"):
+            log.info("Spin penalty active: internal GASCI/macro E and dE "
+                     "refer to the optimization objective")
         e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
             mo_coeff, ci0, verbose, eris=eris)
 
@@ -1407,6 +1436,7 @@ class GASSCF(newton_casscf.CASSCF):
         result = addons.state_average(source, weights, wfnsym=None)
         result.__class__ = lib.replace_class(
             result.__class__, addons.StateAverageMCSCF, _StateAverageGASSCF)
+        gasci._clear_energy_results(result)
         return result.validate_capabilities()
 
     def state_average_(self, weights=(.5, .5), wfnsym=None):
@@ -1420,39 +1450,6 @@ class GASSCF(newton_casscf.CASSCF):
         _unsupported("state-average-mix GASSCF")
 
     state_average_mix_ = state_average_mix
-
-    def _sync_spin_penalty_results(self):
-        """Mirror GASCI spin-penalty bookkeeping onto the GASSCF object."""
-
-        self.spin_penalty_method = getattr(
-            self.fcisolver, "spin_penalty_method", None)
-        if not hasattr(self.fcisolver, "ss_penalty"):
-            self.e_spin_penalty = None
-            self.e_tot_physical = self.e_tot
-            self.e_gas_physical = self.e_gas
-            return self
-        solver_physical = getattr(self.fcisolver, "e_physical", None)
-        solver_penalty = getattr(self.fcisolver, "e_spin_penalty", None)
-        if (solver_physical is None or solver_penalty is None or
-                self.e_tot is None or self.e_gas is None):
-            self.e_spin_penalty = None
-            self.e_tot_physical = None
-            self.e_gas_physical = None
-            return self
-        physical = numpy.asarray(solver_physical, dtype=numpy.float64)
-        penalty = numpy.asarray(solver_penalty, dtype=numpy.float64)
-        core = (numpy.asarray(self.e_tot, dtype=numpy.float64) -
-                numpy.asarray(self.e_gas, dtype=numpy.float64))
-        gas_physical = physical - core
-        if physical.ndim == 0:
-            self.e_spin_penalty = float(penalty)
-            self.e_tot_physical = float(physical)
-            self.e_gas_physical = float(gas_physical)
-        else:
-            self.e_spin_penalty = penalty
-            self.e_tot_physical = physical
-            self.e_gas_physical = gas_physical
-        return self
 
     def fix_spin_(self, shift=.2, ss=None):
         """Enable GASCI-native spin penalty in place and return ``self``.
@@ -1469,23 +1466,8 @@ class GASSCF(newton_casscf.CASSCF):
         """
 
         self.validate_capabilities()
-        gas_orbs, gas_restr = self._normalized_restriction()
-        nelecas = self._effective_nelecas()
-        if not addons_gas.is_spin_complete(gas_orbs, nelecas, gas_restr):
-            raise ValueError(
-                "fix_spin_ requires a spin-complete GAS restriction")
-        shift = float(shift)
-        target = None if ss is None else float(ss)
-        trial = self.fcisolver.copy()
-        trial.ss_penalty = shift
-        trial.ss_value = target
-        fci_gas._spin_penalty_parameters(trial, self.ncas, nelecas)
         self.close()
-        self.fcisolver.ss_penalty = shift
-        self.fcisolver.ss_value = target
-        self.fcisolver.e_physical = None
-        self.fcisolver.e_spin_penalty = None
-        self.fcisolver.spin_penalty_method = None
+        gasci._set_spin_penalty(self, shift, ss)
         return self.validate_capabilities()
 
     fix_spin = fix_spin_
@@ -1494,50 +1476,13 @@ class GASSCF(newton_casscf.CASSCF):
         """Disable GASCI-native spin penalty in place."""
 
         self.close()
-        for key in ("ss_penalty", "ss_value"):
-            self.fcisolver.__dict__.pop(key, None)
-        self.fcisolver.e_physical = None
-        self.fcisolver.e_spin_penalty = None
-        self.fcisolver.spin_penalty_method = None
-        self._sync_spin_penalty_results()
+        gasci.GASCI.undo_fix_spin_(self)
         return self.validate_capabilities()
 
     def undo_fix_spin(self):
         """Return a copied GASSCF object without spin penalty."""
 
         return self.copy().undo_fix_spin_()
-
-    def spin_energy_report(self):
-        """Report root-resolved physical and penalty energies."""
-
-        if (not hasattr(self.fcisolver, "ss_penalty") or
-                getattr(self.fcisolver, "e_physical", None) is None or
-                getattr(self.fcisolver, "e_spin_penalty", None) is None):
-            raise ValueError("no completed spin-penalized GASCI solve")
-        physical = numpy.atleast_1d(numpy.asarray(
-            self.fcisolver.e_physical, dtype=numpy.float64))
-        penalty = numpy.atleast_1d(numpy.asarray(
-            self.fcisolver.e_spin_penalty, dtype=numpy.float64))
-        weights = numpy.asarray(getattr(self, "weights", (1.0,)),
-                                dtype=numpy.float64)
-        if weights.size != physical.size:
-            if physical.size == 1:
-                weights = numpy.ones(1, dtype=numpy.float64)
-            else:
-                raise ValueError(
-                    "state weights do not match spin-penalty roots")
-        objective = physical + penalty
-        return {
-            "root_physical": physical.tolist(),
-            "root_penalty": penalty.tolist(),
-            "root_objective": objective.tolist(),
-            "physical": float(numpy.dot(weights, physical)),
-            "penalty": float(numpy.dot(weights, penalty)),
-            "objective": float(numpy.dot(weights, objective)),
-            "shift": float(self.fcisolver.ss_penalty),
-            "target_s2": getattr(self.fcisolver, "ss_value", None),
-            "method": getattr(self.fcisolver, "spin_penalty_method", None),
-        }
 
     def density_fit(self, auxbasis=None, with_df=None):
         """Return a DF-GASSCF object using PySCF's CASSCF DF machinery.
@@ -1573,27 +1518,42 @@ class GASSCF(newton_casscf.CASSCF):
 
         The native Newton/CIAH macro/micro control flow is reused directly.
         GAS-specific behavior enters through the orbital mask, fixed-orbital
-        GASCI bridge, and GASCI solver dispatch methods above.
+        GASCI bridge, and GASCI solver dispatch methods above. Public energies
+        exclude spin penalties; Newton continues to optimize their objective.
         """
 
         self.validate_capabilities()
+        gasci._clear_energy_results(self)
         mo = self.mo_coeff if mo_coeff is None else mo_coeff
         if (mo is not None and self.ncas == mo.shape[1] and
                 not self.internal_rotation and not self.canonicalization):
             e_tot, e_gas, ci = self._run_fixed_orbital_gasci(mo, ci0)
             self.mo_energy = None
-            return e_tot, e_gas, ci, self.mo_coeff, self.mo_energy
+            return self.e_tot, self.e_gas, ci, self.mo_coeff, self.mo_energy
         stdout, restore_stdout = self._push_gasscf_log_labels()
         try:
             result = mc1step.CASSCF.kernel(
                 self, mo_coeff, ci0, callback, _gasscf_newton_kernel)
-            self._sync_spin_penalty_results()
             return result
         finally:
             self.close()
             if restore_stdout:
                 self.stdout.flush()
                 self.stdout = stdout
+
+    def dump_chk(self, envs_or_file):
+        """Use PySCF's checkpoint format with physical public energies.
+
+        Newton's local dictionary contains objective energies. Substitute the
+        public energies in a copy; leave its convergence variables untouched.
+        Filename-based calls already use the physical object attributes.
+        """
+        if isinstance(envs_or_file, dict):
+            envs_or_file = dict(envs_or_file)
+            envs_or_file["e_tot"] = self.e_tot
+            envs_or_file["e_cas"] = self.e_cas
+        return super().dump_chk(envs_or_file)
+
     def mc1step(self, mo_coeff=None, ci0=None, callback=None):
         return self.kernel(mo_coeff, ci0, callback)
 
