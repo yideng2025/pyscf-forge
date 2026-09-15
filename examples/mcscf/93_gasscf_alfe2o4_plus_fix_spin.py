@@ -62,7 +62,7 @@ with numpy.load(data_file, allow_pickle=False) as data:
     mol = gto.loads(data["mol"].item())
     mo_coeff = data["mo_coeff"]
 
-mol.max_memory = 8000  # MB
+mol.max_memory = 16000  # MB
 mol.verbose = 4
 
 # One-cycle ROHF for mf generation.
