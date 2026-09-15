@@ -1050,99 +1050,41 @@ class GASSCF(newton_casscf.CASSCF):
             "core": core,
         }
 
-    def _ci_for_active_property(self, ci=None):
+    # Public density/property conventions are shared with GASCI: state=None
+    # selects the weighted density on SA objects, while state=i selects root i.
+    # Keep the Newton solver adapter and its singleton-CI/plan dispatch intact.
+    _has_state_weights = gasci.GASCI._has_state_weights
+    _state_weights = gasci.GASCI._state_weights
+    _base_fcisolver_method = gasci.GASCI._base_fcisolver_method
+    _ci_for_rdm = gasci.GASCI._ci_for_rdm
+    _gasdm1s_to_ao = gasci.GASCI._gasdm1s_to_ao
+    _spin_square_for_ci = gasci.GASCI._spin_square_for_ci
+
+    def _select_ci(self, ci=None, state=0):
         ci = self.ci if ci is None else ci
         if ci is None:
             raise ValueError("CI vector is not available")
-        if isinstance(ci, (list, tuple)):
-            _unsupported("state-averaged GAS density wrappers")
-        return ci
+        return gasci.GASCI._select_ci(self, ci, state)
 
-    def make_gasdm1s(self, ci=None, ncas=None, nelecas=None):
-        """Return alpha and beta active-space GAS one-particle DMs."""
+    def _spin_square_for_roots(self, roots, ncas, nelecas):
+        # Bypass the SA averaging wrapper for each selected root while keeping
+        # the Newton-owned RDM plan reuse in _GASFCISolver.spin_square.
+        method = self._base_fcisolver_method("spin_square")
+        return [method(ci, ncas, nelecas) for ci in roots]
 
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        return self.fcisolver.make_rdm1s(
-            self._ci_for_active_property(ci), ncas, nelecas)
-
-    def make_gasdm1(self, ci=None, ncas=None, nelecas=None):
-        """Return the spin-summed active-space GAS one-particle DM."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        return self.fcisolver.make_rdm1(
-            self._ci_for_active_property(ci), ncas, nelecas)
-
-    def make_gasdm12s(self, ci=None, ncas=None, nelecas=None):
-        """Return spin-resolved active-space GAS 1- and 2-particle DMs."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        return self.fcisolver.make_rdm12s(
-            self._ci_for_active_property(ci), ncas, nelecas)
-
-    def make_gasdm12(self, ci=None, ncas=None, nelecas=None):
-        """Return spin-summed active-space GAS 1- and 2-particle DMs."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        return self.fcisolver.make_rdm12(
-            self._ci_for_active_property(ci), ncas, nelecas)
-
-    def make_gasdm2(self, ci=None, ncas=None, nelecas=None):
-        """Return the spin-summed active-space GAS two-particle DM."""
-
-        return self.make_gasdm12(ci, ncas, nelecas)[1]
-
-    def trans_gasdm1s(self, cibra=None, ciket=None, ncas=None, nelecas=None):
-        """Return alpha and beta active-space GAS transition 1-DMs."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        bra = self._ci_for_active_property(cibra)
-        ket = self._ci_for_active_property(ciket)
-        return self.fcisolver.trans_rdm1s(bra, ket, ncas, nelecas)
-
-    def trans_gasdm1(self, cibra=None, ciket=None, ncas=None, nelecas=None):
-        """Return the spin-summed active-space GAS transition 1-DM."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        bra = self._ci_for_active_property(cibra)
-        ket = self._ci_for_active_property(ciket)
-        return self.fcisolver.trans_rdm1(bra, ket, ncas, nelecas)
-
-    def trans_gasdm12s(self, cibra=None, ciket=None, ncas=None, nelecas=None):
-        """Return spin-resolved active-space GAS transition 1- and 2-DMs."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        bra = self._ci_for_active_property(cibra)
-        ket = self._ci_for_active_property(ciket)
-        return self.fcisolver.trans_rdm12s(bra, ket, ncas, nelecas)
-
-    def trans_gasdm12(self, cibra=None, ciket=None, ncas=None, nelecas=None):
-        """Return spin-summed active-space GAS transition 1- and 2-DMs."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        bra = self._ci_for_active_property(cibra)
-        ket = self._ci_for_active_property(ciket)
-        return self.fcisolver.trans_rdm12(bra, ket, ncas, nelecas)
-
-    def trans_gasdm2(self, cibra=None, ciket=None, ncas=None, nelecas=None):
-        """Return the spin-summed active-space GAS transition 2-DM."""
-
-        return self.trans_gasdm12(cibra, ciket, ncas, nelecas)[1]
-
-    def spin_square(self, ci=None, ncas=None, nelecas=None):
-        """Return ``(<S^2>, 2S+1)`` for a state-specific GAS CI vector."""
-
-        ncas = self.ncas if ncas is None else ncas
-        nelecas = self.nelecas if nelecas is None else nelecas
-        return self.fcisolver.spin_square(
-            self._ci_for_active_property(ci), ncas, nelecas)
+    make_gasdm1 = gasci.GASCI.make_gasdm1
+    make_gasdm1s = gasci.GASCI.make_gasdm1s
+    make_gasdm12 = gasci.GASCI.make_gasdm12
+    make_gasdm12s = gasci.GASCI.make_gasdm12s
+    make_gasdm2 = gasci.GASCI.make_gasdm2
+    trans_gasdm1 = gasci.GASCI.trans_gasdm1
+    trans_gasdm1s = gasci.GASCI.trans_gasdm1s
+    trans_gasdm12 = gasci.GASCI.trans_gasdm12
+    trans_gasdm12s = gasci.GASCI.trans_gasdm12s
+    trans_gasdm2 = gasci.GASCI.trans_gasdm2
+    make_rdm1 = gasci.GASCI.make_rdm1
+    make_rdm1s = gasci.GASCI.make_rdm1s
+    spin_square = gasci.GASCI.spin_square
 
     def get_h1gas(self, mo_coeff=None, ncas=None, ncore=None):
         """Return the effective one-electron Hamiltonian in the GAS space."""

@@ -1936,7 +1936,7 @@ class KnownValues(unittest.TestCase):
             numpy.asarray(mc.fcisolver.spin_square(ket, 2, (1, 1))),
             atol=1e-12, rtol=0)
 
-    def test_gasscf_property_wrappers_require_single_ci_vector(self):
+    def test_gasscf_property_wrappers_require_ci_and_select_roots(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
         mc = gasscf.GASSCF(
@@ -1944,8 +1944,136 @@ class KnownValues(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "CI vector is not available"):
             mc.make_gasdm1()
-        with self.assertRaisesRegex(NotImplementedError, "state-averaged"):
-            mc.make_gasdm1([numpy.ones(4), numpy.ones(4)])
+        roots = [numpy.array([1., 0., 0., 0.]),
+                 numpy.array([0., 0., 0., 1.])]
+        mc.ci = roots
+        for state in (0, 1):
+            numpy.testing.assert_allclose(
+                mc.make_gasdm1(state=state),
+                mc.fcisolver.make_rdm1(roots[state], 2, (1, 1)))
+        numpy.testing.assert_allclose(mc.make_gasdm1(), mc.make_gasdm1(state=0))
+        sa = mc.state_average((.25, .75))
+        with self.assertRaisesRegex(ValueError, "one CI vector per state"):
+            sa.make_gasdm1(ci=roots[0])
+        with self.assertRaisesRegex(ValueError, "root count"):
+            sa.make_gasdm1(ci=roots[:1])
+
+    def _n2_property_pair(self):
+        _, mf, mo = self._n2_regression_fixture()
+        mc = self._n2_regression_mc(mf)
+        ref = gasci.GASCI(
+            mf, mc.ncas, mc.nelecas, ncore=mc.ncore,
+            gas_orbs=mc.gas_orbs, gas_restr=mc.gas_restr,
+            gas_restr_type=mc.gas_restr_type)
+        # Keep the embedded MO order. Orthonormal CI probes isolate property
+        # dispatch from eigensolver convergence and give distinct root DMs.
+        ndet = mc.gas_space_info()["core"]["ndet"]
+        probes = numpy.random.default_rng(211).normal(size=(ndet, 2))
+        probes = numpy.linalg.qr(probes)[0]
+        roots = [probes[:, i].copy() for i in range(2)]
+        for obj in (mc, ref):
+            obj.mo_coeff = mo.copy()
+            obj.ci = [ci.copy() for ci in roots]
+        self.addCleanup(mc.close)
+        return mc, ref, roots
+
+    def _assert_property_close(self, actual, expected):
+        if isinstance(expected, (tuple, list)):
+            self.assertEqual(len(actual), len(expected))
+            for a, e in zip(actual, expected):
+                self._assert_property_close(a, e)
+        else:
+            numpy.testing.assert_allclose(actual, expected, atol=2e-11, rtol=0)
+
+    def test_n2_property_densities_match_gasci_for_ss_sa_and_zero_weight(self):
+        mc, ref, roots = self._n2_property_pair()
+        names = ("make_gasdm1", "make_gasdm1s", "make_gasdm12",
+                 "make_gasdm12s", "make_gasdm2", "make_rdm1", "make_rdm1s")
+        overlap = mc._scf.get_ovlp()
+        for weights in (None, (.25, .75), (1., 0.)):
+            obj = mc if weights is None else mc.state_average(weights)
+            reference = ref if weights is None else ref.state_average(weights)
+            self.addCleanup(obj.close)
+            mo_before = obj.mo_coeff.copy()
+            for cache in (True, False):
+                obj.close()
+                obj.cache_plans = cache
+                for name in names:
+                    for state in (None, 0, 1):
+                        with self.subTest(weights=weights, cache=cache,
+                                          method=name, state=state):
+                            actual = getattr(obj, name)(state=state)
+                            expected = getattr(reference, name)(state=state)
+                            self._assert_property_close(actual, expected)
+                # Independently verify weighted AO density and electron count.
+                dm0 = ref.make_rdm1(state=0)
+                dm1 = ref.make_rdm1(state=1)
+                expected = dm0 if weights is None else (
+                    weights[0] * dm0 + weights[1] * dm1)
+                numpy.testing.assert_allclose(obj.make_rdm1(), expected,
+                                              atol=2e-11, rtol=0)
+                self.assertAlmostEqual(
+                    numpy.einsum("ij,ji->", obj.make_rdm1(), overlap),
+                    obj.mol.nelectron, places=10)
+                self.assertAlmostEqual(numpy.trace(obj.make_gasdm1()),
+                                       sum(obj.nelecas), places=10)
+                self._assert_property_close(
+                    obj.make_gasdm1(None, obj.ncas, obj.nelecas, 1),
+                    ref.make_gasdm1(state=1))
+                numpy.testing.assert_array_equal(obj.mo_coeff, mo_before)
+                for actual, original in zip(obj.ci, roots):
+                    numpy.testing.assert_array_equal(actual, original)
+
+    def test_n2_transition_properties_select_bra_and_ket(self):
+        mc, ref, roots = self._n2_property_pair()
+        sa = mc.state_average((.25, .75))
+        self.addCleanup(sa.close)
+        names = ("trans_gasdm1", "trans_gasdm1s", "trans_gasdm12",
+                 "trans_gasdm12s", "trans_gasdm2")
+        for cache in (True, False):
+            sa.close()
+            sa.cache_plans = cache
+            for name in names:
+                for bra, ket in ((0, 1), (1, 0), (1, 1)):
+                    with self.subTest(cache=cache, method=name, bra=bra, ket=ket):
+                        expected = getattr(ref, name)(roots[bra], roots[ket])
+                        self._assert_property_close(
+                            getattr(sa, name)(bra_state=bra, ket_state=ket),
+                            expected)
+                        self._assert_property_close(
+                            getattr(sa, name)(roots[bra], roots[ket]), expected)
+                self._assert_property_close(getattr(sa, name)(),
+                                            getattr(ref, name)(roots[0], roots[1]))
+            # Reversing a real bra/ket transposes the transition 1-RDM.
+            numpy.testing.assert_allclose(
+                sa.trans_gasdm1(bra_state=1, ket_state=0),
+                sa.trans_gasdm1().T, atol=2e-11, rtol=0)
+            numpy.testing.assert_allclose(
+                sa.trans_gasdm1(bra_state=1, ket_state=1),
+                sa.make_gasdm1(state=1), atol=2e-11, rtol=0)
+
+    def test_n2_spin_properties_match_gasci_and_reuse_newton_plan(self):
+        mc, ref, _ = self._n2_property_pair()
+        root_spins = [ref.spin_square(state=i)[0] for i in (0, 1)]
+        for weights in (None, (.25, .75), (1., 0.)):
+            obj = mc if weights is None else mc.state_average(weights)
+            self.addCleanup(obj.close)
+            obj.close()
+            obj.cache_plans = True
+            with mock.patch.object(obj.fcisolver, "make_rdm_plan",
+                                   wraps=obj.fcisolver.make_rdm_plan) as create:
+                for state in (0, 1):
+                    self._assert_property_close(obj.spin_square(state=state),
+                                                ref.spin_square(state=state))
+                ss, multiplicity = obj.spin_square()
+                expected = root_spins[0] if weights is None else numpy.dot(
+                    weights, root_spins)
+                self.assertAlmostEqual(ss, expected, places=11)
+                self.assertAlmostEqual(multiplicity, numpy.sqrt(4*ss+1), places=11)
+                self.assertEqual(create.call_count, 1)
+            obj.close()
+            obj.cache_plans = False
+            self.assertAlmostEqual(obj.spin_square()[0], expected, places=11)
 
     def test_newton_solver_hides_native_cas_only_hooks(self):
         base = fci_gas.FCISolver(gas_orbs=(2,))
