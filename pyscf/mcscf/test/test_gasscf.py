@@ -27,7 +27,9 @@ import unittest
 from unittest import mock
 
 import numpy
+import scipy.linalg
 
+from pyscf import ao2mo
 from pyscf import gto
 from pyscf import scf
 from pyscf.tools import molden
@@ -1243,6 +1245,89 @@ class KnownValues(unittest.TestCase):
         mc.fcisolver.max_space = 30
         mc.fcisolver.conv_tol = 1e-10
         return mc
+
+    def _check_n2_orbital_gradient_finite_difference(self, weights=None, use_df=False):
+        _, mf, mo = self._n2_regression_fixture()
+        mc = self._n2_regression_mc(mf)
+        self.addCleanup(mc.close)
+        if use_df:
+            mc = mc.density_fit()
+            self.addCleanup(mc.close)
+        if weights is not None:
+            mc = mc.state_average(weights)
+            self.addCleanup(mc.close)
+        ncore, nocc = mc.ncore, mc.ncore + mc.ncas
+        mask = mc.uniq_var_indices(mo.shape[1], ncore, mc.ncas, mc.frozen)
+        rows, cols = numpy.where(mask)
+        sectors = {
+            "core-active": (rows < nocc) & (cols < ncore),
+            "core-virtual": (rows >= nocc) & (cols < ncore),
+            "active-virtual": (rows >= nocc) & (cols >= ncore),
+            "inter-GAS": (rows < nocc) & (cols >= ncore),
+        }
+        rng = numpy.random.default_rng(211)
+        directions = {}
+        for name, selected in sectors.items():
+            self.assertTrue(numpy.any(selected))
+            direction = numpy.zeros(rows.size)
+            direction[selected] = rng.normal(size=numpy.count_nonzero(selected))
+            directions[name] = direction / numpy.linalg.norm(direction)
+
+        # The embedded orbitals are close to a stationary singlet solution.
+        # Apply a small deterministic rotation so the finite differences probe
+        # nonzero gradients, rather than cancellation at that stationary point.
+        # Keep the fixture's MO columns/GAS assignment; do not sort orbitals.
+        displacement = .04 * sum(directions.values())
+        mo = mo @ scipy.linalg.expm(mc.unpack_uniq_var(displacement))
+        mc.gasci(mo)
+        self.assertTrue(mc.converged)
+        ci = mc.ci
+        dm1, dm2 = mc.make_gasdm12(ci=ci)
+        eris = mc.ao2mo(mo)
+        gradient = mc.gen_g_hop(mo, ci, eris)[0][:rows.size]
+        self.assertGreater(numpy.linalg.norm(gradient), 1e-3)
+
+        def energy(orbitals):
+            # Independent scalar expectation value at fixed CI coefficients.
+            # Do not reoptimize CI at +/-h: gen_g_hop supplies the orbital
+            # partial derivative of the joint orbital/CI objective.
+            # Rebuild integrals at both displacements, including on the DF path.
+            h1, ecore = mc.get_h1gas(orbitals)
+            h2 = ao2mo.restore(1, mc.get_h2gas(orbitals), mc.ncas)
+            return (ecore + numpy.einsum('pq,qp', h1, dm1)
+                    + .5 * numpy.einsum('pqrs,pqrs', h2, dm2))
+
+        self.assertAlmostEqual(energy(mo), float(mc.e_tot), delta=2e-8)
+        combined = sum(directions.values())
+        directions["combined"] = combined / numpy.linalg.norm(combined)
+        for name, direction in directions.items():
+            with self.subTest(weights=weights, df=use_df, sector=name):
+                analytic = numpy.dot(gradient, direction)
+                self.assertGreater(abs(analytic), 1e-6)
+                kappa = mc.unpack_uniq_var(direction)
+                errors = []
+                for step in (2e-4, 1e-4):
+                    plus = energy(mo @ scipy.linalg.expm(step * kappa))
+                    minus = energy(mo @ scipy.linalg.expm(-step * kappa))
+                    numerical = (plus - minus) / (2 * step)
+                    errors.append(abs(numerical - analytic))
+                self.assertLess(errors[0], 8e-7)
+                self.assertLess(errors[1], 2e-7)
+                # Central differences have O(h^2) truncation error. Allow for
+                # roundoff once the absolute error is already below 1e-8.
+                self.assertLess(errors[1], .4 * errors[0] + 1e-8)
+
+    def test_n2_orbital_gradient_finite_difference(self):
+        self._check_n2_orbital_gradient_finite_difference()
+
+    def test_n2_sa_orbital_gradient_finite_difference(self):
+        for weights in ((.3, .7), (1., 0.)):
+            self._check_n2_orbital_gradient_finite_difference(weights=weights)
+
+    def test_n2_df_orbital_gradient_finite_difference(self):
+        for weights in (None, (.3, .7)):
+            self._check_n2_orbital_gradient_finite_difference(
+                weights=weights, use_df=True)
 
     def test_n2_numerical_regression_ss_and_zero_weight_sa(self):
         _, mf, mo = self._n2_regression_fixture()
