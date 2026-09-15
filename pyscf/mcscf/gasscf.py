@@ -719,13 +719,16 @@ class GASSCF(newton_casscf.CASSCF):
     Args:
         mf : SCF object
             Mean-field object that supplies molecular data and orbitals.
-        gas_orbs : sequence of ints
-            Ordered numbers of active orbitals in the GAS subspaces.  The total
-            active-space size is ``sum(gas_orbs)``.
-        gas_restr : object, optional
-            GAS restriction in the syntax selected by ``gas_restr_type``.
+        ncas : int
+            Total number of active orbitals, equal to ``sum(gas_orbs)``.
         nelecas : int or pair of ints
             Number of active electrons, optionally resolved as alpha/beta.
+        gas_orbs : sequence of ints, optional
+            Ordered numbers of active orbitals in the GAS subspaces.  The total
+            must equal ``ncas``.  If omitted, one GAS contains all active
+            orbitals, as in GASCI.
+        gas_restr : object, optional
+            GAS restriction in the syntax selected by ``gas_restr_type``.
         gas_restr_type : str, optional
             ``spin-supergroup``, ``supergroup``, ``cumulative-occ`` or ``ras``.
             If omitted, the GASCI default ``spin-supergroup`` is used.
@@ -737,6 +740,11 @@ class GASSCF(newton_casscf.CASSCF):
             Whether GASSCF reuses owned GAS contraction/RDM/spin plans.
 
     Notes:
+        The public call is ``GASSCF(mf, ncas, nelecas, ...)``, following GASCI.
+        For compatibility, calls supplying ``nelecas`` and ``gas_orbs`` (or
+        an explicit GASCI solver) by keyword may omit ``ncas``; it is then
+        inferred from the GAS orbital counts.
+
         The optimizer reuses PySCF's native Newton/CIAH driver.  GAS-specific
         CI, RDM, spin and orbital-rotation operations are supplied by the
         determinant GASCI adapter.
@@ -745,10 +753,22 @@ class GASSCF(newton_casscf.CASSCF):
     _keys = set(newton_casscf.CASSCF._keys) | {
         "gas_orbs", "gas_restr", "gas_restr_type", "cache_plans"}
 
-    def __init__(self, mf, gas_orbs=None, gas_restr=None, *, nelecas,
-                 gas_restr_type=None, ncore=None, frozen=None,
+    def __init__(self, mf, ncas=None, nelecas=None, gas_orbs=None,
+                 gas_restr=None, gas_restr_type=None, *, ncore=None, frozen=None,
                  fcisolver=None, cache_plans=None):
+        if nelecas is None:
+            raise TypeError("GASSCF requires nelecas")
+        if ncas is not None:
+            if (isinstance(ncas, (bool, numpy.bool_)) or
+                    not isinstance(ncas, (int, numpy.integer))):
+                raise TypeError("ncas must be an integer")
+            ncas = int(ncas)
+            if ncas <= 0:
+                raise ValueError("ncas must be positive")
+
         if fcisolver is None:
+            if gas_orbs is None and ncas is not None:
+                gas_orbs = (ncas,)
             solver = _new_gas_solver(
                 mf, gas_orbs, gas_restr, gas_restr_type, cache_plans)
         else:
@@ -759,8 +779,14 @@ class GASSCF(newton_casscf.CASSCF):
                     "by the explicit fcisolver")
             solver = _adapt_solver(fcisolver, cache_plans)
 
-        super().__init__(
-            mf, sum(solver.gas_orbs), nelecas, ncore=ncore, frozen=frozen)
+        gas_ncas = sum(solver.gas_orbs)
+        if ncas is None:
+            ncas = gas_ncas
+        elif ncas != gas_ncas:
+            raise ValueError(
+                "ncas (%d) must equal sum(gas_orbs) (%d)" % (ncas, gas_ncas))
+
+        super().__init__(mf, ncas, nelecas, ncore=ncore, frozen=frozen)
         self.fcisolver = solver
         self.fcisolver.mol = self.mol
 
@@ -1543,8 +1569,8 @@ class GASSCF(newton_casscf.CASSCF):
         return self.e_cas
 
 
-def DFGASSCF(mf, gas_orbs=None, gas_restr=None, *, nelecas,
-             gas_restr_type=None, ncore=None, frozen=None, fcisolver=None,
+def DFGASSCF(mf, ncas=None, nelecas=None, gas_orbs=None, gas_restr=None,
+             gas_restr_type=None, *, ncore=None, frozen=None, fcisolver=None,
              cache_plans=None, auxbasis=None, with_df=None):
     """Create a density-fitted :class:`GASSCF` object.
 
@@ -1553,7 +1579,7 @@ def DFGASSCF(mf, gas_orbs=None, gas_restr=None, *, nelecas,
     """
 
     return GASSCF(
-        mf, gas_orbs=gas_orbs, gas_restr=gas_restr,
-        nelecas=nelecas, gas_restr_type=gas_restr_type, ncore=ncore,
+        mf, ncas, nelecas, gas_orbs=gas_orbs, gas_restr=gas_restr,
+        gas_restr_type=gas_restr_type, ncore=ncore,
         frozen=frozen, fcisolver=fcisolver,
         cache_plans=cache_plans).density_fit(auxbasis=auxbasis, with_df=with_df)
