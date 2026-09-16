@@ -163,6 +163,18 @@ class TestGASRestrictions(unittest.TestCase):
 
 class TestGASFCISolver(unittest.TestCase):
 
+    def test_unsupported_cas_density_and_gpu_entries(self):
+        solver = fci_gas.FCISolver(gas_orbs=(1, 1))
+        for method in ('make_rdm123', 'make_rdm123s',
+                       'make_rdm1234', 'make_rdm1234s'):
+            with self.subTest(method=method):
+                with mock.patch.object(direct_spin1, method, create=True) as native:
+                    with self.assertRaisesRegex(NotImplementedError, 'density matrices'):
+                        getattr(solver, method)(None, 2, (1, 1))
+                    native.assert_not_called()
+        with self.assertRaisesRegex(NotImplementedError, 'C/OpenMP backend'):
+            solver.to_gpu()
+
     def test_borrowed_rdm_plan_matches_full_fci_transitions(self):
         solver = fci_gas.FCISolver(
             gas_orbs=(1, 2), gas_restr=((0, 1), (2, 2)),

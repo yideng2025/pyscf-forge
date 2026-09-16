@@ -384,18 +384,18 @@ class _GASFCISolver(fci_gas.FCISolver):
 
     @staticmethod
     def _contract_eri_key(eri):
-        array = numpy.ascontiguousarray(eri, dtype=numpy.float64)
+        array = fci_gas._as_c_double(eri)
         digest = hashlib.sha256(array.view(numpy.uint8)).digest()
         return array, (tuple(int(value) for value in array.shape), digest)
 
     def _get_contract_plan(self, eri, norb, nelec):
         """Return a Newton-owned Hamiltonian contraction plan for one ERI."""
 
+        eri, key = self._contract_eri_key(eri)
         self._ensure_topology(norb, nelec)
         if self._contract_space is None:
             self._contract_space = self.make_space(
                 norb, nelec, compress_links=True)
-        eri, key = self._contract_eri_key(eri)
         plan = self._contract_plans.pop(key, None)
         if plan is None:
             if len(self._contract_plans) >= self._MAX_CONTRACT_PLANS:

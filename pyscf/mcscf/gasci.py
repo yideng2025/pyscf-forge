@@ -749,9 +749,7 @@ class GASCI(casci.CASCI):
         raise NotImplementedError(
             "GASCI nuclear gradients are not implemented")
 
-    def to_gpu(self, *args, **kwargs):
-        raise NotImplementedError(
-            "the libfci_gas C/OpenMP backend does not support GPU execution")
+    to_gpu = fci_gas.FCISolver.to_gpu
 
     def state_specific_(self, state=1, wfnsym=None):
         if wfnsym is not None:

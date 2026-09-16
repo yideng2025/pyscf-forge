@@ -16,7 +16,11 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""GAS-aware FCISolver bindings for the frozen GAS FCI C kernels."""
+"""GAS-aware FCISolver bindings for the frozen GAS FCI C kernels.
+
+Density matrices through second order are supported. Higher-order CAS RDM
+implementations and GPU conversion cannot operate on this GAS backend.
+"""
 
 from contextlib import nullcontext
 import ctypes
@@ -1431,6 +1435,19 @@ class FCISolver(direct_spin1.FCISolver):
         """Return the spin-traced GAS two-particle density matrix."""
 
         return self.make_rdm12(ci, norb, nelec, link_index, reorder, plan=plan)[1]
+
+    def make_rdm123(self, *args, **kwargs):
+        """Reject inherited third- and fourth-order CAS density matrices."""
+        raise NotImplementedError(
+            "third- and fourth-order density matrices are not implemented "
+            "for the GAS solver")
+
+    make_rdm123s = make_rdm1234 = make_rdm1234s = make_rdm123
+
+    def to_gpu(self, *args, **kwargs):
+        """Reject conversion of the GAS C/OpenMP solver to a GPU backend."""
+        raise NotImplementedError(
+            "the libfci_gas C/OpenMP backend does not support GPU execution")
 
     @pyscf_lib.with_doc(direct_spin1.trans_rdm1s.__doc__)
     def trans_rdm1s(self, cibra, ciket, norb, nelec, link_index=None,

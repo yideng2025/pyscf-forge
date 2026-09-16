@@ -1140,6 +1140,12 @@ class KnownValues(unittest.TestCase):
                 base = (solver if weights is None else
                         super(addons.StateAverageFCISolver, solver))
                 with self.subTest(cache=cache, weights=weights):
+                    for method in ('make_rdm123', 'make_rdm123s',
+                                   'make_rdm1234', 'make_rdm1234s'):
+                        with self.assertRaisesRegex(NotImplementedError, 'density matrices'):
+                            getattr(solver, method)(None, norb, nelec)
+                    with self.assertRaisesRegex(NotImplementedError, 'C/OpenMP backend'):
+                        solver.to_gpu()
                     for method in ('make_rdm1', 'make_rdm1s', 'make_rdm12',
                                    'make_rdm12s', 'trans_rdm1', 'trans_rdm1s',
                                    'trans_rdm12', 'trans_rdm12s'):
@@ -2082,6 +2088,32 @@ class KnownValues(unittest.TestCase):
                                       atol=1e-12, rtol=0)
         solver.close()
 
+    def test_contract_cache_preserves_real_array_validation(self):
+        eri = numpy.eye(3)
+        ci = numpy.array([.5, .5, .5, .5])
+        expected = direct_spin1.contract_2e(eri, ci.reshape(2, 2), 2, (1, 1)).ravel()
+        for cached in (False, True):
+            solver = gasscf._GASFCISolver(gas_orbs=(2,), cache_plans=cached)
+            self.addCleanup(solver.close)
+            for warm in (False, True):
+                with self.subTest(cache=cached, warm=warm):
+                    # Zero imaginary parts are also rejected by GASCI.
+                    for imaginary in (0., 2.):
+                        with self.assertRaisesRegex(TypeError, 'real-valued'):
+                            solver.contract_2e(eri + 1j * imaginary, ci, 2, (1, 1))
+                    if not warm:
+                        self.assertIsNone(solver._contract_space)
+                    numpy.testing.assert_allclose(
+                        solver.contract_2e(eri, ci, 2, (1, 1)), expected,
+                        atol=1e-12, rtol=0)
+                    with self.assertRaisesRegex(TypeError, 'real-valued'):
+                        solver.contract_2e(eri, ci.astype(complex), 2, (1, 1))
+                    with self.assertRaisesRegex(ValueError, 'CI vector size'):
+                        solver.contract_2e(eri, ci[:-1], 2, (1, 1))
+            numpy.testing.assert_allclose(
+                solver.contract_2e(eri, ci, 2, (1, 1)), expected,
+                atol=1e-12, rtol=0)
+
     def test_public_rdm_methods_reuse_owned_plan(self):
         solver = gasscf._GASFCISolver(gas_orbs=(2,))
         reference = fci_gas.FCISolver(gas_orbs=(2,))
@@ -2155,6 +2187,10 @@ class KnownValues(unittest.TestCase):
                     eri, ci, 2, (1, 1), plan=plan)
                 numpy.testing.assert_allclose(
                     contracted, plan.contract(ci), atol=1e-12, rtol=0)
+                # Explicit borrowed plans supply their own Hamiltonian.
+                numpy.testing.assert_array_equal(
+                    solver.contract_2e(eri.astype(complex), ci, 2, (1, 1), plan=plan),
+                    contracted)
         self.assertIsNone(solver._contract_space)
         self.assertEqual(len(solver._contract_plans), 0)
 
