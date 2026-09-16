@@ -271,6 +271,9 @@ class _GasSpinPlan:
     opposite-spin exchange term without expanding the CI vector into the full
     CAS tensor.  The numerical gather/scatter is delegated to PySCF's C-backed
     ``take_2d`` and ``takebak_2d`` helpers.
+
+    The plan owns Python block descriptors and NumPy link maps. It retains
+    no C pointers and remains valid after the source GasSpace is closed.
     """
 
     def __init__(self, gas):
@@ -1368,22 +1371,18 @@ class FCISolver(direct_spin1.FCISolver):
                 c_list = [c_arr.reshape(-1)]
         if spin_penalty is not None:
             penalty_values = []
-            # The contraction GasSpace above has left its context.  Rebuild a
-            # short-lived raw-link space for post-solver diagnostics instead
-            # of retaining a plan backed by released C memory.
-            with self.make_space(
-                    norb, nelec, compress_links=False) as diagnostic_gas:
-                diagnostic_spin = _GasSpinPlan(diagnostic_gas)
-                for vector in c_list[:nroots]:
-                    ss_vector = numpy.asarray(
-                        diagnostic_spin.contract(vector)).reshape(-1)
-                    if linear_spin_penalty:
-                        penalty = spin_shift * (
-                            numpy.dot(vector, ss_vector) - spin_target)
-                    else:
-                        delta = ss_vector - spin_target * vector
-                        penalty = spin_shift * numpy.dot(delta, delta)
-                    penalty_values.append(float(penalty))
+            # Reuse the solve's independent NumPy plan after releasing the
+            # contraction GasSpace; diagnostics need no second raw-link space.
+            for vector in c_list[:nroots]:
+                ss_vector = numpy.asarray(
+                    spin_plan.contract(vector)).reshape(-1)
+                if linear_spin_penalty:
+                    penalty = spin_shift * (
+                        numpy.dot(vector, ss_vector) - spin_target)
+                else:
+                    delta = ss_vector - spin_target * vector
+                    penalty = spin_shift * numpy.dot(delta, delta)
+                penalty_values.append(float(penalty))
             penalty_values = numpy.asarray(
                 penalty_values, dtype=numpy.float64)
             physical_values = e[:nroots] - penalty_values

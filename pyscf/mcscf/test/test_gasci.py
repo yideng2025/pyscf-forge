@@ -645,6 +645,85 @@ class TestGASFCISolver(unittest.TestCase):
         diag[:] = 999
         self.assertFalse(numpy.any(plan.diagonal_vector() == 999))
 
+    def test_kernel_reuses_spin_plan_after_space_release(self):
+        norb, nelec = 3, (1, 1)
+        h1, eri = make_integrals(norb)
+        shift, core = .001, .37
+        observed_nonzero = {0.: False, 2.: False}
+        for target in (0., 2.):
+            for nroots in (1, 2):
+                for pspace in (0, 100):
+                    with self.subTest(target=target, nroots=nroots, pspace=pspace):
+                        solver = fci_gas.FCISolver(
+                            gas_orbs=(1, 2), gas_restr=((1, 1), (2, 2)),
+                            gas_restr_type='cumulative-occ')
+                        solver.ss_penalty, solver.ss_value = shift, target
+                        solver.nroots = nroots
+                        solver.pspace_size = pspace
+                        solver.conv_tol = 1e-12
+                        solver.max_space = 20
+                        spaces, plans, diagnostic_calls = [], [], []
+                        make_space = solver.make_space
+                        plan_class = fci_gas._GasSpinPlan
+
+                        def tracked_space(*args, **kwargs):
+                            space = make_space(*args, **kwargs)
+                            spaces.append(space)
+                            return space
+
+                        def tracked_plan(space):
+                            plan = plan_class(space)
+                            plans.append(plan)
+                            contract = plan.contract
+
+                            def tracked_contract(ci):
+                                if space._gas is None:
+                                    diagnostic_calls.append(plan)
+                                return contract(ci)
+
+                            plan.contract = tracked_contract
+                            return plan
+
+                        with mock.patch.object(solver, 'make_space', side_effect=tracked_space):
+                            with mock.patch.object(fci_gas, '_GasSpinPlan', side_effect=tracked_plan):
+                                energy, ci = solver.kernel(h1, eri, norb, nelec, ecore=core)
+                        self.assertEqual(len(spaces), 1)
+                        self.assertEqual(len(plans), 1)
+                        self.assertIsNone(spaces[0]._gas)
+                        self.assertEqual(len(diagnostic_calls), nroots)
+                        self.assertTrue(all(plan is plans[0] for plan in diagnostic_calls))
+                        self.assertTrue(numpy.all(solver.converged))
+                        self.assertEqual(solver.spin_penalty_method,
+                                         'exact-small-space' if pspace else
+                                         'projected-plus-global-davidson')
+                        # Independent full-FCI operators check physical energy
+                        # and both linear/quadratic penalties for each root.
+                        roots = [ci] if nroots == 1 else ci
+                        physical, penalties = [], []
+                        with make_space(norb, nelec) as gas:
+                            for root in roots:
+                                full = fci_gas.gas2fci(root, gas)
+                                ss_full = spin_op.contract_ss(full, norb, nelec)
+                                physical.append(core + direct_spin1.energy(
+                                    h1, eri, full, norb, nelec))
+                                if target == 0.:
+                                    penalty = shift * numpy.vdot(full, ss_full)
+                                else:
+                                    delta = ss_full - target * full
+                                    penalty = shift * numpy.vdot(delta, delta)
+                                penalties.append(float(penalty))
+                        observed_nonzero[target] |= max(penalties) > 1e-6
+                        numpy.testing.assert_allclose(
+                            numpy.atleast_1d(solver.e_spin_penalty), penalties,
+                            atol=2e-12, rtol=0)
+                        numpy.testing.assert_allclose(
+                            numpy.atleast_1d(solver.e_physical), physical,
+                            atol=2e-11, rtol=0)
+                        numpy.testing.assert_allclose(
+                            numpy.atleast_1d(energy), numpy.asarray(physical) + penalties,
+                            atol=2e-11, rtol=0)
+        self.assertTrue(all(observed_nonzero.values()))
+
     def test_spin_plan_exception_closes_temporary_space(self):
         solver = fci_gas.FCISolver(gas_orbs=(2,))
         space = solver.make_space(2, (1, 1))
