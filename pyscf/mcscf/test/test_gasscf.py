@@ -3218,6 +3218,156 @@ class KnownValues(unittest.TestCase):
         mc.close()
         self.assertIsNone(source_plan._plan)
 
+    def test_full_active_kernel_preserves_ci_convergence(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for use_df in (False, True):
+            for weights in (None, (.5, .5), (1., 0.)):
+                for canonical in (False, True):
+                    with self.subTest(df=use_df, weights=weights, canonical=canonical):
+                        mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=0)
+                        self.addCleanup(mc.close)
+                        if use_df:
+                            mc = mc.density_fit()
+                            self.addCleanup(mc.close)
+                        if weights is not None:
+                            mc = mc.state_average(weights)
+                            self.addCleanup(mc.close)
+                        mc.canonicalization = canonical
+                        solve = mc.fcisolver.kernel
+                        # Keep real CI vectors and energies, but control the
+                        # convergence flag independently of a tiny exact solve.
+                        for converged in (False, True):
+                            flags = converged if weights is None else [True, converged]
+
+                            def controlled_solve(*args, **kwargs):
+                                result = solve(*args, **kwargs)
+                                mc.fcisolver.converged = flags
+                                return result
+
+                            with mock.patch.object(mc.fcisolver, 'kernel',
+                                                   side_effect=controlled_solve):
+                                result = mc.kernel()
+                            self.assertIs(mc.converged, converged)
+                            self.assertTrue(numpy.isfinite(result[0]))
+                            self.assertEqual(result[4] is None, not canonical)
+
+    def test_changed_gas_space_discards_implicit_ci(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.; H 0 0 3.2',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for method in ('gasci', 'kernel', 'get_grad'):
+            # Both fixed occupations have four determinants, with different
+            # meanings; the unrestricted variant changes the vector length.
+            for bounds, ndet in (((1, 1), 4), ((0, 2), 9)):
+                with self.subTest(method=method, bounds=bounds):
+                    mc = gasscf.GASSCF(
+                        mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                        gas_restr=((0, 0), (2, 2)), gas_restr_type='cumulative-occ')
+                    self.addCleanup(mc.close)
+                    mc.canonicalization = False
+                    mc.max_cycle_macro = 1
+                    mc.gasci()
+                    self.assertEqual(mc.ci.size, 4)
+                    old_ci = mc.ci
+                    mc.gas_restr = (bounds, (2, 2))
+                    with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                        getattr(mc, method)()
+                    self.assertIsNone(solve.call_args_list[0].kwargs['ci0'])
+                    self.assertIsNot(mc.ci, old_ci)
+                    self.assertEqual(mc.ci.size, ndet)
+                    ref = gasci.GASCI(
+                        mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                        gas_restr=(bounds, (2, 2)), gas_restr_type='cumulative-occ')
+                    self.assertAlmostEqual(mc.e_tot, ref.kernel(mc.mo_coeff)[0], places=9)
+
+    def test_equivalent_gas_space_retains_ci_and_explicit_guess(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.; H 0 0 3.2',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for method in ('gasci', 'kernel'):
+            mc = gasscf.GASSCF(
+                mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                gas_restr=((0, 0), (2, 2)), gas_restr_type='cumulative-occ')
+            self.addCleanup(mc.close)
+            mc.canonicalization = False
+            mc.max_cycle_macro = 1
+            mc.gasci()
+            previous_ci = mc.ci
+            _, blocks = mc._normalized_restriction()
+            mc.gas_restr, mc.gas_restr_type = blocks, 'spin-supergroup'
+            # A same-model reset/copy and equivalent syntax preserve the basis.
+            mc.reset(mol)
+            mc = mc.copy()
+            self.addCleanup(mc.close)
+            with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                getattr(mc, method)()
+            self.assertIs(solve.call_args_list[0].kwargs['ci0'], previous_ci)
+            # Explicit guesses are still accepted for a changed model.
+            mc.gas_restr, mc.gas_restr_type = ((1, 1), (2, 2)), 'cumulative-occ'
+            explicit = numpy.ones(4) / 2
+            with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                getattr(mc, method)(ci0=explicit)
+            self.assertIs(solve.call_args_list[0].kwargs['ci0'], explicit)
+
+    def test_state_average_root_count_invalidates_implicit_ci(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for method in ('gasci', 'kernel'):
+            mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=0)
+            self.addCleanup(mc.close)
+            mc.gasci()
+            mc = mc.state_average((.5, .5))
+            self.addCleanup(mc.close)
+            with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                getattr(mc, method)()
+            self.assertIsNone(solve.call_args_list[0].kwargs['ci0'])
+            self.assertEqual(len(mc.ci), 2)
+            previous_ci = mc.ci
+            mc = mc.state_average((1., 0.))
+            self.addCleanup(mc.close)
+            with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                getattr(mc, method)()
+            self.assertIs(solve.call_args_list[0].kwargs['ci0'], previous_ci)
+            mc = mc.undo_state_average()
+            self.addCleanup(mc.close)
+            with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                getattr(mc, method)()
+            self.assertIsNone(solve.call_args_list[0].kwargs['ci0'])
+            self.assertEqual(numpy.asarray(mc.ci).ndim, 1)
+
+    def test_checkpoint_ci_requires_explicit_guess_without_gas_signature(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=0)
+        self.addCleanup(mc.close)
+        mc.gasci()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mc.chkfile = str(Path(tmpdir) / 'gas.chk')
+            mc.chk_ci = True
+            mc.dump_chk(dict(e_tot=mc.e_tot, e_cas=mc.e_cas, fcivec=mc.ci,
+                             mo_coeff=mc.mo_coeff, casdm1=mc.make_gasdm1()))
+            for explicit in (False, True):
+                mc.update_from_chk()
+                self.assertIsNone(mc._gas_ci_signature)
+                loaded_ci = mc.ci
+                self.assertIsNotNone(loaded_ci)
+                with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                    mc.kernel(ci0=loaded_ci if explicit else None)
+                self.assertIs(solve.call_args_list[0].kwargs['ci0'],
+                              loaded_ci if explicit else None)
+                self.assertIsNotNone(mc._gas_ci_signature)
+
     def test_full_active_gas_as_cas_kernel_without_canonicalization(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()

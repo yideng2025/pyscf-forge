@@ -189,7 +189,12 @@ def _gasscf_newton_kernel(casscf, *args, **kwargs):
     result = native_kernel(casscf, *args, **kwargs)
     physical, gas_physical = gasci._publish_energy_results(
         casscf, result[1], result[2])
-    return (result[0], physical, gas_physical) + result[3:]
+    converged = result[0]
+    if casscf.ncas == result[4].shape[1] and not casscf.internal_rotation:
+        # Native Newton returns True unconditionally in its full-active CAS
+        # shortcut. The GASCI bridge has the actual CI convergence status.
+        converged = casscf.converged
+    return (converged, physical, gas_physical) + result[3:]
 
 
 def gen_g_hop(mc, mo, ci0, eris, verbose=None):
@@ -897,7 +902,7 @@ class GASSCF(newton_casscf.CASSCF):
 
     _keys = set(newton_casscf.CASSCF._keys) | {
         "gas_orbs", "gas_restr", "gas_restr_type", "cache_plans",
-        "e_spin_penalty", "_gas_energy_results",
+        "e_spin_penalty", "_gas_energy_results", "_gas_ci_signature",
         "spin_penalty_method"}
 
     def __init__(self, mf, ncas=None, nelecas=None, gas_orbs=None,
@@ -938,6 +943,7 @@ class GASSCF(newton_casscf.CASSCF):
         self.fcisolver.mol = self.mol
         self.e_spin_penalty = None
         self._gas_energy_results = None
+        self._gas_ci_signature = None
         self.spin_penalty_method = None
 
 
@@ -1107,9 +1113,12 @@ class GASSCF(newton_casscf.CASSCF):
         Physical e_tot/e_gas remain available from the file. Root energies,
         e_average and spin-penalty diagnostics require a new calculation,
         since the native checkpoint does not store the full GAS energy report.
+        Its CI vector has no GAS-space signature: reuse it explicitly via ci0
+        only when the caller knows the determinant basis is compatible.
         """
 
         result = super().update_from_chk(chkfile)
+        self._gas_ci_signature = None
         energies = self.e_tot, self.e_cas
         gasci._clear_energy_results(self)
         self.e_tot, self.e_cas = energies
@@ -1289,12 +1298,16 @@ class GASSCF(newton_casscf.CASSCF):
         if eris is None:
             eris = self.ao2mo(mo_coeff)
         if casdm1_casdm2 is None:
-            _, _, ci = self.casci(mo_coeff, self.ci, eris)
+            _, _, ci = self.casci(mo_coeff, eris=eris)
             casdm1_casdm2 = self.fcisolver.make_rdm12(ci, self.ncas, self.nelecas)
         dm1, dm2 = casdm1_casdm2
         # The inherited get_grad dispatches through self.gen_g_hop, whose
         # joint orbital/CI signature differs from this orbital-only interface.
         return mc1step.gen_g_hop(self, mo_coeff, 1, dm1, dm2, eris)[0]
+
+    _gas_problem_signature = gasci.GASCI._gas_problem_signature
+    _ci_matches_signature = gasci.GASCI._ci_matches_signature
+    _clear_ci_guess = gasci.GASCI._clear_ci_guess
 
     def _prepare_fixed_orbital_gasci(
             self, mo_coeff=None, ci0=None, *, validate=False, verbose=None):
@@ -1317,7 +1330,12 @@ class GASSCF(newton_casscf.CASSCF):
         if validate:
             self.check_sanity()
         if ci0 is None:
-            ci0 = self.ci
+            if self._ci_matches_signature(self.ci, self._gas_problem_signature()):
+                ci0 = self.ci
+            else:
+                # Also clear self.ci: native CASSCF falls back to this slot
+                # when the explicitly supplied ci0 is None.
+                self._clear_ci_guess()
         self.fcisolver.mol = self.mol
         return mo_coeff, ci0
 
@@ -1326,12 +1344,14 @@ class GASSCF(newton_casscf.CASSCF):
         """Run fixed-orbital GASCI and update PySCF-style result slots."""
 
         mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(mo_coeff, ci0)
+        signature = self._gas_problem_signature()
         gasci._clear_energy_results(self)
         gasci_obj = (
             self if eris is None else
             mc1step._fake_h_for_fast_casci(self, mo_coeff, eris))
         objective, gas_objective, self.ci = gasci.kernel(
             gasci_obj, mo_coeff, ci0=ci0, verbose=verbose)
+        self._gas_ci_signature = signature
         if getattr(self.fcisolver, "converged", None) is not None:
             self.converged = bool(numpy.all(self.fcisolver.converged))
         else:
@@ -1344,7 +1364,9 @@ class GASSCF(newton_casscf.CASSCF):
         """Run the fixed-orbital GASCI problem associated with this object.
 
         This convenience method solves the GASCI problem associated with the
-        current orbitals without performing orbital optimization.
+        current orbitals without performing orbital optimization. An implicit
+        CI guess is reused only for the same normalized GAS space/root count.
+        Pass ci0 explicitly to supply a guess without a recorded GAS signature.
         """
 
         mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(
@@ -1722,6 +1744,7 @@ class GASSCF(newton_casscf.CASSCF):
         GAS-specific behavior enters through the orbital mask, fixed-orbital
         GASCI bridge, and GASCI solver dispatch methods above. Public energies
         exclude spin penalties; Newton continues to optimize their objective.
+        Implicit CI guesses follow the same GAS-space checks as :meth:`gasci`.
         """
 
         mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(
