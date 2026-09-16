@@ -786,6 +786,8 @@ class _StateAverageGASSCF(addons.StateAverageMCSCF):
 
     @property
     def e_average(self):
+        if self._gas_energy_results is None:
+            return None
         return float(numpy.dot(self.weights, self.e_states))
 
     def _finalize(self):
@@ -1098,6 +1100,22 @@ class GASSCF(newton_casscf.CASSCF):
         result = super().reset(mol)
         self.fcisolver.mol = self.mol
         return result
+
+    def update_from_chk(self, chkfile=None):
+        """Load native checkpoint fields and invalidate derived energy reports.
+
+        Physical e_tot/e_gas remain available from the file. Root energies,
+        e_average and spin-penalty diagnostics require a new calculation,
+        since the native checkpoint does not store the full GAS energy report.
+        """
+
+        result = super().update_from_chk(chkfile)
+        energies = self.e_tot, self.e_cas
+        gasci._clear_energy_results(self)
+        self.e_tot, self.e_cas = energies
+        return result
+
+    update = update_from_chk
 
     def copy(self):
         """Copy GAS/SCF state with independent solver and DF cache ownership.

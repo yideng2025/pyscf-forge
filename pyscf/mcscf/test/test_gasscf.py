@@ -3909,6 +3909,107 @@ class KnownValues(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         mc.spin_energy_report()
 
+    def test_checkpoint_reload_invalidates_old_energy_reports(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        kappa = numpy.zeros((4, 4))
+        kappa[1, 0], kappa[0, 1] = .18, -.18
+        moved = mf.mo_coeff @ scipy.linalg.expm(kappa)
+        with tempfile.TemporaryDirectory() as directory:
+            filename = str(Path(directory) / 'new_results.chk')
+            for use_df in (False, True):
+                for weights in (None, (.4, .6), (1., 0.)):
+                    for penalty in (False, True):
+                        source = gasscf.GASSCF(
+                            mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                            gas_restr=((0, 1), (2, 2)), gas_restr_type='cumulative-occ')
+                        self.addCleanup(source.close)
+                        if use_df:
+                            source = source.density_fit()
+                            self.addCleanup(source.close)
+                        if weights is not None:
+                            source = source.state_average(weights)
+                            self.addCleanup(source.close)
+                            self.assertIsNone(source.e_average)
+                        if penalty:
+                            source.fix_spin_(shift=.001, ss=0.)
+                        source.gasci(moved)
+                        source.chkfile, source.chk_ci = filename, True
+                        # Use the native writer's iteration interface to save CI
+                        # as well as the physical energies and orbitals.
+                        source.dump_chk(dict(
+                            e_tot=source.e_tot, e_cas=source.e_cas,
+                            mo_coeff=source.mo_coeff, fcivec=source.ci,
+                            casdm1=source.make_gasdm1()))
+                        saved = lib.chkfile.load(filename, 'mcscf')
+                        self.assertNotIn('_gas_energy_results', saved)
+                        target = source.copy()
+                        self.addCleanup(target.close)
+                        for method in ('update_from_chk', 'update'):
+                            with self.subTest(df=use_df, weights=weights,
+                                              penalty=penalty, method=method):
+                                target.gasci(mf.mo_coeff)
+                                self.assertIsNotNone(target._gas_energy_results)
+                                self.assertGreater(abs(target.e_tot - source.e_tot), 1e-4)
+                                if penalty:
+                                    target.spin_energy_report()
+                                with mock.patch.object(target.fcisolver, 'kernel',
+                                                       side_effect=AssertionError('CI solve')):
+                                    result = (target.update_from_chk(filename)
+                                              if method == 'update_from_chk' else target.update())
+                                self.assertIs(result, target)
+                                self.assertEqual(target.e_tot, saved['e_tot'])
+                                self.assertEqual(target.e_gas, saved['e_cas'])
+                                numpy.testing.assert_array_equal(target.mo_coeff, saved['mo_coeff'])
+                                numpy.testing.assert_array_equal(target.ci, saved['ci'])
+                                self.assertIsNone(target._gas_energy_results)
+                                self.assertIsNone(target.e_spin_penalty)
+                                self.assertIsNone(target.spin_penalty_method)
+                                with self.assertRaisesRegex(ValueError, 'no completed'):
+                                    target.spin_energy_report()
+                                if weights is not None:
+                                    self.assertEqual(target.e_states, [None] * len(weights))
+                                    self.assertIsNone(target.e_average)
+                                target.gasci()
+                                self.assertAlmostEqual(target.e_tot, source.e_tot, delta=1e-9)
+                                self.assertAlmostEqual(target.e_gas, source.e_gas, delta=1e-9)
+                                if weights is not None:
+                                    numpy.testing.assert_allclose(target.e_states, source.e_states,
+                                                                  atol=1e-9, rtol=0)
+                                    self.assertAlmostEqual(target.e_average, target.e_tot, delta=1e-9)
+                                if penalty:
+                                    report = target.spin_energy_report()
+                                    self.assertAlmostEqual(report['physical'], target.e_tot, delta=1e-9)
+                                    numpy.testing.assert_allclose(
+                                        report['root_objective'], source.spin_energy_report()['root_objective'],
+                                        atol=1e-9, rtol=0)
+
+    def test_checkpoint_read_failure_preserves_completed_results(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        mc = gasscf.GASSCF(mf, 2, (1, 1)).state_average((.4, .6))
+        self.addCleanup(mc.close)
+        mc.fix_spin_(shift=.001, ss=0.)
+        mc.gasci()
+        snapshot = mc._gas_energy_results
+        energies = (mc.e_tot, mc.e_gas, mc.e_average)
+        mo, ci = mc.mo_coeff, mc.ci
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / 'missing.chk')
+            for method in (mc.update_from_chk, mc.update):
+                with self.assertRaises(OSError):
+                    method(missing)
+                self.assertIs(mc._gas_energy_results, snapshot)
+                self.assertEqual((mc.e_tot, mc.e_gas, mc.e_average), energies)
+                self.assertIs(mc.mo_coeff, mo)
+                self.assertIs(mc.ci, ci)
+                self.assertEqual(mc.spin_energy_report()['physical'], mc.e_tot)
+
     def test_spin_physical_energy_full_active_shortcut_and_native_checkpoint(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 .75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
@@ -3923,7 +4024,11 @@ class KnownValues(unittest.TestCase):
             filename = str(Path(directory) / "energy.chk")
             mc.dump_chk(filename)
             mc.update_from_chk(filename)
-            self._check_physical_energy_result(mc, result)
+            self.assertEqual(mc.e_tot, result[0])
+            self.assertEqual(mc.e_gas, result[1])
+            with self.assertRaisesRegex(ValueError, 'no completed'):
+                mc.spin_energy_report()
+            self._check_physical_energy_result(mc, mc.gasci())
             # Native update() accepts ordinary PySCF fields without a marker.
             lib.chkfile.dump(filename, "mcscf", {
                 "mo_coeff": mc.mo_coeff, "ci": mc.ci,
