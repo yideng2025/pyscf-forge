@@ -578,6 +578,8 @@ class GasContractPlan:
     """
 
     def __init__(self, gas, eri):
+        if gas._gas is None:
+            raise RuntimeError("GAS space is closed")
         if not gas.links_are_compressed():
             raise ValueError(
                 "Hamiltonian contraction planning requires compressed links")
@@ -607,8 +609,10 @@ class GasContractPlan:
     def contract(self, fcivec):
         """Contract the fixed absorbed Hamiltonian with one GAS CI vector."""
 
-        if self._plan is None:
+        if self._plan is None or self.gas is None:
             raise RuntimeError("Hamiltonian contraction plan is closed")
+        if self.gas._gas is None:
+            raise RuntimeError("GAS space is closed")
         shape = numpy.asarray(fcivec).shape
         ci0 = _as_c_double(numpy.asarray(fcivec).reshape(-1))
         if ci0.size != self.ndet:
@@ -828,6 +832,19 @@ class FCISolver(direct_spin1.FCISolver):
 
         return GasRDMPlan(self, norb, nelec)
 
+    def _validate_plan_space(self, plan, norb, nelec, kind):
+        """Validate a borrowed plan without building or taking ownership of it."""
+
+        if plan._plan is None or plan.gas is None:
+            raise RuntimeError(kind + " plan is closed")
+        if plan.gas._gas is None:
+            raise RuntimeError("GAS space is closed")
+        gas_orbs, expected_nelec, blocks = self._space_spec(norb, nelec)
+        if (tuple(gas_orbs) != plan.gas.norb or
+                tuple(expected_nelec) != tuple(plan.gas.nelec) or
+                not numpy.array_equal(blocks, plan.gas.blocks)):
+            raise ValueError(kind + " plan does not match the GAS space")
+
     def _rdm_plan_context(self, norb, nelec, plan=None):
         """Own a temporary RDM plan, or borrow an explicitly supplied plan.
 
@@ -839,13 +856,7 @@ class FCISolver(direct_spin1.FCISolver):
             return self.make_rdm_plan(norb, nelec)
         if not isinstance(plan, GasRDMPlan):
             raise TypeError("plan must be a GasRDMPlan")
-        if plan._plan is None or plan.gas is None:
-            raise RuntimeError("RDM plan is closed")
-        gas_orbs, expected_nelec, blocks = self._space_spec(norb, nelec)
-        if (tuple(gas_orbs) != plan.gas.norb or
-                tuple(expected_nelec) != tuple(plan.gas.nelec) or
-                not numpy.array_equal(blocks, plan.gas.blocks)):
-            raise ValueError("RDM plan does not match the GAS space")
+        self._validate_plan_space(plan, norb, nelec, "RDM")
         return nullcontext(plan)
 
     def make_spin_plan(self, norb, nelec):
@@ -908,16 +919,19 @@ class FCISolver(direct_spin1.FCISolver):
 
     def contract_2e(self, eri, fcivec, norb, nelec, link_index=None,
                     *args, **kwargs):
-        """Contract an absorbed Hamiltonian with a GAS CI vector."""
+        """Contract an absorbed Hamiltonian with a GAS CI vector.
+
+        With ``plan=``, use the plan's fixed Hamiltonian (``eri`` is unused).
+        Its normalized GAS space must match this solver. The borrowed plan
+        and its GAS space must be open and remain caller-owned on success
+        and failure.
+        """
 
         plan = kwargs.pop("plan", None)
         if plan is not None:
             if not isinstance(plan, GasContractPlan):
                 raise TypeError("plan must be a GasContractPlan")
-            expected_nelec = tuple(fci_addons._unpack_nelec(nelec, self.spin))
-            # Native PySCF checkpoint loading can supply a NumPy pair.
-            if int(norb) != plan.norb or expected_nelec != tuple(plan.nelec):
-                raise ValueError("contraction plan does not match norb/nelec")
+            self._validate_plan_space(plan, norb, nelec, "contraction")
             return plan.contract(fcivec)
 
         compress_links = bool(kwargs.pop("compress_links", True))

@@ -326,6 +326,90 @@ class TestGASFCISolver(unittest.TestCase):
                     numpy.testing.assert_allclose(
                         planned, one_shot, atol=1e-12, rtol=0)
 
+    def test_borrowed_contract_plan_equivalent_specs_and_ownership(self):
+        solver = fci_gas.FCISolver(
+            gas_orbs=(1, 2), gas_restr=((0, 1), (2, 2)),
+            gas_restr_type='cumulative-occ')
+        equivalent = fci_gas.FCISolver(
+            gas_orbs=(1, 2), gas_restr=((1, 1), (0, 2), (1, 1)),
+            gas_restr_type='supergroup')
+        h1, eri = make_integrals(3)
+        h2 = fci_gas.absorb_h1e(h1, eri, 3, (1, 1), .5)
+        with solver.make_space(3, (1, 1), compress_links=True) as gas:
+            with fci_gas.GasContractPlan(gas, h2) as plan:
+                ci = numpy.random.default_rng(410).normal(size=gas.ndet)
+                full = fci_gas.gas2fci(ci, gas)
+                expected = fci_gas.fci2gas(
+                    direct_spin1.contract_2e(h2, full, 3, (1, 1)), gas)
+                with mock.patch.object(equivalent, 'make_space',
+                                       side_effect=AssertionError('space rebuilt')):
+                    # plan= selects its fixed Hamiltonian, so eri is unused.
+                    actual = equivalent.contract_2e(
+                        None, ci, 3, numpy.array([1, 1]), plan=plan)
+                    numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+                    with self.assertRaisesRegex(ValueError, 'CI vector size'):
+                        equivalent.contract_2e(None, ci[:-1], 3, (1, 1), plan=plan)
+                    self.assertIsNotNone(plan._plan)
+                    self.assertIsNotNone(gas._gas)
+                    numpy.testing.assert_allclose(plan.contract(ci), expected, atol=1e-12, rtol=0)
+            self.assertIsNone(plan._plan)
+            self.assertIsNotNone(gas._gas)
+
+    def test_contract_plan_rejects_same_size_foreign_space(self):
+        donor = fci_gas.FCISolver(
+            gas_orbs=(1, 2), gas_restr=((0, 0), (2, 2)),
+            gas_restr_type='cumulative-occ')
+        others = (
+            fci_gas.FCISolver(gas_orbs=(1, 2), gas_restr=((1, 1), (2, 2)),
+                              gas_restr_type='cumulative-occ'),
+            fci_gas.FCISolver(gas_orbs=(2, 1), gas_restr=((2, 2), (2, 2)),
+                              gas_restr_type='cumulative-occ'))
+        h2 = fci_gas.absorb_h1e(numpy.diag([1., 2., 4.]),
+                                numpy.zeros((6, 6)), 3, (1, 1), .5)
+        with donor.make_space(3, (1, 1), compress_links=True) as gas:
+            with fci_gas.GasContractPlan(gas, h2) as plan:
+                ci = numpy.ones(plan.ndet) / numpy.sqrt(plan.ndet)
+                original = plan.contract(ci)
+                for other in others:
+                    with self.subTest(gas_orbs=other.gas_orbs):
+                        self.assertEqual(other.space_info(3, (1, 1))['ndet_estimate'], plan.ndet)
+                        different = other.contract_2e(h2, ci, 3, (1, 1))
+                        self.assertGreater(numpy.linalg.norm(different - original), .1)
+                        with mock.patch.object(plan, 'contract',
+                                               side_effect=AssertionError('foreign execution')):
+                            with self.assertRaisesRegex(ValueError, 'GAS space'):
+                                other.contract_2e(h2, ci, 3, (1, 1), plan=plan)
+                        self.assertIsNotNone(plan._plan)
+                        numpy.testing.assert_array_equal(plan.contract(ci), original)
+                with self.assertRaises(ValueError):
+                    donor.contract_2e(h2, ci, 3, (2, 0), plan=plan)
+                with self.assertRaisesRegex(TypeError, 'GasContractPlan'):
+                    donor.contract_2e(h2, ci, 3, (1, 1), plan=object())
+
+    def test_contract_plan_closed_lifetimes(self):
+        solver = fci_gas.FCISolver(gas_orbs=(2,))
+        eri, ci = numpy.zeros((3, 3)), numpy.ones(4) / 2
+        with solver.make_space(2, (1, 1), compress_links=True) as gas:
+            with fci_gas.GasContractPlan(gas, eri) as plan:
+                pass
+            for call in (lambda: plan.contract(ci),
+                         lambda: solver.contract_2e(eri, ci, 2, (1, 1), plan=plan)):
+                with self.assertRaisesRegex(RuntimeError, 'plan is closed'):
+                    call()
+            self.assertIsNotNone(gas._gas)
+            with fci_gas.GasContractPlan(gas, eri) as plan:
+                gas.close()
+                for call in (lambda: plan.contract(ci),
+                             lambda: solver.contract_2e(eri, ci, 2, (1, 1), plan=plan),
+                             lambda: fci_gas.GasContractPlan(gas, eri)):
+                    with self.assertRaisesRegex(RuntimeError, 'GAS space is closed'):
+                        call()
+        # The common borrowed-space validation also protects the RDM path.
+        with solver.make_rdm_plan(2, (1, 1)) as rdm:
+            rdm.gas.close()
+            with self.assertRaisesRegex(RuntimeError, 'GAS space is closed'):
+                solver.make_rdm1(ci, 2, (1, 1), plan=rdm)
+
     def test_gas_fci_vector_converters(self):
         gas_orbs = (2, 2)
         nelec = (2, 1)

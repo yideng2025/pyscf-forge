@@ -2152,6 +2152,50 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(solver._contract_space)
         self.assertEqual(len(solver._contract_plans), 0)
 
+    def test_external_contract_plan_validation_through_gasscf(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol)
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        donor = fci_gas.FCISolver(
+            gas_orbs=(1, 2), gas_restr=((0, 0), (2, 2)),
+            gas_restr_type='cumulative-occ')
+        h2 = fci_gas.absorb_h1e(numpy.diag([1., 2., 4.]),
+                                numpy.zeros((6, 6)), 3, (1, 1), .5)
+        with donor.make_space(3, (1, 1), compress_links=True) as wrong_space:
+            with fci_gas.GasContractPlan(wrong_space, h2) as wrong:
+                ci = numpy.ones(wrong.ndet) / numpy.sqrt(wrong.ndet)
+                for cached in (False, True):
+                    for sa in (False, True):
+                        with self.subTest(cache=cached, sa=sa):
+                            mc = gasscf.GASSCF(
+                                mf, 3, (1, 1), gas_orbs=(1, 2),
+                                gas_restr=((1, 1), (2, 2)),
+                                gas_restr_type='cumulative-occ', cache_plans=cached)
+                            self.addCleanup(mc.close)
+                            if sa:
+                                mc = mc.state_average((1., 0.))
+                                self.addCleanup(mc.close)
+                            solver = mc.fcisolver
+                            with mock.patch.object(solver, '_get_contract_plan',
+                                                   side_effect=AssertionError('borrowed plan cached')):
+                                with self.assertRaisesRegex(ValueError, 'GAS space'):
+                                    solver.contract_2e(h2, ci, 3, (1, 1), plan=wrong)
+                                self.assertIsNotNone(wrong._plan)
+                                with solver.make_space(3, (1, 1), compress_links=True) as gas:
+                                    with fci_gas.GasContractPlan(gas, h2) as plan:
+                                        expected = plan.contract(ci)
+                                        actual = solver.contract_2e(h2, ci, 3, (1, 1), plan=plan)
+                                        numpy.testing.assert_array_equal(actual, expected)
+                                        mc.close()
+                                        numpy.testing.assert_array_equal(plan.contract(ci), expected)
+                                        self.assertIsNotNone(gas._gas)
+                                    with self.assertRaisesRegex(RuntimeError, 'plan is closed'):
+                                        solver.contract_2e(h2, ci, 3, (1, 1), plan=plan)
+                            self.assertIsNone(solver._contract_space)
+                            self.assertEqual(len(solver._contract_plans), 0)
+
     def test_gasscf_space_info_uses_gasci_normalization(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
