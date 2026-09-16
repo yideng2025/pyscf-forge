@@ -1048,6 +1048,8 @@ class GASSCF(newton_casscf.CASSCF):
                 "nroots>1 requires ordinary state_average support")
 
         gas_orbs, gas_restr = self._normalized_restriction()
+        if sum(gas_orbs) != self.ncas:
+            raise ValueError("ncas must equal sum(gas_orbs)")
         nelecas = self._effective_nelecas()
         addons_gas.check_kernel_limits(gas_orbs, nelecas, gas_restr)
         if hasattr(self.fcisolver, "ss_penalty"):
@@ -1233,16 +1235,26 @@ class GASSCF(newton_casscf.CASSCF):
 
     get_h2gas = gasci.GASCI.get_h2gas
 
-    def _prepare_fixed_orbital_gasci(self, mo_coeff=None, ci0=None):
-        """Return orbitals and CI guess for a fixed-orbital GASCI call."""
+    def _prepare_fixed_orbital_gasci(
+            self, mo_coeff=None, ci0=None, *, validate=False, verbose=None):
+        """Resolve MO/CI guesses, validating at public calculation entries.
 
+        Internal Newton calls use the already validated problem and updated
+        orbitals; they must not repeat the AO metric check at every macro step.
+        """
+
+        if validate:
+            self.validate_capabilities()
         if mo_coeff is None:
-            if self.mo_coeff is None and self._scf.mol.nelectron > 0:
-                self._scf.run()
-                self.mo_coeff = self._scf.mo_coeff
             mo_coeff = self.mo_coeff
-        else:
-            self.mo_coeff = mo_coeff
+            if mo_coeff is None and self._scf.mol.nelectron > 0:
+                self._scf.run()
+                mo_coeff = self._scf.mo_coeff
+        if validate:
+            self._check_mo_orthonormality(mo_coeff, verbose)
+        self.mo_coeff = mo_coeff
+        if validate:
+            self.check_sanity()
         if ci0 is None:
             ci0 = self.ci
         self.fcisolver.mol = self.mol
@@ -1274,6 +1286,8 @@ class GASSCF(newton_casscf.CASSCF):
         current orbitals without performing orbital optimization.
         """
 
+        mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(
+            mo_coeff, ci0, validate=True, verbose=verbose)
         e_tot, e_gas, ci = self._run_fixed_orbital_gasci(
             mo_coeff, ci0, verbose)
         return self.e_tot, self.e_gas, ci, self.mo_coeff, self.mo_energy
@@ -1597,12 +1611,12 @@ class GASSCF(newton_casscf.CASSCF):
         exclude spin penalties; Newton continues to optimize their objective.
         """
 
-        self.validate_capabilities()
+        mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(
+            mo_coeff, ci0, validate=True)
         gasci._clear_energy_results(self)
-        mo = self.mo_coeff if mo_coeff is None else mo_coeff
-        if (mo is not None and self.ncas == mo.shape[1] and
+        if (self.ncas == mo_coeff.shape[1] and
                 not self.internal_rotation and not self.canonicalization):
-            e_tot, e_gas, ci = self._run_fixed_orbital_gasci(mo, ci0)
+            e_tot, e_gas, ci = self._run_fixed_orbital_gasci(mo_coeff, ci0)
             self.mo_energy = None
             return self.e_tot, self.e_gas, ci, self.mo_coeff, self.mo_energy
         stdout, restore_stdout = self._push_gasscf_log_labels()

@@ -2224,6 +2224,148 @@ class KnownValues(unittest.TestCase):
             with self.assertRaises(TypeError):
                 scanner(mol, mo_coeff=mf.mo_coeff.astype(str))
 
+    def test_public_entries_reject_invalid_mo_before_integrals(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        bad = ((mf.mo_coeff * 1.01, ValueError),
+               (mf.mo_coeff[:, :2], ValueError),
+               (mf.mo_coeff[:2], ValueError),
+               (numpy.ones(4), ValueError),
+               (numpy.full((4, 4), numpy.nan), ValueError),
+               (numpy.full((4, 4), numpy.inf), ValueError),
+               (mf.mo_coeff.astype(complex), TypeError),
+               (mf.mo_coeff.astype(str), TypeError))
+        for kind in ('plain', 'df', 'sa', 'df-sa', 'sa-df'):
+            mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=1)
+            if kind in ('df', 'df-sa'):
+                mc = mc.density_fit()
+            if kind in ('sa', 'df-sa', 'sa-df'):
+                mc = mc.state_average((.5, .5))
+            if kind == 'sa-df':
+                mc = mc.density_fit()
+            self.addCleanup(mc.close)
+            for method in ('gasci', 'kernel'):
+                for implicit in (False, True):
+                    for mo, error in bad:
+                        with self.subTest(kind=kind, method=method,
+                                          implicit=implicit, shape=mo.shape):
+                            mc.mo_coeff = mo if implicit else mf.mo_coeff
+                            with mock.patch.object(mc, 'get_h1eff') as h1, \
+                                    mock.patch.object(mc, 'ao2mo') as ao:
+                                with self.assertRaises(error):
+                                    getattr(mc, method)(None if implicit else mo)
+                                h1.assert_not_called()
+                                ao.assert_not_called()
+                            if not implicit:
+                                self.assertIs(mc.mo_coeff, mf.mo_coeff)
+
+    def test_public_entries_share_gasci_metric_thresholds(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        for method in ('gasci', 'kernel'):
+            for sa in (False, True):
+                mc = gasscf.GASSCF(mf, 2, (1, 1))
+                if sa:
+                    mc = mc.state_average((.5, .5))
+                self.addCleanup(mc.close)
+                mc.canonicalization = False
+                mc.stdout = io.StringIO()
+                mc.verbose = 4
+                with mock.patch.object(gasci, 'MO_ORTH_WARN_TOL', 1e-7), \
+                        mock.patch.object(gasci, 'MO_ORTH_ERROR_TOL', 1e-5):
+                    for error in (5e-8, 2e-6, 2e-5):
+                        with self.subTest(method=method, sa=sa, error=error):
+                            mo = mf.mo_coeff.copy()
+                            mo[:, 0] *= numpy.sqrt(1 + error)
+                            mc.stdout.seek(0)
+                            mc.stdout.truncate(0)
+                            if error > 1e-5:
+                                with self.assertRaisesRegex(ValueError, 'orthonormal'):
+                                    getattr(mc, method)(mo)
+                            else:
+                                result = getattr(mc, method)(mo)
+                                self.assertTrue(numpy.isfinite(result[0]))
+                                self.assertEqual('WARN: MO orthonormality' in
+                                                 mc.stdout.getvalue(), error > 1e-7)
+
+    def test_public_entries_validate_solver_and_problem(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        for method in ('gasci', 'kernel'):
+            for invalid in ('solver', 'nroots', 'natorb', 'gas-size', 'electrons'):
+                with self.subTest(method=method, invalid=invalid):
+                    mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=0)
+                    self.addCleanup(mc.fcisolver.close)
+                    if invalid == 'solver':
+                        mc.fcisolver = direct_spin1.FCISolver(mol)
+                        error = NotImplementedError
+                    elif invalid == 'nroots':
+                        mc.fcisolver.nroots = 2
+                        error = ValueError
+                    elif invalid == 'natorb':
+                        mc.natorb = True
+                        error = NotImplementedError
+                    elif invalid == 'gas-size':
+                        mc.gas_orbs = (3,)
+                        error = ValueError
+                    else:
+                        mc.nelecas = (0, 0)
+                        error = AssertionError  # Native CASCI.check_sanity contract.
+                    with mock.patch.object(mc, 'get_h1eff') as h1, \
+                            mock.patch.object(mc, 'ao2mo') as ao:
+                        with self.assertRaises(error):
+                            getattr(mc, method)()
+                        h1.assert_not_called()
+                        ao.assert_not_called()
+
+    def test_public_entries_initialize_and_validate_missing_mo(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        ref = scf.RHF(mol).run()
+        expected = gasci.GASCI(ref, 2, (1, 1)).kernel()[0]
+        for method in ('gasci', 'kernel'):
+            mf = scf.RHF(mol)
+            if getattr(mf, '_chkfile', None) is not None:
+                self.addCleanup(mf._chkfile.close)
+            mc = gasscf.GASSCF(mf, 2, (1, 1))
+            self.addCleanup(mc.close)
+            mc.canonicalization = False
+            with mock.patch.object(mf, 'run', wraps=mf.run) as run:
+                self.assertAlmostEqual(getattr(mc, method)()[0], expected, places=11)
+                run.assert_called_once()
+            self.assertTrue(mc.converged)
+            # Explicit orbitals must not trigger an unnecessary SCF solve.
+            mc.mo_coeff = None
+            with mock.patch.object(mf, 'run') as run:
+                self.assertAlmostEqual(getattr(mc, method)(ref.mo_coeff)[0],
+                                       expected, places=11)
+                run.assert_not_called()
+            # Orbitals generated by SCF receive the same validation.
+            mc.mo_coeff = None
+            mf.mo_coeff = ref.mo_coeff * 1.01
+            with mock.patch.object(mf, 'run', return_value=mf) as run:
+                with self.assertRaisesRegex(ValueError, 'orthonormal'):
+                    getattr(mc, method)()
+                run.assert_called_once()
+
+    def test_newton_checks_mo_only_at_public_entry(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(
+            mf, 2, (1, 1), ncore=1, gas_orbs=(1, 1),
+            gas_restr=((1, 1), (2, 2)), gas_restr_type='cumulative-occ')
+        self.addCleanup(mc.close)
+        mc.max_cycle_macro = 2
+        mc.canonicalization = False
+        with mock.patch.object(mc, '_check_mo_orthonormality',
+                               wraps=mc._check_mo_orthonormality) as check, \
+                mock.patch.object(mc, 'casci', wraps=mc.casci) as internal:
+            result = mc.kernel()
+            self.assertTrue(numpy.isfinite(result[0]))
+            self.assertGreater(internal.call_count, 1)
+            check.assert_called_once()
+
     def test_effective_nelecas_honors_solver_spin(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
