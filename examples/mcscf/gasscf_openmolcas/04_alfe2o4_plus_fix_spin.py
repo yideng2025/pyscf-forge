@@ -92,7 +92,8 @@ mc.fcisolver.max_space = 40
 mc.fcisolver.conv_tol = 1e-11
 mc.fcisolver.conv_tol_residual = 1e-7
 
-# fix spin
+# Bias toward S=4 through the GAS spin penalty; check <S^2> after convergence.
+# e_tot is the physical energy; spin_energy_report also exposes the objective.
 mc.fix_spin_(shift=0.2, ss=target_s2)
 mc.kernel(mo_coeff)
 

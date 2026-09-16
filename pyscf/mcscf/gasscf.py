@@ -19,9 +19,10 @@
 """Generalized active-space self-consistent field.
 
 The public API is :class:`GASSCF` in ``pyscf.mcscf.gasscf``.  The
-implementation reuses PySCF's native Newton/CIAH orbital-optimization driver
-and replaces the active-space CI, RDM and spin operations with the
-restricted determinant GASCI kernels.
+implementation reuses PySCF's ``newton_casscf`` joint orbital/CI Newton driver
+and supplies the active-space CI, RDM and spin operations through the
+restricted determinant GASCI kernels. Computational orbitals and CI vectors
+must be real-valued; the C/OpenMP backend does not support GPU conversion.
 
 Supported GAS definitions follow :mod:`pyscf.mcscf.gasci`: ``gas_orbs``,
 ``gas_restr`` and ``gas_restr_type`` are normalized by the same GAS helper
@@ -325,7 +326,8 @@ class _GASFCISolver(fci_gas.FCISolver):
     Ordinary GASCI remains implemented by :mod:`fci_gas`.  This subclass owns
     only reusable helper plans needed by the joint GASSCF orbital optimizer.
     Adapted or copied solvers always start with empty caches, so C workspaces
-    are never borrowed across solver objects.
+    are not shared by adaptation or copy. An explicit ``plan=`` argument is
+    separately validated and borrowed for that call, without taking ownership.
     """
 
     _keys = set(fci_gas.FCISolver._keys) | {"cache_plans", "ss_penalty", "ss_value"}
@@ -608,8 +610,8 @@ def _adapt_solver(fcisolver, cache_plans):
 
     Scientific GASCI settings are copied from the input solver.  Newton-owned
     helper plans are intentionally not borrowed.  Predecorated solvers are
-    rejected because state averaging, state specificity and spin penalty must
-    decorate the outer GASSCF object where orbital derivatives are visible.
+    rejected. Configure ordinary state averaging and spin penalty through the
+    GASSCF object methods; state-specific excited-state wrappers are unsupported.
     """
 
     if isinstance(fcisolver, _decorated_solver_classes()):
@@ -896,8 +898,10 @@ class GASSCF(newton_casscf.CASSCF):
     """Joint GASSCF orbital optimizer for a determinant GASCI active space.
 
     Args:
-        mf : SCF object
-            Mean-field object that supplies molecular data and orbitals.
+        mf : SCF object or Mole
+            Mean-field reference, or a molecule from which RHF is constructed.
+            UHF/UKS inputs use their native to_rhf() conversion. Active DF-SCF
+            references automatically select DF-GASSCF.
         ncas : int
             Total number of active orbitals, equal to ``sum(gas_orbs)``.
         nelecas : int or pair of ints
@@ -915,8 +919,15 @@ class GASSCF(newton_casscf.CASSCF):
             Number of inactive doubly occupied orbitals.
         frozen : int or sequence of ints, optional
             Frozen orbital specification forwarded to the native Newton class.
+        fcisolver : fci_gas.FCISolver, optional
+            GASCI solver whose settings are copied into an owned adapter with
+            fresh helper-plan caches. It must define gas_orbs; do not also
+            supply gas_orbs, gas_restr or gas_restr_type to the constructor.
+            Predecorated SA/spin-penalty wrappers and external solvers are
+            unsupported; use GASSCF's state_average() and fix_spin_() methods.
         cache_plans : bool, optional
             Whether GASSCF reuses owned GAS contraction/RDM/spin plans.
+            None preserves an explicit solver's setting, or defaults to True.
 
     Notes:
         The public call is ``GASSCF(mf, ncas, nelecas, ...)``, following GASCI.
@@ -924,9 +935,17 @@ class GASSCF(newton_casscf.CASSCF):
         an explicit GASCI solver) by keyword may omit ``ncas``; it is then
         inferred from the GAS orbital counts.
 
-        The optimizer reuses PySCF's native Newton/CIAH driver.  GAS-specific
-        CI, RDM, spin and orbital-rotation operations are supplied by the
-        determinant GASCI adapter.
+        The optimizer reuses PySCF's native joint orbital/CI Newton driver.
+        GAS-specific CI, RDM, spin and orbital-rotation operations are supplied
+        by the determinant GASCI adapter.
+
+    Energies:
+        kernel() and gasci() return (e_tot, e_gas, ci, mo_coeff, mo_energy).
+        Public e_tot and e_gas (also e_cas) exclude spin penalties. On SA
+        objects these are weighted energies; e_states contains physical root
+        energies in solver order. After a penalized solve, spin_energy_report()
+        provides physical, penalty and objective energies. Newton optimizes the
+        penalized objective; its internal casci() bridge returns that objective.
 
     Natural-orbital analysis:
         ``get_gas_natorb(state=i)`` returns a full MO matrix and active-space
@@ -934,12 +953,16 @@ class GASSCF(newton_casscf.CASSCF):
         density. ``get_gas_pseudo_natorb()`` diagonalizes each GAS block and
         returns occupations as one array per subspace. These methods leave
         the computational orbitals and CI vectors unchanged.
+        On SA objects, pseudo-natural orbitals default to the weighted density;
+        state=i selects a root. True natural orbitals may mix GAS subspaces
+        and are for analysis only. Complex analysis orbitals cannot be passed
+        to the real-valued GAS solver.
 
         To rotate computational orbitals and CI together, explicitly call
         ``mc.canonicalize_(gas_pseudo_natorb=True)``. The variant without the
         trailing underscore returns the transformed results without writeback.
 
-        Analysis orbitals can be exported with PySCF's Molden writer::
+        Real analysis orbitals can be exported with PySCF's Molden writer::
 
             from pyscf.tools import molden
             mo_no, active_occ = mc.get_gas_natorb(state=0)
@@ -1104,8 +1127,7 @@ class GASSCF(newton_casscf.CASSCF):
     def validate_capabilities(self):
         """Validate the supported GASSCF feature set.
 
-        This
-        guard makes unsupported combinations fail before entering the native
+        This guard makes unsupported combinations fail before entering the native
         CASSCF driver and sets ``internal_rotation`` whenever
         active-active inter-GAS rotations are part of the orbital variables.
         SA/DF objects must carry the GAS-specific outer adapters as well as
@@ -1211,6 +1233,8 @@ class GASSCF(newton_casscf.CASSCF):
         DF settings are retained, but integrals are rebuilt on demand and DF
         output files are not inherited. SCF and MCSCF share the new DF object
         only when they shared the source DF object.
+        MO and CI arrays retain PySCF's shallow-copy semantics. as_scanner()
+        additionally copies these arrays for independent scanning.
         """
 
         result = super().copy()
@@ -1547,7 +1571,7 @@ class GASSCF(newton_casscf.CASSCF):
         Fock diagonal elements, not pseudo-natural occupations.
 
         These are pseudo-natural orbitals: density between GAS subspaces need
-        not vanish. Rotations across GAS subspaces remain unsupported, as do
+        not vanish. Canonicalization across GAS subspaces is unsupported, as are
         ``gas_natorb=True`` and ``cas_natorb=True``. Use ``canonicalize_`` to
         write the returned orbitals, CI and orbital energies to this object.
         """
@@ -1656,6 +1680,8 @@ class GASSCF(newton_casscf.CASSCF):
         Zero-weight roots are still solved and stored, but contribute neither
         to the weighted energy nor to its gradient and Hessian. Their presence
         may affect multiroot solver work and the numerical optimization path.
+        Supply at least two finite nonnegative weights summing to one. This
+        method returns a copy; state_average_() updates the object in place.
         ``wfnsym`` and SA-mix are not supported.
         """
 
@@ -1696,6 +1722,8 @@ class GASSCF(newton_casscf.CASSCF):
         instead of wrapping the solver in PySCF's CAS-oriented
         ``SpinPenaltyFCISolver`` dynamic class.  This keeps GAS
         link tables and CI vectors in the GAS representation.
+        The GAS restriction must be spin-complete. Electron counts fix the
+        spin projection, not the total spin; check spin_square() after solving.
         """
 
         self.validate_capabilities()
@@ -1767,6 +1795,11 @@ class GASSCF(newton_casscf.CASSCF):
         to be compatible. Creating a scanner does not change the source CI.
         Resetting a scanner invalidates its scan report and convergence flag;
         stored orbitals and compatible CI remain available as initial guesses.
+        Keep atoms/order, charge, spin, basis/ECP, core and GAS definitions,
+        root count, weights, spin penalty and frozen orbitals fixed. Explicit
+        mo_coeff is interpreted in the current geometry's AO basis; otherwise
+        previous orbitals are projected with GAS-block priorities. Root order
+        follows each GASCI solve; the scanner does not track state identity.
         """
 
         return _as_scanner(self)
@@ -1791,9 +1824,9 @@ class GASSCF(newton_casscf.CASSCF):
     gen_g_hop = gen_g_hop
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
-        """Run full GASSCF orbital optimization with native CIAH.
+        """Run joint orbital/CI optimization with native newton_casscf.
 
-        The native Newton/CIAH macro/micro control flow is reused directly.
+        The native Newton macro/micro control flow is reused directly.
         GAS-specific behavior enters through the orbital mask, fixed-orbital
         GASCI bridge, and GASCI solver dispatch methods above. Public energies
         exclude spin penalties; Newton continues to optimize their objective.

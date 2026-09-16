@@ -107,6 +107,8 @@ print(f"Difference / Eh       : {energy - openmolcas_energy:+.3e}")
 
 # The scanner projects the previous orbitals and reuses the previous CI guess.
 # Keep the atom order, basis, electron counts, GAS definition and spin fixed.
+# SA weights, root count, spin penalty and frozen orbitals must also stay fixed.
+# Root ordering follows each GASCI solve; state identity is not tracked.
 scanner = mc.as_scanner()
 for distance in (r0 - 0.001, r0 + 0.001):
     new_coords = coords.copy()

@@ -72,6 +72,8 @@ mf.kernel()
 mf.mo_coeff = mo_coeff
 
 # GASSCF(10e,8o), with three GAS spaces containing 2, 4, and 2 orbitals.
+# (6,4) fixes M_S=1; determinant roots are not constrained to total S=1.
+# The reported <S^2> verifies the triplet character of these reference roots.
 mc = gasscf.GASSCF(
     mf,
     ncas=8,

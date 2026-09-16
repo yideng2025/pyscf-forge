@@ -65,6 +65,8 @@ mf.kernel()
 mf.mo_coeff = mo_coeff
 
 # RASSCF(30e,22o)
+# The DF-SCF reference automatically selects DF-GASSCF. The explicit
+# density_fit call below retains the matching SCF auxiliary-basis helper.
 mc = gasscf.GASSCF(
     mf,
     ncas=22,
@@ -85,7 +87,8 @@ mc.fcisolver.max_space = 30
 mc.fcisolver.conv_tol = 1e-10
 mc.fcisolver.conv_tol_residual = 1e-6
 
-# fix spin
+# Bias toward S=3 through the GAS spin penalty; check <S^2> after convergence.
+# e_tot is the physical energy; spin_energy_report also exposes the objective.
 mc.fix_spin_(shift=0.2, ss=target_s2)
 mc.kernel(mo_coeff)
 

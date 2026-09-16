@@ -212,6 +212,7 @@ def spin_energy_report(mc):
 
     Totals are scalars for a single root or state average, and arrays for
     unweighted multiroot GASCI. Root entries always retain solver root order.
+    Requires a completed spin-penalized solve; otherwise raises ValueError.
     """
     result = getattr(mc, "_gas_energy_results", None)
     if result is None or not result["penalized"]:
@@ -1121,7 +1122,7 @@ class GASCI(casci.CASCI):
                                sort=True):
         """Return natural orbitals of the explicitly state-averaged GAS DM.
 
-        This method is available only on a state-average GASCI object.  Like
+        This method requires a state-average GASCI or GASSCF object. Like
         :meth:`get_gas_natorb`, the returned orbitals are for analysis and do
         not replace the computational GAS orbitals.
         """
