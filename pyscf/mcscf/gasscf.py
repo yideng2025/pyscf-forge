@@ -33,6 +33,15 @@ and the GASCI-native spin-penalty Hamiltonian.  It does not implement
 state-average-mix, state-specific excited-state wrappers,
 unrestricted active-space natural-orbital rotations, analytic gradients/NACs or the
 legacy two-step CASSCF driver.
+
+Construct supported SA/DF objects with ``mc.state_average(...)``,
+``mc.density_fit(...)`` or ``DFGASSCF(...)``. These entry points install the
+GAS energy, resource-ownership and capability adapters. Unadapted wrappers
+from ``mcscf.addons.state_average`` or ``mcscf.df.density_fit`` are rejected
+by GASSCF calculation entry points. Such external wrappers can still expose
+their own CASSCF methods (including gradient constructors); those methods
+are outside the supported GASSCF API. The separate ``approx_hessian``
+wrapper is not supported.
 """
 
 from collections import OrderedDict
@@ -1016,10 +1025,22 @@ class GASSCF(newton_casscf.CASSCF):
         guard makes unsupported combinations fail before entering the native
         CASSCF driver and sets ``internal_rotation`` whenever
         active-active inter-GAS rotations are part of the orbital variables.
-        Ordinary state averaging is supported only when both the outer MCSCF
-        object and the inner GASCI solver carry PySCF's matching SA wrappers.
+        SA/DF objects must carry the GAS-specific outer adapters as well as
+        the matching native solver wrappers. Use the GASSCF object methods
+        or DFGASSCF factory to construct them.
         """
 
+        if isinstance(self, mcdf._DFHessianCASSCF):
+            _unsupported("density-fitted approximate Hessian")
+        if isinstance(self, mcdf._DFCAS) and not isinstance(self, _DFGASSCF):
+            _unsupported(
+                "unadapted PySCF DF wrapper; use mc.density_fit() on the "
+                "original GASSCF object")
+        if (isinstance(self, addons.StateAverageMCSCF) and
+                not isinstance(self, _StateAverageGASSCF)):
+            _unsupported(
+                "unadapted PySCF state-average wrapper; use "
+                "mc.state_average(weights) on the original GASSCF object")
         if not isinstance(self.fcisolver, _GASFCISolver):
             _unsupported("non-adapted GASCI solver")
         if isinstance(self.fcisolver, addons.StateAverageMixFCISolver):
@@ -1499,6 +1520,7 @@ class GASSCF(newton_casscf.CASSCF):
 
         if wfnsym is not None:
             _unsupported("wfnsym")
+        self.validate_capabilities()
         weights = self._validate_weights(weights)
         source = self.undo_state_average() if isinstance(
             self, addons.StateAverageMCSCF) else self.copy()
@@ -1564,6 +1586,7 @@ class GASSCF(newton_casscf.CASSCF):
         to obtain independent DF caches and output-file ownership.
         """
 
+        self.validate_capabilities()
         result = mcdf.density_fit(self, auxbasis=auxbasis, with_df=with_df)
         # Native DF construction copies __dict__ without calling our copy().
         # Do not detach or close caches on an idempotent return of self.
@@ -1576,6 +1599,11 @@ class GASSCF(newton_casscf.CASSCF):
             result.__class__ = lib.replace_class(
                 result.__class__, mcdf._DFCASSCF, _DFGASSCF)
         return result
+
+    def approx_hessian(self, auxbasis=None, with_df=None):
+        """Reject the unvalidated native DF-only Hessian approximation."""
+
+        _unsupported("density-fitted approximate Hessian")
 
 
     def as_scanner(self):

@@ -3222,6 +3222,86 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "wfnsym"):
             mc.state_average((0.5, 0.5), wfnsym=0)
 
+    def test_unadapted_native_wrappers_fail_before_calculation(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol)
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        wrappers = (
+            ('sa', lambda mc: addons.state_average(mc, (.5, .5))),
+            ('sa-inplace', lambda mc: addons.state_average_(mc, (.5, .5))),
+            ('df', mcdf.density_fit),
+            ('native-sa-over-gas-df', lambda mc:
+             addons.state_average(mc.density_fit(), (.5, .5))),
+            ('native-df-over-gas-sa', lambda mc:
+             mcdf.density_fit(mc.state_average((.5, .5)))),
+            ('native-df-sa', lambda mc:
+             addons.state_average(mcdf.density_fit(mc), (.5, .5))),
+            ('native-sa-df', lambda mc:
+             mcdf.density_fit(addons.state_average(mc, (.5, .5)))),
+        )
+        for kind, wrap in wrappers:
+            source = gasscf.GASSCF(mf, 2, (1, 1))
+            self.addCleanup(source.close)
+            plan = source.fcisolver._get_rdm_plan(2, (1, 1))
+            mc = wrap(source)
+            self.addCleanup(mc.close)
+            for method in ('validate_capabilities', 'kernel', 'gasci',
+                           'newton', 'as_scanner', 'state_average', 'density_fit'):
+                with self.subTest(kind=kind, method=method):
+                    with mock.patch.object(mc._scf, 'run') as scf_run, \
+                            mock.patch.object(mc, 'get_h1eff') as h1, \
+                            mock.patch.object(mc, 'ao2mo') as ao:
+                        with self.assertRaisesRegex(NotImplementedError,
+                                                    'unadapted PySCF.*original GASSCF'):
+                            getattr(mc, method)()
+                        scf_run.assert_not_called()
+                        h1.assert_not_called()
+                        ao.assert_not_called()
+                    self.assertIsNotNone(plan._plan)
+
+    def test_native_approx_hessian_wrapper_is_rejected(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol)
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for sa in (False, True):
+            source = gasscf.GASSCF(mf, 2, (1, 1))
+            if sa:
+                source = source.state_average((.5, .5))
+            self.addCleanup(source.close)
+            mc = mcdf.approx_hessian(source)
+            self.addCleanup(mc.close)
+            for method in ('validate_capabilities', 'kernel', 'gasci',
+                           'newton', 'as_scanner', 'state_average', 'density_fit'):
+                with self.subTest(sa=sa, method=method):
+                    with mock.patch.object(mc._scf, 'run') as run, \
+                            mock.patch.object(mc, 'ao2mo') as ao:
+                        with self.assertRaisesRegex(NotImplementedError,
+                                                    'approximate Hessian'):
+                            getattr(mc, method)()
+                        run.assert_not_called()
+                        ao.assert_not_called()
+
+    def test_sa_then_df_keeps_physical_energy_adapters(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for weights in ((.4, .6), (1., 0.)):
+            mc = gasscf.GASSCF(
+                mf, 3, (1, 1), ncore=1, gas_orbs=(1, 2),
+                gas_restr=((0, 1), (2, 2)), gas_restr_type='cumulative-occ')
+            mc = mc.state_average(weights).density_fit()
+            self.addCleanup(mc.close)
+            mc.fix_spin_(shift=.001, ss=0.)
+            mc.max_cycle_macro = mc.max_cycle_micro = 1
+            mc.canonicalization = False
+            self.assertIs(mc.validate_capabilities(), mc)
+            self._check_physical_energy_result(mc, mc.gasci())
+            self._check_physical_energy_result(mc, mc.kernel())
+
     def test_state_average_kernel_gas_as_cas_smoke(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
@@ -3976,6 +4056,7 @@ class KnownValues(unittest.TestCase):
                     ('nac_method', {}, 'nonadiabatic coupling'),
                     ('NACs', {}, 'nonadiabatic coupling'),
                     ('to_gpu', {}, 'C/OpenMP backend'),
+                    ('approx_hessian', {}, 'approximate Hessian'),
                 )
                 for method, kwargs, message in calls:
                     with self.subTest(kind=kind, scanner=scanner,
