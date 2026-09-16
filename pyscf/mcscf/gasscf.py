@@ -50,6 +50,12 @@ with their ``to_rhf()`` method, and active DF-SCF inputs automatically select
 DF-GASSCF. This does not implement unrestricted GASSCF. Generalized and
 relativistic spinor SCF references are not supported.
 
+Point-group symmetry and orbital/wavefunction symmetry constraints are not
+supported. Disable molecular symmetry and leave ``extrasym``, ``orbsym`` and
+``wfnsym`` unset. Tagged symmetry orbitals are rejected, not silently stripped.
+GAS restrictions, frozen orbitals and the native GAS spin penalty remain
+supported independently of these spatial-symmetry settings.
+
 Use ``kernel()`` for joint Newton orbital optimization. The ``mc1step()``
 entry and its legacy ``rotate_orb_cc``, ``update_casdm`` and ``solve_approx_ci``
 helpers are not supported.
@@ -71,7 +77,6 @@ from pyscf.lib import logger
 from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
-from pyscf.mcscf import casci_symm
 from pyscf.mcscf import df as mcdf
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
@@ -85,8 +90,28 @@ def _unsupported(feature):
     raise NotImplementedError(feature + " is not implemented for GASSCF")
 
 
+def _check_symmetry(obj, mo_coeff=None, mol=None):
+    """Reject spatial symmetry before orbital metadata can be discarded."""
+    if mol is not None and mol.symmetry:
+        _unsupported("molecular point-group symmetry")
+    for source in (obj, getattr(obj, "_scf", None),
+                   getattr(obj, "fcisolver", None)):
+        if source is None:
+            continue
+        if getattr(getattr(source, "mol", None), "symmetry", False):
+            _unsupported("molecular point-group symmetry")
+        for name in ("extrasym", "orbsym", "wfnsym"):
+            if getattr(source, name, None) is not None:
+                _unsupported(name + " symmetry constraints")
+        if getattr(getattr(source, "mo_coeff", None), "orbsym", None) is not None:
+            _unsupported("orbital symmetry labels (orbsym)")
+    if getattr(mo_coeff, "orbsym", None) is not None:
+        _unsupported("orbital symmetry labels (orbsym)")
+
+
 def _check_scf_reference(mf):
     """Reject unsupported references before conversion or integral work."""
+    _check_symmetry(mf)
     if getattr(mf, "with_x2c", None) is not None:
         _unsupported("X2C")
     if getattr(mf, "with_solvent", None) is not None:
@@ -225,6 +250,7 @@ def gen_g_hop(mc, mo, ci0, eris, verbose=None):
     2 w r and 2 w [(P-p) v - r(c.v) - c(r.v)], respectively, in the native
     Newton normalization convention. The keyframe gradient uses the same P.
     """
+    _check_symmetry(mc, mo)
     gradient, update, hop, hdiag = newton_casscf.gen_g_hop(
         mc, mo, ci0, eris, verbose)
     solver = mc.fcisolver
@@ -647,7 +673,6 @@ def _problem_signature(mc):
              None if getattr(mc.fcisolver, "ss_value", None) is None else
              float(mc.fcisolver.ss_value))),
         "frozen": _digest(mc.frozen),
-        "extrasym": _digest(mc.extrasym),
     }
 
 
@@ -714,9 +739,9 @@ def _copy_df(with_df):
 def _as_scanner(mc):
     """Return an energy-only scanner with fixed GAS/Newton objective metadata."""
 
+    mc.validate_capabilities()
     if isinstance(mc, lib.SinglePointScanner):
         return mc
-    mc.validate_capabilities()
     source = mc.copy()
     source.mo_coeff = None if mc.mo_coeff is None else numpy.array(
         mc.mo_coeff, copy=True)
@@ -743,6 +768,7 @@ class _GASSCFScanner(lib.SinglePointScanner):
             mol = mol_or_geom
         else:
             mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+        _check_symmetry(self, mo_coeff, mol)
         if _system_signature(mol) != self._scan_system:
             raise ValueError(
                 "energy scanner requires the same atoms/order, charge, spin, "
@@ -835,6 +861,11 @@ class _DFGASSCF(mcdf._DFCASSCF):
     nuc_grad_method = _nuc_grad_method
     Gradients = nuc_grad_method
     _state_average_nuc_grad_method = nuc_grad_method
+
+    def reset(self, mol=None):
+        # Native DF.reset changes its auxiliary molecule before calling super.
+        _check_symmetry(self, mol=mol)
+        return super().reset(mol)
 
     def dump_flags(self, verbose=None):
         super(mcdf._DFCAS, self).dump_flags(verbose)
@@ -976,6 +1007,7 @@ class GASSCF(newton_casscf.CASSCF):
         super().__init__(mf, ncas, nelecas, ncore=ncore, frozen=frozen)
         self.fcisolver = solver
         self.fcisolver.mol = self.mol
+        _check_symmetry(self)
         self.e_spin_penalty = None
         self._gas_energy_results = None
         self._gas_ci_signature = None
@@ -1074,6 +1106,7 @@ class GASSCF(newton_casscf.CASSCF):
         or DFGASSCF factory to construct them.
         """
 
+        _check_symmetry(self)
         _check_scf_reference(self._scf)
         if getattr(self, "with_solvent", None) is not None:
             _unsupported("solvent models")
@@ -1139,6 +1172,7 @@ class GASSCF(newton_casscf.CASSCF):
     def reset(self, mol=None):
         """Reset molecular data and drop GAS helper-plan caches."""
 
+        _check_symmetry(self, mol=mol)
         self.close()
         gasci._clear_energy_results(self)
         result = super().reset(mol)
@@ -1200,6 +1234,7 @@ class GASSCF(newton_casscf.CASSCF):
         orbital gauge degrees of freedom and are excluded.
         """
 
+        _check_symmetry(self)
         nmo = int(nmo)
         ncore = int(ncore)
         ncas = int(ncas)
@@ -1220,10 +1255,6 @@ class GASSCF(newton_casscf.CASSCF):
             mask[start:stop, first_active:start] = True
             offset = stop
 
-        if self.extrasym is not None:
-            extrasym = numpy.asarray(self.extrasym)
-            extrasym_allowed = extrasym.reshape(-1, 1) == extrasym
-            mask = mask * extrasym_allowed
         if frozen is not None:
             if isinstance(frozen, (int, numpy.integer)):
                 mask[:frozen] = mask[:, :frozen] = False
@@ -1231,6 +1262,10 @@ class GASSCF(newton_casscf.CASSCF):
                 frozen = numpy.asarray(frozen)
                 mask[frozen] = mask[:, frozen] = False
         return mask
+
+    def rotate_mo(self, mo, u, log=None):
+        _check_symmetry(self, mo)
+        return super().rotate_mo(mo, u, log)
 
     _effective_nelecas = gasci.GASCI._effective_nelecas
 
@@ -1260,7 +1295,6 @@ class GASSCF(newton_casscf.CASSCF):
     _state_weights = gasci.GASCI._state_weights
     _base_fcisolver_method = gasci.GASCI._base_fcisolver_method
     _ci_for_rdm = gasci.GASCI._ci_for_rdm
-    _gasdm1s_to_ao = gasci.GASCI._gasdm1s_to_ao
     _spin_square_for_ci = gasci.GASCI._spin_square_for_ci
 
     def _select_ci(self, ci=None, state=0):
@@ -1290,9 +1324,7 @@ class GASSCF(newton_casscf.CASSCF):
     spin_square = gasci.GASCI.spin_square
 
     # Reuse GASCI analysis without installing analysis orbitals on this object.
-    _check_mo_orthonormality = gasci.GASCI._check_mo_orthonormality
     _natural_eigensystem = staticmethod(gasci.GASCI._natural_eigensystem)
-    _rotate_gas_orbitals = gasci.GASCI._rotate_gas_orbitals
     sort_mo = gasci.GASCI.sort_mo
     get_gas_natorb = gasci.GASCI.get_gas_natorb
     get_gas_average_natorb = gasci.GASCI.get_gas_average_natorb
@@ -1301,6 +1333,18 @@ class GASSCF(newton_casscf.CASSCF):
     _gas_analysis_label = "GASSCF"
     analyze = gasci.GASCI.analyze
     to_gpu = gasci.GASCI.to_gpu
+
+    def _check_mo_orthonormality(self, mo_coeff=None, verbose=None):
+        _check_symmetry(self, mo_coeff)
+        return gasci.GASCI._check_mo_orthonormality(self, mo_coeff, verbose)
+
+    def _rotate_gas_orbitals(self, mo_coeff, rotation):
+        _check_symmetry(self, mo_coeff)
+        return gasci.GASCI._rotate_gas_orbitals(self, mo_coeff, rotation)
+
+    def _gasdm1s_to_ao(self, gasdm1s, mo_coeff, ncas, ncore):
+        _check_symmetry(self, mo_coeff)
+        return gasci.GASCI._gasdm1s_to_ao(self, gasdm1s, mo_coeff, ncas, ncore)
 
     def get_fock(self, mo_coeff=None, ci=None, eris=None, gasdm1=None,
                  verbose=None, *, casdm1=None):
@@ -1311,6 +1355,7 @@ class GASSCF(newton_casscf.CASSCF):
         only one of the two. Positional arguments retain the native order.
         """
 
+        _check_symmetry(self, mo_coeff)
         if casdm1 is not None:
             if gasdm1 is not None:
                 raise ValueError("supply only one of gasdm1 and casdm1")
@@ -1370,6 +1415,7 @@ class GASSCF(newton_casscf.CASSCF):
         orbitals; they must not repeat the AO metric check at every macro step.
         """
 
+        _check_symmetry(self, mo_coeff)
         if validate:
             self.validate_capabilities()
         if mo_coeff is None:
@@ -1474,50 +1520,6 @@ class GASSCF(newton_casscf.CASSCF):
 
         return e_tot, e_gas, ci
 
-    def _eig(self, mat, b0=None, b1=None, orbsym=None):
-        # Native canonicalize supplies combined orbital/extrasym labels.
-        if orbsym is not None:
-            return casci_symm.eig(mat, orbsym)
-        return super()._eig(mat, b0, b1)
-
-    def _canonicalize_core_virtual(self, mo_coeff, ci, eris, sort,
-                                   gasdm1, verbose, **kwargs):
-        """Reuse GASCI canonicalization while preserving fixed extra labels."""
-
-        mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
-        # Native sort=True may reorder the supplied orbsym array in place.
-        # Own the labels as well as the MO array on both canonicalization paths.
-        mo_input = mo_coeff.copy()
-        if getattr(mo_coeff, 'orbsym', None) is not None:
-            mo_input = lib.tag_array(
-                mo_input, orbsym=numpy.array(mo_coeff.orbsym, copy=True))
-        extra = self.extrasym
-        mo, ci, energies = gasci.GASCI.canonicalize(
-            self, mo_input, ci, eris, sort=sort and extra is None,
-            gas_natorb=False, gasdm1=gasdm1, verbose=verbose, **kwargs)
-        if sort and extra is not None:
-            # extrasym is an object constraint, not returned orbital metadata.
-            # Keep its positions fixed while applying native energy ordering
-            # within each unfrozen extra-symmetry group of core/virtual space.
-            extra = numpy.asarray(extra)
-            available = numpy.ones(mo.shape[1], dtype=bool)
-            if isinstance(self.frozen, (int, numpy.integer)):
-                available[:self.frozen] = False
-            elif self.frozen is not None:
-                available[self.frozen] = False
-            nocc = self.ncore + self.ncas
-            for start, stop in ((0, self.ncore), (nocc, mo.shape[1])):
-                indices = numpy.arange(start, stop)[available[start:stop]]
-                for label in set(extra[indices]):
-                    group = indices[extra[indices] == label]
-                    order = group[numpy.argsort(energies[group].round(9),
-                                               kind='mergesort')]
-                    mo[:, group] = mo[:, order]
-                    energies[group] = energies[order]
-                    if getattr(mo, 'orbsym', None) is not None:
-                        mo.orbsym[group] = mo.orbsym[order]
-        return mo, ci, energies
-
     def canonicalize(self, mo_coeff=None, ci=None, eris=None, sort=False,
                      gas_natorb=False, gasdm1=None, verbose=None,
                      cas_natorb=None, *, gas_pseudo_natorb=False, casdm1=None,
@@ -1532,10 +1534,9 @@ class GASSCF(newton_casscf.CASSCF):
         is a compatibility alias; supply only one of these density arguments.
 
         Active occupations are ordered from largest to smallest within each
-        unfrozen symmetry block of a GAS subspace. Frozen orbitals and orbital
-        symmetry/``extrasym`` labels are respected. ``sort`` orders core/external
-        energies, within each fixed ``extrasym`` group when present; returned
-        orbital symmetry labels follow any permutation. ``mo_energy`` contains
+        unfrozen block of a GAS subspace. Frozen orbitals are preserved;
+        spatial-symmetry settings and labels are not supported. ``sort`` orders
+        unfrozen core/external energies. ``mo_energy`` contains
         Fock diagonal elements, not pseudo-natural occupations.
 
         These are pseudo-natural orbitals: density between GAS subspaces need
@@ -1544,6 +1545,7 @@ class GASSCF(newton_casscf.CASSCF):
         write the returned orbitals, CI and orbital energies to this object.
         """
 
+        _check_symmetry(self, mo_coeff)
         if gas_natorb or cas_natorb:
             _unsupported("GAS natural-orbital rotation")
         if casdm1 is not None:
@@ -1551,8 +1553,9 @@ class GASSCF(newton_casscf.CASSCF):
                 raise ValueError("supply only one of gasdm1 and casdm1")
             gasdm1 = casdm1
         if not gas_pseudo_natorb:
-            return self._canonicalize_core_virtual(
-                mo_coeff, ci, eris, sort, gasdm1, verbose, **kwargs)
+            return gasci.GASCI.canonicalize(
+                self, mo_coeff, ci, eris, sort=sort, gasdm1=gasdm1,
+                verbose=verbose, **kwargs)
 
         mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
         ci = self.ci if ci is None else ci
@@ -1573,19 +1576,12 @@ class GASSCF(newton_casscf.CASSCF):
             frozen[:self.frozen] = True
         elif self.frozen is not None:
             frozen[self.frozen] = True
-        orbsym = getattr(mo_coeff, 'orbsym', numpy.zeros(nmo, dtype=int))
-        extrasym = getattr(self, 'extrasym', None)
-        if extrasym is None:
-            extrasym = numpy.zeros(nmo, dtype=int)
         rotation = numpy.eye(self.ncas)
         offset = 0
         for size in self.gas_orbs:
-            groups = {}
-            for p in range(offset, offset + size):
-                i = self.ncore + p
-                if not frozen[i]:
-                    groups.setdefault((orbsym[i], extrasym[i]), []).append(p)
-            for indices in groups.values():
+            indices = numpy.arange(offset, offset + size)
+            indices = indices[~frozen[self.ncore + indices]]
+            if indices.size:
                 block = numpy.ix_(indices, indices)
                 _, vectors = self._natural_eigensystem(gasdm1[block], sort=True)
                 rotation[block] = vectors
@@ -1605,8 +1601,9 @@ class GASSCF(newton_casscf.CASSCF):
             ci_new = transform(ci)
         # Both calls use the original basis, so a supplied ERIS remains valid.
         fock = self.get_fock(mo_coeff, ci, eris, gasdm1, verbose)
-        mo_new, _, mo_energy = self._canonicalize_core_virtual(
-            mo_coeff, ci, eris, sort, gasdm1, verbose, **kwargs)
+        mo_new, _, mo_energy = gasci.GASCI.canonicalize(
+            self, mo_coeff, ci, eris, sort=sort, gasdm1=gasdm1,
+            verbose=verbose, **kwargs)
         active = slice(self.ncore, self.ncore + self.ncas)
         mo_new[:, active] = mo_coeff[:, active] @ rotation
         mo_energy[active] = numpy.einsum(

@@ -1531,10 +1531,9 @@ class KnownValues(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'orthonormal'):
                     mc.get_grad(mo * 1.01, densities, eris)
                 self.assertIs(mc.mo_coeff, mo)
-                for frozen, extrasym in ((None, None), (1, None),
-                                         ([3], [0, 0, 1, 0])):
-                    with self.subTest(df=use_df, frozen=frozen, extrasym=extrasym):
-                        mc.frozen, mc.extrasym = frozen, extrasym
+                for frozen in (None, 1, [3]):
+                    with self.subTest(df=use_df, frozen=frozen):
+                        mc.frozen = frozen
                         mask = mc.uniq_var_indices(4, 1, 2, frozen)
                         actual = mc.get_grad(casdm1_casdm2=densities, eris=eris)
                         numpy.testing.assert_allclose(actual, full[mask[full_mask]],
@@ -1905,7 +1904,7 @@ class KnownValues(unittest.TestCase):
         active = mask[1:5, 1:5]
         self.assertFalse(numpy.any(active[numpy.tril_indices(4, -1)]))
 
-    def test_gas_orbital_rotation_mask_honors_extrasym_and_frozen(self):
+    def test_gas_orbital_rotation_mask_honors_frozen(self):
         mol = gto.M(
             atom="; ".join("H 0 0 %g" % value for value in range(6)),
             basis="sto-3g",
@@ -1914,7 +1913,6 @@ class KnownValues(unittest.TestCase):
         mc = gasscf.GASSCF(
             mf, 4, (2, 2), gas_orbs=(1, 2, 1), gas_restr=None,
             ncore=1)
-        mc.extrasym = numpy.asarray([0, 0, 1, 1, 0, 0])
 
         mask = mc.uniq_var_indices(6, 1, 4, [2])
 
@@ -1922,8 +1920,8 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(numpy.any(mask[:, 2]))
         self.assertTrue(mask[4, 1])
         self.assertTrue(mask[5, 4])
-        self.assertFalse(mask[3, 1])
-        self.assertFalse(mask[5, 3])
+        self.assertTrue(mask[3, 1])
+        self.assertTrue(mask[5, 3])
 
     def test_explicit_gasci_solver_is_adapted_by_copy(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -2986,35 +2984,29 @@ class KnownValues(unittest.TestCase):
         # The zero-weight root has also been transformed, not silently retained.
         self.assertGreater(numpy.linalg.norm(obj.ci[1] - roots[1]), 1e-3)
 
-    def test_n2_pseudo_canonicalize_respects_frozen_and_extra_symmetry(self):
+    def test_n2_pseudo_canonicalize_respects_frozen_and_gas_blocks(self):
         mc, _, roots = self._n2_property_pair()
         mc.ci = roots[0]
         mc.frozen = [0, 2]
-        mc.extrasym = numpy.zeros(mc.mo_coeff.shape[1], dtype=int)
-        mc.extrasym[[5, 7]] = 1
-        labels_before = numpy.zeros(mc.mo_coeff.shape[1], dtype=int)
-        labels_before[9] = 1
-        mc.mo_coeff = lib.tag_array(mc.mo_coeff, orbsym=labels_before.copy())
         before = mc.mo_coeff.copy()
         mo, ci, _ = mc.canonicalize(gas_pseudo_natorb=True)
         numpy.testing.assert_array_equal(mo[:, mc.frozen], before[:, mc.frozen])
-        numpy.testing.assert_array_equal(mc.mo_coeff.orbsym, labels_before)
-        numpy.testing.assert_array_equal(mo.orbsym, labels_before)
         active = slice(mc.ncore, mc.ncore + mc.ncas)
         rotation = before[:, active].T @ mc._scf.get_ovlp() @ mo[:, active]
-        orb_labels = labels_before[active]
-        numpy.testing.assert_allclose(rotation[orb_labels[:, None] != orb_labels],
+        gas_labels = numpy.repeat(numpy.arange(mc.ngas), mc.gas_orbs)
+        numpy.testing.assert_allclose(rotation[gas_labels[:, None] != gas_labels],
                                       0., atol=2e-9)
-        labels = mc.extrasym[active]
-        numpy.testing.assert_allclose(rotation[labels[:, None] != labels], 0., atol=2e-9)
         numpy.testing.assert_allclose(
             mc.make_rdm1(mo_coeff=mo, ci=ci), mc.make_rdm1(), atol=2e-11, rtol=0)
         dm = mc.make_gasdm1(ci=ci)
-        # GAS2 is split into extra-symmetry groups (MO4,6) and (MO5,7).
-        for group in ([2, 4], [3, 5]):
+        offset = 0
+        for size in mc.gas_orbs:
+            group = [i for i in range(offset, offset + size)
+                     if mc.ncore + i not in mc.frozen]
             block = dm[numpy.ix_(group, group)]
             numpy.testing.assert_allclose(block, numpy.diag(block.diagonal()),
                                           atol=2e-11, rtol=0)
+            offset += size
 
     def test_n2_pseudo_canonicalize_with_spin_penalty_and_restart(self):
         _, mf, mo = self._n2_regression_fixture()
@@ -3517,7 +3509,7 @@ class KnownValues(unittest.TestCase):
                         numpy.testing.assert_allclose(left, right, atol=2e-11, rtol=0)
                         self.assertIs(left, stored)
 
-    def test_canonicalize_sort_owns_orbital_labels(self):
+    def test_canonicalize_sort_preserves_input_orbitals(self):
         mol = gto.M(atom=';'.join('H 0 0 %s' % z for z in
                                  (0., .9, 1.9, 3., 4.2, 5.5)),
                     basis='sto-3g', verbose=0)
@@ -3528,10 +3520,10 @@ class KnownValues(unittest.TestCase):
             mf, 2, (1, 1), gas_orbs=(1, 1),
             gas_restr=((1, 1), (2, 2)), gas_restr_type='cumulative-occ')
         self.addCleanup(mc.close)
-        labels = numpy.array([0, 1, 0, 0, 1, 0])
-        mo = lib.tag_array(mf.mo_coeff.copy(), orbsym=labels.copy())
+        mo = mf.mo_coeff.copy()
+        before = mo.copy()
         mc.gasci(mo)
-        # A deterministic Fock matrix forces permutations of tagged columns
+        # A deterministic Fock matrix forces permutations of columns
         # in both core and virtual space, without relying on energy ordering.
         sm = mf.get_ovlp() @ mo
         fock = (sm * numpy.array([2., 1., 3., 4., 6., 5.])) @ sm.T
@@ -3542,11 +3534,10 @@ class KnownValues(unittest.TestCase):
                 new, _, eps = mc.canonicalize(sort=True, gas_pseudo_natorb=pseudo)
                 numpy.testing.assert_allclose(new, mo[:, order], atol=2e-11)
                 numpy.testing.assert_allclose(eps, numpy.arange(1., 7.), atol=2e-11)
-                numpy.testing.assert_array_equal(new.orbsym, labels[order])
-                numpy.testing.assert_array_equal(mo.orbsym, labels)
-                self.assertFalse(numpy.shares_memory(new.orbsym, mo.orbsym))
+                numpy.testing.assert_array_equal(mo, before)
+                self.assertFalse(numpy.shares_memory(new, mo))
 
-    def test_canonicalize_core_virtual_preserves_symmetry_and_density(self):
+    def test_canonicalize_preserves_frozen_density_and_energy(self):
         mol = gto.M(atom=';'.join('H 0 0 %s' % z for z in
                                  (0., .8, 1.7, 2.7, 3.8, 5., 6.3, 7.7, 9.2, 10.8)),
                     basis='sto-3g', verbose=0)
@@ -3565,18 +3556,14 @@ class KnownValues(unittest.TestCase):
                 if weights is not None:
                     mc = mc.state_average(weights)
                     self.addCleanup(mc.close)
-                # Deliberately mix core/virtual orbitals so symmetry-restricted
+                # Deliberately mix core/virtual orbitals so
                 # canonicalization and sort=True are both nontrivial.
                 kappa = numpy.zeros((10, 10))
                 for start in (0, 7):
                     kappa[start+1, start] = .4
                     kappa[start+2, start] = .3
                 mo = mf.mo_coeff @ scipy.linalg.expm(kappa - kappa.T)
-                labels = numpy.array([0, 1, 0, 0, 0, 0, 0, 0, 1, 0])
-                mo = lib.tag_array(mo, orbsym=labels.copy())
                 mc.gasci(mo)
-                extra = numpy.array([0, 0, 1, 0, 0, 1, 1, 0, 0, 1])
-                mc.extrasym = extra.copy()
                 before = mo.copy()
                 ci_before = numpy.array(mc.ci, copy=True)
                 energy_before = mc.mo_energy
@@ -3601,22 +3588,14 @@ class KnownValues(unittest.TestCase):
                                               frozen=frozen, pseudo=pseudo, sort=sort):
                                 new, ci, eps = mc.canonicalize(
                                     sort=sort, gas_pseudo_natorb=pseudo)
-                                rotation = before.T @ mf.get_ovlp() @ new
-                                numpy.testing.assert_allclose(
-                                    rotation[extra[:, None] != extra], 0., atol=2e-11)
-                                numpy.testing.assert_allclose(
-                                    rotation[labels[:, None] != new.orbsym], 0., atol=2e-11)
-                                if not sort:
-                                    numpy.testing.assert_array_equal(new.orbsym, labels)
                                 if frozen is not None:
                                     numpy.testing.assert_array_equal(new[:, frozen], before[:, frozen])
                                 if sort:
                                     for indices in (numpy.arange(3), numpy.arange(7, 10)):
                                         indices = numpy.array([i for i in indices
                                                                if frozen is None or i not in frozen])
-                                        for label in set(extra[indices]):
-                                            self.assertTrue(numpy.all(numpy.diff(
-                                                eps[indices[extra[indices] == label]]) >= -2e-9))
+                                        self.assertTrue(numpy.all(
+                                            numpy.diff(eps[indices]) >= -2e-9))
                                 numpy.testing.assert_allclose(
                                     eps, numpy.einsum('pi,pi->i', new, fock @ new), atol=2e-11)
                                 for state, density in zip(states, old_dm):
@@ -3625,8 +3604,6 @@ class KnownValues(unittest.TestCase):
                                         density, atol=2e-11)
                                 numpy.testing.assert_allclose(energies(new, ci), old_e, atol=2e-10, rtol=0)
                                 numpy.testing.assert_array_equal(mc.mo_coeff, before)
-                                numpy.testing.assert_array_equal(mc.mo_coeff.orbsym, labels)
-                                numpy.testing.assert_array_equal(mc.extrasym, extra)
                                 numpy.testing.assert_array_equal(numpy.asarray(mc.ci), ci_before)
                                 self.assertIs(mc.mo_energy, energy_before)
 
@@ -4737,20 +4714,115 @@ class KnownValues(unittest.TestCase):
                 self.assertNotIn("does not have attributes", errors.getvalue())
                 self.assertNotIn("does not have attributes", mc.stdout.getvalue())
 
-    def test_as_scanner_rejects_changed_extrasym_constraint(self):
-        mol = gto.M(
-            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
-            basis="sto-3g", verbose=0)
+    def test_symmetry_rejected_during_construction(self):
+        for symmetry in (True, 'C1'):
+            mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g',
+                        symmetry=symmetry, verbose=0)
+            mf = scf.UHF(mol)
+            self.addCleanup(mf._chkfile.close)
+            with mock.patch.object(mf, 'to_rhf', side_effect=AssertionError('conversion')):
+                for source in (mol, mf):
+                    for constructor in (gasscf.GASSCF, gasscf.DFGASSCF):
+                        with self.subTest(symmetry=symmetry, constructor=constructor.__name__):
+                            with self.assertRaisesRegex(NotImplementedError, 'point-group'):
+                                constructor(source, 2, (1, 1))
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol).run()
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
-            gas_restr_type="cumulative-occ", ncore=1)
+        self.addCleanup(mf._chkfile.close)
+        solver = fci_gas.FCISolver(mol, gas_orbs=(2,))
+        for target, name, value in (
+                (solver, 'orbsym', [0, 0]), (solver, 'wfnsym', 0),
+                (mf, 'mo_coeff', lib.tag_array(mf.mo_coeff.copy(), orbsym=[0, 0]))):
+            with mock.patch.object(target, name, value, create=True):
+                for constructor in (gasscf.GASSCF, gasscf.DFGASSCF):
+                    with self.assertRaisesRegex(NotImplementedError, 'symmetry'):
+                        constructor(mf, 2, (1, 1), fcisolver=solver)
 
-        scanner = mc.as_scanner()
-        scanner.extrasym = numpy.zeros(
-            mf.mo_coeff.shape[1], dtype=int)
-        with self.assertRaisesRegex(ValueError, "create a new scanner"):
-            scanner(mol)
+    def test_symmetry_settings_and_tagged_orbitals_rejected(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        self.addCleanup(mf._chkfile.close)
+        tagged = lib.tag_array(mf.mo_coeff.copy(), orbsym=[0, 0])
+        for kind in ('plain', 'df', 'sa', 'df-sa', 'sa-df'):
+            mc = gasscf.GASSCF(mf, 2, (1, 1))
+            self.addCleanup(mc.close)
+            if kind in ('df', 'df-sa'):
+                mc = mc.density_fit()
+            if kind in ('sa', 'df-sa', 'sa-df'):
+                mc = mc.state_average((.5, .5))
+            if kind == 'sa-df':
+                mc = mc.density_fit()
+            self.addCleanup(mc.close)
+            entries = ('gasci', 'casci', 'kernel', 'get_grad', 'get_fock',
+                       'canonicalize', 'canonicalize_')
+            settings = ((mc, 'extrasym', [0, 0]), (mc, 'wfnsym', 0),
+                        (mc, 'orbsym', [0, 0]),
+                        (mc.fcisolver, 'orbsym', [0, 0]),
+                        (mc.fcisolver, 'wfnsym', 0),
+                        (mc, 'mo_coeff', tagged), (mc._scf, 'mo_coeff', tagged),
+                        (mc.mol, 'symmetry', True))
+            with mock.patch.object(mc, 'ao2mo', side_effect=AssertionError('AO2MO')):
+                for target, name, value in settings:
+                    with mock.patch.object(target, name, value, create=True):
+                        for entry in entries + ('newton', 'as_scanner'):
+                            with self.subTest(kind=kind, setting=name, entry=entry):
+                                with self.assertRaisesRegex(NotImplementedError, 'symmetry'):
+                                    getattr(mc, entry)()
+                        with self.assertRaisesRegex(NotImplementedError, 'symmetry'):
+                            mc.uniq_var_indices(2, 0, 2, None)
+                for entry in entries:
+                    with self.subTest(kind=kind, explicit_mo_entry=entry):
+                        with self.assertRaisesRegex(NotImplementedError, 'orbsym'):
+                            getattr(mc, entry)(tagged)
+                for entry in ('get_gas_natorb', 'get_gas_pseudo_natorb'):
+                    with self.assertRaisesRegex(NotImplementedError, 'orbsym'):
+                        getattr(mc, entry)(tagged, gasdm1=numpy.eye(2))
+                with self.assertRaisesRegex(NotImplementedError, 'orbsym'):
+                    mc.gen_g_hop(tagged, None, None)
+                with self.assertRaisesRegex(NotImplementedError, 'orbsym'):
+                    mc.rotate_mo(tagged, numpy.eye(2))
+                with self.assertRaisesRegex(NotImplementedError, 'orbsym'):
+                    mc.sort_mo(([0, 1],), tagged, base=0)
+                with mock.patch.object(mc, 'make_gasdm1s',
+                                       return_value=(numpy.eye(2), numpy.eye(2))):
+                    for entry in ('make_rdm1', 'make_rdm1s'):
+                        with self.assertRaisesRegex(NotImplementedError, 'orbsym'):
+                            getattr(mc, entry)(mo_coeff=tagged)
+            # Explicit densities do not bypass the canonicalization guard.
+            with self.assertRaisesRegex(NotImplementedError, 'orbsym'):
+                mc.canonicalize(tagged, gasdm1=numpy.eye(2), gas_pseudo_natorb=True)
+        numpy.testing.assert_array_equal(tagged.orbsym, [0, 0])
+
+    def test_scanner_rejects_symmetry_before_reset_or_scf(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        self.addCleanup(mf._chkfile.close)
+        mc = gasscf.GASSCF(mf, 2, (1, 1))
+        self.addCleanup(mc.close)
+        tagged = lib.tag_array(mf.mo_coeff.copy(), orbsym=[0, 0])
+        symmetric = mol.copy()
+        symmetric.symmetry = True
+        symmetric.build()
+        for df in (False, True):
+            source = mc.density_fit() if df else mc
+            self.addCleanup(source.close)
+            scanner = source.as_scanner()
+            self.addCleanup(scanner.close)
+            with mock.patch.object(scanner, 'reset', side_effect=AssertionError('reset')):
+                for geometry, mo in ((symmetric, None), (mol, tagged)):
+                    with self.assertRaisesRegex(NotImplementedError, 'symmetry'):
+                        scanner(geometry, mo_coeff=mo)
+                with mock.patch.object(scanner, 'extrasym', [0, 0]):
+                    with self.assertRaisesRegex(NotImplementedError, 'extrasym'):
+                        scanner(mol)
+                    with self.assertRaisesRegex(NotImplementedError, 'extrasym'):
+                        scanner.as_scanner()
+            with self.assertRaisesRegex(NotImplementedError, 'point-group'):
+                scanner.reset(symmetric)
+            self.assertIs(scanner.mol, mol)
+            self.assertIs(scanner._scf.mol, mol)
+            if df:
+                self.assertIs(scanner.with_df.mol, mol)
 
     def test_df_scanner_reset_updates_with_df_molecule(self):
         mol = gto.M(
