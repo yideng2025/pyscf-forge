@@ -668,6 +668,16 @@ def _orbital_groups(mc):
     return groups
 
 
+def _copy_df(with_df):
+    """Copy DF settings with fresh geometry caches and output-file ownership."""
+
+    result = with_df.copy()
+    # DF.reset clears integral/JK caches, but retains the output target. A
+    # copied object must not overwrite the source's named or temporary file.
+    result._cderi_to_save = None
+    return result.reset(with_df.mol)
+
+
 def _as_scanner(mc):
     """Return an energy-only scanner with fixed GAS/Newton objective metadata."""
 
@@ -675,7 +685,6 @@ def _as_scanner(mc):
         return mc
     mc.validate_capabilities()
     source = mc.copy()
-    source._scf = mc._scf.copy()
     source.mo_coeff = None if mc.mo_coeff is None else numpy.array(
         mc.mo_coeff, copy=True)
     source.ci = _copy_ci(mc.ci, _problem_signature(mc))
@@ -802,8 +811,8 @@ class _DFGASSCF(mcdf._DFCASSCF):
         return self
 
     def undo_df(self):
-        self.close()
-        result = lib.view(self, lib.drop_class(self.__class__, _DFGASSCF))
+        result = lib.view(self.copy(),
+                          lib.drop_class(self.__class__, _DFGASSCF))
         try:
             del result.with_df
         except AttributeError:
@@ -1067,11 +1076,24 @@ class GASSCF(newton_casscf.CASSCF):
         return result
 
     def copy(self):
-        """Return a copy with independent Newton-owned GAS solver caches."""
+        """Copy GAS/SCF state with independent solver and DF cache ownership.
+
+        DF settings are retained, but integrals are rebuilt on demand and DF
+        output files are not inherited. SCF and MCSCF share the new DF object
+        only when they shared the source DF object.
+        """
 
         result = super().copy()
         result.fcisolver = self.fcisolver.copy()
         result.fcisolver.mol = result.mol
+        result._scf = self._scf.copy()
+        scf_df = getattr(self._scf, "with_df", None)
+        if scf_df is not None:
+            result._scf.with_df = _copy_df(scf_df)
+        mc_df = getattr(self, "with_df", None)
+        if mc_df is not None:
+            result.with_df = (result._scf.with_df if mc_df is scf_df
+                              else _copy_df(mc_df))
         return result
 
     def newton(self):
@@ -1523,10 +1545,17 @@ class GASSCF(newton_casscf.CASSCF):
 
         Density fitting changes only integral/J-K construction.  The active
         CI vector, GAS restrictions, GAS RDMs and spin-penalty bookkeeping
-        remain owned by the GASSCF/GASCI adapter.
+        remain owned by the GASSCF/GASCI adapter. A new wrapper owns its GAS
+        solver; initial SCF DF reuse follows PySCF. Use copy() or as_scanner()
+        to obtain independent DF caches and output-file ownership.
         """
 
         result = mcdf.density_fit(self, auxbasis=auxbasis, with_df=with_df)
+        # Native DF construction copies __dict__ without calling our copy().
+        # Do not detach or close caches on an idempotent return of self.
+        if result is not self and result.fcisolver is self.fcisolver:
+            result.fcisolver = self.fcisolver.copy()
+            result.fcisolver.mol = result.mol
         if isinstance(result, _DFGASSCF):
             return result
         if isinstance(result, mcdf._DFCASSCF):

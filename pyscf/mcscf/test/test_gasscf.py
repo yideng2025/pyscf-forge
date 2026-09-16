@@ -18,6 +18,7 @@
 
 """Small tests for the GASSCF module."""
 
+from contextlib import ExitStack
 from functools import reduce
 import io
 from pathlib import Path
@@ -3565,6 +3566,122 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mc.gas_orbs, (2,))
         self.assertIs(mc.validate_capabilities(), mc)
         self.assertIsInstance(mc.undo_df(), gasscf.GASSCF)
+
+    def test_df_wrappers_own_solver_and_preserve_source_plans(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        for sa in (False, True):
+            with self.subTest(sa=sa):
+                source = gasscf.GASSCF(scf.RHF(mol), 2, (1, 1))
+                if sa:
+                    source = source.state_average((.5, .5))
+                self.addCleanup(source.close)
+                plan = source.fcisolver._get_rdm_plan(2, (1, 1))
+                fitted = source.density_fit(auxbasis='weigend')
+                self.addCleanup(fitted.close)
+                self.assertIsNot(fitted.fcisolver, source.fcisolver)
+                self.assertIsNone(fitted.fcisolver._rdm_plan)
+                fitted.fix_spin_(shift=.2, ss=0)
+                self.assertFalse(hasattr(source.fcisolver, 'ss_penalty'))
+                self.assertIsNotNone(plan._plan)
+
+                fitted_plan = fitted.fcisolver._get_rdm_plan(2, (1, 1))
+                # Reusing the same DF setup preserves the native identity rule.
+                self.assertIs(fitted.density_fit(auxbasis='weigend'), fitted)
+                plain = fitted.undo_df()
+                self.addCleanup(plain.close)
+                self.assertNotIsInstance(plain, mcdf._DFCAS)
+                self.assertIsNot(plain.fcisolver, fitted.fcisolver)
+                self.assertIsNone(plain.fcisolver._rdm_plan)
+                plain.undo_fix_spin_()
+                self.assertEqual(fitted.fcisolver.ss_penalty, .2)
+                self.assertIsNotNone(fitted_plan._plan)
+                self.assertEqual(plain.fcisolver.nroots, 2 if sa else 1)
+                fitted.close()
+                self.assertIsNotNone(plan._plan)
+
+    def test_df_copy_and_scanner_leave_source_geometry_and_energy_unchanged(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                    basis='sto-3g', verbose=0)
+        moved = mol.set_geom_(
+            'H 0 0 0; H 0 0 1.05; H 0 0 1.8; H 0 0 2.6', inplace=False)
+        for kind in ('mc-df', 'shared-df', 'separate-df', 'scf-df'):
+            for sa in (False, True):
+                with self.subTest(kind=kind, sa=sa):
+                    mf = scf.RHF(mol)
+                    if kind != 'mc-df':
+                        mf = mf.density_fit(auxbasis='weigend')
+                    mf.run()
+                    mc = gasscf.GASSCF(
+                        mf, 2, (1, 1), ncore=1, gas_orbs=(1, 1),
+                        gas_restr=((1, 1), (2, 2)),
+                        gas_restr_type='cumulative-occ')
+                    if kind != 'scf-df':
+                        auxbasis = 'def2-svp-jkfit' if kind == 'separate-df' else 'weigend'
+                        mc = mc.density_fit(auxbasis=auxbasis)
+                    if sa:
+                        mc = mc.state_average((.5, .5))
+                    self.addCleanup(mc.close)
+                    before = mc.gasci()[0]
+                    source_df = getattr(mc, 'with_df', None)
+                    source_scf_df = getattr(mc._scf, 'with_df', None)
+                    source_cderi = None if source_df is None else source_df._cderi
+                    for factory in (mc.copy, mc.as_scanner):
+                        copied = factory()
+                        self.addCleanup(copied.close)
+                        self.assertIsNot(copied._scf, mc._scf)
+                        if source_df is not None:
+                            self.assertIsNot(copied.with_df, source_df)
+                        if source_scf_df is not None:
+                            self.assertIsNot(copied._scf.with_df, source_scf_df)
+                            if source_df is source_scf_df:
+                                self.assertIs(copied.with_df, copied._scf.with_df)
+                            elif source_df is not None:
+                                self.assertIsNot(copied.with_df, copied._scf.with_df)
+                        copied.reset(moved)
+                        self.assertIs(mc.mol, mol)
+                        self.assertIs(mc._scf.mol, mol)
+                        if source_df is not None:
+                            self.assertIs(source_df.mol, mol)
+                            self.assertIs(source_df._cderi, source_cderi)
+                            self.assertIs(copied.with_df.mol, moved)
+                            copied.with_df.build()
+                        if source_scf_df is not None:
+                            self.assertIs(source_scf_df.mol, mol)
+                            self.assertIs(copied._scf.with_df.mol, moved)
+                        self.assertAlmostEqual(mc.gasci()[0], before, places=11)
+
+    def test_df_copies_do_not_overwrite_source_integral_files(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        moved = mol.set_geom_('H 0 0 0; H 0 0 1.05', inplace=False)
+        mf = scf.RHF(mol).run()
+        for storage in ('named', 'temporary'):
+            with self.subTest(storage=storage), ExitStack() as files:
+                tmp = files.enter_context(tempfile.TemporaryDirectory())
+                mc = gasscf.GASSCF(mf, 2, (1, 1)).density_fit(auxbasis='weigend')
+                self.addCleanup(mc.close)
+                source_df = mc.with_df
+                source_df.max_memory = 0
+                if storage == 'named':
+                    target = str(Path(tmp) / 'source.h5')
+                else:
+                    target = files.enter_context(tempfile.NamedTemporaryFile(dir=tmp))
+                source_df._cderi_to_save = target
+                before = mc.gasci()[0]
+                source_path = Path(target if storage == 'named' else target.name)
+                contents = source_path.read_bytes()
+                for factory in (mc.copy, mc.as_scanner):
+                    copied = factory()
+                    self.addCleanup(copied.close)
+                    self.assertIsNone(copied.with_df._cderi)
+                    self.assertIsNone(copied.with_df._cderi_to_save)
+                    copied.reset(moved)
+                    copied.with_df.build()
+                    owned = copied.with_df._cderi_to_save
+                    files.enter_context(owned)
+                    self.assertNotEqual(Path(owned.name), source_path)
+                    self.assertEqual(source_path.read_bytes(), contents)
+                    self.assertIs(source_df._cderi_to_save, target)
+                    self.assertAlmostEqual(mc.gasci()[0], before, places=11)
 
     def test_as_scanner_runs_energy_scan_with_fixed_gas_model(self):
         mol = gto.M(
