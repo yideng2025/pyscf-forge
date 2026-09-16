@@ -763,6 +763,13 @@ class _GASSCFScanner(lib.SinglePointScanner):
         self._scan_system = _system_signature(mc.mol)
         self.scan_info = None
 
+    def reset(self, mol=None):
+        """Invalidate scan results while retaining native orbital/CI guesses."""
+        super().reset(mol)
+        self.scan_info = None
+        self.converged = False
+        return self
+
     def __call__(self, mol_or_geom, mo_coeff=None, ci0=None):
         if isinstance(mol_or_geom, gto.MoleBase):
             mol = mol_or_geom
@@ -1758,6 +1765,8 @@ class GASSCF(newton_casscf.CASSCF):
         basis matches the current model. Checkpoint CI has no such metadata;
         pass it explicitly as ``scanner(mol, ci0=ci)`` when its basis is known
         to be compatible. Creating a scanner does not change the source CI.
+        Resetting a scanner invalidates its scan report and convergence flag;
+        stored orbitals and compatible CI remain available as initial guesses.
         """
 
         return _as_scanner(self)

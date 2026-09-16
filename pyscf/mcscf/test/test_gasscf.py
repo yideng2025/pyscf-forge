@@ -4799,6 +4799,61 @@ class KnownValues(unittest.TestCase):
         self.assertIn("GASSCF", scanner.__class__.__name__)
         self.assertIs(scanner.as_scanner(), scanner)
 
+    def test_scanner_reset_and_preparation_failure_invalidate_scan_report(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        moved = mol.set_geom_('H 0 0 0; H 0 0 .95', inplace=False)
+        mf = scf.RHF(mol).run()
+        self.addCleanup(mf._chkfile.close)
+        for use_df, weights in ((False, None), (True, (.5, .5))):
+            mc = gasscf.GASSCF(mf, 2, (1, 1))
+            self.addCleanup(mc.close)
+            if use_df:
+                mc = mc.density_fit().state_average(weights)
+                self.addCleanup(mc.close)
+            scanner = mc.as_scanner()
+            self.addCleanup(scanner.close)
+            for stage in ('reset', 'scf', 'projection', 'mo-validation'):
+                with self.subTest(df=use_df, stage=stage):
+                    scanner(mol)
+                    self.assertTrue(scanner.converged)
+                    self.assertIn('energy', scanner.scan_info)
+                    previous_mo = scanner.mo_coeff
+                    previous_ci = scanner.ci
+                    with ExitStack() as patches:
+                        kwargs = {}
+                        error = RuntimeError
+                        if stage == 'scf':
+                            patches.enter_context(mock.patch.object(
+                                type(scanner._scf), '__call__',
+                                side_effect=RuntimeError('SCF preparation')))
+                        elif stage == 'projection':
+                            patches.enter_context(mock.patch.object(
+                                gasscf.addons, 'project_init_guess',
+                                side_effect=RuntimeError('MO projection')))
+                        elif stage == 'mo-validation':
+                            kwargs['mo_coeff'] = numpy.zeros_like(mf.mo_coeff)
+                            error = ValueError
+                        if stage == 'reset':
+                            scanner.reset(moved)
+                        else:
+                            with self.assertRaises(error):
+                                scanner(moved, **kwargs)
+                    self.assertIs(scanner.mol, moved)
+                    self.assertIs(scanner.mo_coeff, previous_mo)
+                    self.assertIs(scanner.ci, previous_ci)
+                    self.assertIsNone(scanner.e_tot)
+                    self.assertIsNone(scanner.scan_info)
+                    self.assertFalse(scanner.converged)
+                    # Preserve native reuse of old orbitals as a projection guess.
+                    energy = scanner(moved)
+                    self.assertIn('projected previous', scanner.scan_info['MO_source'])
+                    self.assertEqual(scanner.scan_info['energy'], energy)
+                    self.assertTrue(scanner.converged)
+                    ref = scanner.copy()
+                    self.addCleanup(ref.close)
+                    ref._clear_ci_guess()
+                    self.assertAlmostEqual(energy, ref.gasci()[0], places=10)
+
     def test_repeated_kernel_and_scanner_spin_results_pass_sanity(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
