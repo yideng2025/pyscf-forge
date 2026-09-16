@@ -3194,6 +3194,158 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
         self.assertIsNone(mo_energy)
 
+    def test_canonicalize_accepts_native_density_alias(self):
+        mol = gto.M(atom=';'.join('H 0 0 %s' % z for z in
+                                 (0., .9, 1.9, 3., 4.2, 5.5)),
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for use_df in (False, True):
+            for pseudo in (False, True):
+                with self.subTest(df=use_df, pseudo=pseudo):
+                    mc = gasscf.GASSCF(
+                        mf, 4, (2, 2), gas_orbs=(2, 2),
+                        gas_restr=((2, 2), (4, 4)), gas_restr_type='cumulative-occ')
+                    self.addCleanup(mc.close)
+                    if use_df:
+                        mc = mc.density_fit()
+                        self.addCleanup(mc.close)
+                    mc = mc.state_average((1., 0.))
+                    self.addCleanup(mc.close)
+                    mc.gasci()
+                    density = mc.make_gasdm1(state=1)
+                    self.assertGreater(numpy.linalg.norm(
+                        density - mc.make_gasdm1()), 1e-3)
+                    options = dict(gas_pseudo_natorb=pseudo)
+                    expected = mc.canonicalize(gasdm1=density, **options)
+                    with mock.patch.object(mc, 'make_gasdm1',
+                                           side_effect=AssertionError('density recomputed')):
+                        actual = mc.canonicalize(casdm1=density, **options)
+                        for left, right in zip(actual, expected):
+                            numpy.testing.assert_allclose(left, right, atol=2e-11, rtol=0)
+                        for method in (mc.canonicalize, mc.canonicalize_):
+                            with self.assertRaisesRegex(ValueError, 'only one'):
+                                method(gasdm1=density, casdm1=density, **options)
+                        actual = mc.canonicalize_(casdm1=density, **options)
+                    for left, right, stored in zip(
+                            actual, expected, (mc.mo_coeff, mc.ci, mc.mo_energy)):
+                        numpy.testing.assert_allclose(left, right, atol=2e-11, rtol=0)
+                        self.assertIs(left, stored)
+
+    def test_canonicalize_sort_owns_orbital_labels(self):
+        mol = gto.M(atom=';'.join('H 0 0 %s' % z for z in
+                                 (0., .9, 1.9, 3., 4.2, 5.5)),
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        mc = gasscf.GASSCF(
+            mf, 2, (1, 1), gas_orbs=(1, 1),
+            gas_restr=((1, 1), (2, 2)), gas_restr_type='cumulative-occ')
+        self.addCleanup(mc.close)
+        labels = numpy.array([0, 1, 0, 0, 1, 0])
+        mo = lib.tag_array(mf.mo_coeff.copy(), orbsym=labels.copy())
+        mc.gasci(mo)
+        # A deterministic Fock matrix forces permutations of tagged columns
+        # in both core and virtual space, without relying on energy ordering.
+        sm = mf.get_ovlp() @ mo
+        fock = (sm * numpy.array([2., 1., 3., 4., 6., 5.])) @ sm.T
+        order = [1, 0, 2, 3, 5, 4]
+        for pseudo in (False, True):
+            with self.subTest(pseudo=pseudo), \
+                    mock.patch.object(mc, 'get_fock', return_value=fock):
+                new, _, eps = mc.canonicalize(sort=True, gas_pseudo_natorb=pseudo)
+                numpy.testing.assert_allclose(new, mo[:, order], atol=2e-11)
+                numpy.testing.assert_allclose(eps, numpy.arange(1., 7.), atol=2e-11)
+                numpy.testing.assert_array_equal(new.orbsym, labels[order])
+                numpy.testing.assert_array_equal(mo.orbsym, labels)
+                self.assertFalse(numpy.shares_memory(new.orbsym, mo.orbsym))
+
+    def test_canonicalize_core_virtual_preserves_symmetry_and_density(self):
+        mol = gto.M(atom=';'.join('H 0 0 %s' % z for z in
+                                 (0., .8, 1.7, 2.7, 3.8, 5., 6.3, 7.7, 9.2, 10.8)),
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for use_df in (False, True):
+            for weights in (None, (1., 0.)):
+                mc = gasscf.GASSCF(
+                    mf, 4, (2, 2), gas_orbs=(2, 2),
+                    gas_restr=((2, 2), (4, 4)), gas_restr_type='cumulative-occ')
+                self.addCleanup(mc.close)
+                if use_df:
+                    mc = mc.density_fit()
+                    self.addCleanup(mc.close)
+                if weights is not None:
+                    mc = mc.state_average(weights)
+                    self.addCleanup(mc.close)
+                # Deliberately mix core/virtual orbitals so symmetry-restricted
+                # canonicalization and sort=True are both nontrivial.
+                kappa = numpy.zeros((10, 10))
+                for start in (0, 7):
+                    kappa[start+1, start] = .4
+                    kappa[start+2, start] = .3
+                mo = mf.mo_coeff @ scipy.linalg.expm(kappa - kappa.T)
+                labels = numpy.array([0, 1, 0, 0, 0, 0, 0, 0, 1, 0])
+                mo = lib.tag_array(mo, orbsym=labels.copy())
+                mc.gasci(mo)
+                extra = numpy.array([0, 0, 1, 0, 0, 1, 1, 0, 0, 1])
+                mc.extrasym = extra.copy()
+                before = mo.copy()
+                ci_before = numpy.array(mc.ci, copy=True)
+                energy_before = mc.mo_energy
+                fock = mc.get_fock()
+                states = (0,) if weights is None else (0, 1)
+                old_dm = [mc.make_rdm1(state=state) for state in states]
+                def energies(orbitals, ci):
+                    h1, ecore = mc.get_h1gas(orbitals)
+                    h2 = ao2mo.restore(1, mc.get_h2gas(orbitals), mc.ncas)
+                    result = []
+                    for state in states:
+                        dm1, dm2 = mc.make_gasdm12(ci=ci, state=state)
+                        result.append(ecore + numpy.einsum('pq,qp', h1, dm1)
+                                      + .5 * numpy.einsum('pqrs,pqrs', h2, dm2))
+                    return result
+                old_e = energies(mo, mc.ci)
+                for frozen in (None, [0, 9]):
+                    mc.frozen = frozen
+                    for pseudo in (False, True):
+                        for sort in (False, True):
+                            with self.subTest(df=use_df, weights=weights,
+                                              frozen=frozen, pseudo=pseudo, sort=sort):
+                                new, ci, eps = mc.canonicalize(
+                                    sort=sort, gas_pseudo_natorb=pseudo)
+                                rotation = before.T @ mf.get_ovlp() @ new
+                                numpy.testing.assert_allclose(
+                                    rotation[extra[:, None] != extra], 0., atol=2e-11)
+                                numpy.testing.assert_allclose(
+                                    rotation[labels[:, None] != new.orbsym], 0., atol=2e-11)
+                                if not sort:
+                                    numpy.testing.assert_array_equal(new.orbsym, labels)
+                                if frozen is not None:
+                                    numpy.testing.assert_array_equal(new[:, frozen], before[:, frozen])
+                                if sort:
+                                    for indices in (numpy.arange(3), numpy.arange(7, 10)):
+                                        indices = numpy.array([i for i in indices
+                                                               if frozen is None or i not in frozen])
+                                        for label in set(extra[indices]):
+                                            self.assertTrue(numpy.all(numpy.diff(
+                                                eps[indices[extra[indices] == label]]) >= -2e-9))
+                                numpy.testing.assert_allclose(
+                                    eps, numpy.einsum('pi,pi->i', new, fock @ new), atol=2e-11)
+                                for state, density in zip(states, old_dm):
+                                    numpy.testing.assert_allclose(
+                                        mc.make_rdm1(mo_coeff=new, ci=ci, state=state),
+                                        density, atol=2e-11)
+                                numpy.testing.assert_allclose(energies(new, ci), old_e, atol=2e-10, rtol=0)
+                                numpy.testing.assert_array_equal(mc.mo_coeff, before)
+                                numpy.testing.assert_array_equal(mc.mo_coeff.orbsym, labels)
+                                numpy.testing.assert_array_equal(mc.extrasym, extra)
+                                numpy.testing.assert_array_equal(numpy.asarray(mc.ci), ci_before)
+                                self.assertIs(mc.mo_energy, energy_before)
+
     def test_canonicalize_keeps_restricted_gas_active_block_unchanged(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",

@@ -58,6 +58,7 @@ from pyscf.lib import logger
 from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
 from pyscf.mcscf import addons_gas
+from pyscf.mcscf import casci_symm
 from pyscf.mcscf import df as mcdf
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
@@ -1404,21 +1405,68 @@ class GASSCF(newton_casscf.CASSCF):
 
         return e_tot, e_gas, ci
 
+    def _eig(self, mat, b0=None, b1=None, orbsym=None):
+        # Native canonicalize supplies combined orbital/extrasym labels.
+        if orbsym is not None:
+            return casci_symm.eig(mat, orbsym)
+        return super()._eig(mat, b0, b1)
+
+    def _canonicalize_core_virtual(self, mo_coeff, ci, eris, sort,
+                                   gasdm1, verbose, **kwargs):
+        """Reuse GASCI canonicalization while preserving fixed extra labels."""
+
+        mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
+        # Native sort=True may reorder the supplied orbsym array in place.
+        # Own the labels as well as the MO array on both canonicalization paths.
+        mo_input = mo_coeff.copy()
+        if getattr(mo_coeff, 'orbsym', None) is not None:
+            mo_input = lib.tag_array(
+                mo_input, orbsym=numpy.array(mo_coeff.orbsym, copy=True))
+        extra = self.extrasym
+        mo, ci, energies = gasci.GASCI.canonicalize(
+            self, mo_input, ci, eris, sort=sort and extra is None,
+            gas_natorb=False, gasdm1=gasdm1, verbose=verbose, **kwargs)
+        if sort and extra is not None:
+            # extrasym is an object constraint, not returned orbital metadata.
+            # Keep its positions fixed while applying native energy ordering
+            # within each unfrozen extra-symmetry group of core/virtual space.
+            extra = numpy.asarray(extra)
+            available = numpy.ones(mo.shape[1], dtype=bool)
+            if isinstance(self.frozen, (int, numpy.integer)):
+                available[:self.frozen] = False
+            elif self.frozen is not None:
+                available[self.frozen] = False
+            nocc = self.ncore + self.ncas
+            for start, stop in ((0, self.ncore), (nocc, mo.shape[1])):
+                indices = numpy.arange(start, stop)[available[start:stop]]
+                for label in set(extra[indices]):
+                    group = indices[extra[indices] == label]
+                    order = group[numpy.argsort(energies[group].round(9),
+                                               kind='mergesort')]
+                    mo[:, group] = mo[:, order]
+                    energies[group] = energies[order]
+                    if getattr(mo, 'orbsym', None) is not None:
+                        mo.orbsym[group] = mo.orbsym[order]
+        return mo, ci, energies
+
     def canonicalize(self, mo_coeff=None, ci=None, eris=None, sort=False,
                      gas_natorb=False, gasdm1=None, verbose=None,
-                     cas_natorb=None, *, gas_pseudo_natorb=False, **kwargs):
+                     cas_natorb=None, *, gas_pseudo_natorb=False, casdm1=None,
+                     **kwargs):
         """Return ``(mo_coeff, ci, mo_energy)`` without writing to this object.
 
         By default only core/external orbitals are canonicalized. Opt in with
         ``gas_pseudo_natorb=True`` to diagonalize the density separately within
         each GAS subspace and transform every CI root into the new basis,
         including zero-weight roots. SA uses the weighted density unless
-        ``gasdm1`` is supplied in the input active-orbital basis.
+        ``gasdm1`` is supplied in the input active-orbital basis. ``casdm1``
+        is a compatibility alias; supply only one of these density arguments.
 
         Active occupations are ordered from largest to smallest within each
         unfrozen symmetry block of a GAS subspace. Frozen orbitals and orbital
-        symmetry/``extrasym`` labels are respected. ``sort`` retains its native
-        meaning for core/external orbital energies. ``mo_energy`` contains
+        symmetry/``extrasym`` labels are respected. ``sort`` orders core/external
+        energies, within each fixed ``extrasym`` group when present; returned
+        orbital symmetry labels follow any permutation. ``mo_energy`` contains
         Fock diagonal elements, not pseudo-natural occupations.
 
         These are pseudo-natural orbitals: density between GAS subspaces need
@@ -1429,10 +1477,13 @@ class GASSCF(newton_casscf.CASSCF):
 
         if gas_natorb or cas_natorb:
             _unsupported("GAS natural-orbital rotation")
+        if casdm1 is not None:
+            if gasdm1 is not None:
+                raise ValueError("supply only one of gasdm1 and casdm1")
+            gasdm1 = casdm1
         if not gas_pseudo_natorb:
-            return gasci.GASCI.canonicalize(
-                self, mo_coeff, ci, eris, sort=sort, gas_natorb=False,
-                gasdm1=gasdm1, verbose=verbose, **kwargs)
+            return self._canonicalize_core_virtual(
+                mo_coeff, ci, eris, sort, gasdm1, verbose, **kwargs)
 
         mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
         ci = self.ci if ci is None else ci
@@ -1483,16 +1534,10 @@ class GASSCF(newton_casscf.CASSCF):
             ci_new = numpy.asarray([transform(vector) for vector in ci])
         else:
             ci_new = transform(ci)
-        # The native routine may reorder orbital labels when sort=True;
-        # own the metadata as well as the MO array to keep this call nonmutating.
-        mo_input = mo_coeff.copy()
-        if getattr(mo_coeff, 'orbsym', None) is not None:
-            mo_input = lib.tag_array(mo_input, orbsym=numpy.array(orbsym, copy=True))
         # Both calls use the original basis, so a supplied ERIS remains valid.
         fock = self.get_fock(mo_coeff, ci, eris, gasdm1, verbose)
-        mo_new, _, mo_energy = gasci.GASCI.canonicalize(
-            self, mo_input, ci, eris, sort=sort, gas_natorb=False,
-            gasdm1=gasdm1, verbose=verbose, **kwargs)
+        mo_new, _, mo_energy = self._canonicalize_core_virtual(
+            mo_coeff, ci, eris, sort, gasdm1, verbose, **kwargs)
         active = slice(self.ncore, self.ncore + self.ncas)
         mo_new[:, active] = mo_coeff[:, active] @ rotation
         mo_energy[active] = numpy.einsum(
@@ -1501,7 +1546,8 @@ class GASSCF(newton_casscf.CASSCF):
 
     def canonicalize_(self, mo_coeff=None, ci=None, eris=None, sort=False,
                       gas_natorb=False, gasdm1=None, verbose=None,
-                      cas_natorb=None, *, gas_pseudo_natorb=False, **kwargs):
+                      cas_natorb=None, *, gas_pseudo_natorb=False, casdm1=None,
+                      **kwargs):
         """Write the canonicalized MO, CI and orbital energies to this object.
 
         Returns the same three values as :meth:`canonicalize`; the method
@@ -1511,7 +1557,7 @@ class GASSCF(newton_casscf.CASSCF):
         mo_coeff, ci, mo_energy = self.canonicalize(
             mo_coeff, ci, eris, sort=sort, gas_natorb=gas_natorb,
             gasdm1=gasdm1, verbose=verbose, cas_natorb=cas_natorb,
-            gas_pseudo_natorb=gas_pseudo_natorb, **kwargs)
+            gas_pseudo_natorb=gas_pseudo_natorb, casdm1=casdm1, **kwargs)
         self.mo_coeff = mo_coeff
         self.ci = ci
         self.mo_energy = mo_energy
