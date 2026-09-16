@@ -33,7 +33,8 @@ and the GASCI-native spin-penalty Hamiltonian.  It does not implement
 state-average-mix, state-specific excited-state wrappers,
 unrestricted active-space natural-orbital rotations, analytic gradients/NACs or the
 legacy two-step CASSCF driver. X2C is not supported, including SCF inputs
-with an active ``with_x2c`` helper.
+with an active ``with_x2c`` helper. Solvent models are not supported,
+including an active ``with_solvent`` helper on either the SCF or MCSCF object.
 
 Construct supported SA/DF objects with ``mc.state_average(...)``,
 ``mc.density_fit(...)`` or ``DFGASSCF(...)``. These entry points install the
@@ -1040,6 +1041,9 @@ class GASSCF(newton_casscf.CASSCF):
 
         if getattr(self._scf, "with_x2c", None) is not None:
             _unsupported("X2C")
+        if (getattr(self, "with_solvent", None) is not None or
+                getattr(self._scf, "with_solvent", None) is not None):
+            _unsupported("solvent models")
         if isinstance(self, mcdf._DFHessianCASSCF):
             _unsupported("density-fitted approximate Hessian")
         if isinstance(self, mcdf._DFCAS) and not isinstance(self, _DFGASSCF):
@@ -1711,6 +1715,11 @@ class GASSCF(newton_casscf.CASSCF):
 
     x2c = x2c1e = sfx2c1e
 
+    def ddCOSMO(self, *args, **kwargs):
+        """Reject solvent wrappers, including the inherited alias names."""
+        _unsupported("solvent models")
+
+    DDCOSMO = ddPCM = DDPCM = PCM = ddCOSMO
 
     def as_scanner(self):
         """Return an energy-only scanner for a fixed GASSCF objective.

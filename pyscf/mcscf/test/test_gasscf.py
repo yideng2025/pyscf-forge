@@ -34,6 +34,7 @@ from pyscf import ao2mo
 from pyscf import gto
 from pyscf import lib
 from pyscf import scf
+from pyscf import solvent
 from pyscf.tools import molden
 from pyscf.fci import addons as fci_addons
 from pyscf.fci import direct_spin1
@@ -4674,6 +4675,11 @@ class KnownValues(unittest.TestCase):
                     ('sfx2c1e', {}, 'X2C'),
                     ('x2c1e', {}, 'X2C'),
                     ('x2c', {}, 'X2C'),
+                    ('ddCOSMO', {}, 'solvent models'),
+                    ('DDCOSMO', {}, 'solvent models'),
+                    ('ddPCM', {}, 'solvent models'),
+                    ('DDPCM', {}, 'solvent models'),
+                    ('PCM', {}, 'solvent models'),
                     ('mc1step', {}, 'use kernel\\(\\)'),
                     ('solve_approx_ci', dict(h1=None, h2=None, ci0=None,
                                              ecore=0., e_cas=0., envs={}),
@@ -4689,17 +4695,33 @@ class KnownValues(unittest.TestCase):
                         with self.assertRaisesRegex(NotImplementedError, message):
                             getattr(mc, method)(**kwargs)
 
-                # X2C enabled at SCF level must not bypass the conversion guards.
-                mc._scf = mc._scf.sfx2c1e()
-                for method in ('kernel', 'gasci', 'get_grad', 'newton'):
-                    with self.subTest(kind=kind, scanner=scanner, x2c_entry=method):
-                        with self.assertRaisesRegex(NotImplementedError, 'X2C'):
-                            getattr(mc, method)()
-                with self.assertRaisesRegex(NotImplementedError, 'X2C'):
-                    if scanner:
-                        mc(mol)
-                    else:
-                        mc.as_scanner()
+                # External decorations must also fail at calculation entry.
+                decorators = (
+                    ('X2C', lambda obj: obj.sfx2c1e(), ('scf',), 'X2C'),
+                    ('ddCOSMO', solvent.ddCOSMO, ('scf', 'mc'), 'solvent models'),
+                    ('ddPCM', solvent.ddPCM, ('scf', 'mc'), 'solvent models'),
+                    ('PCM', solvent.PCM, ('scf', 'mc'), 'solvent models'),
+                )
+                for name, decorate, targets, message in decorators:
+                    for target in targets:
+                        trial = mc.copy()
+                        if target == 'scf':
+                            trial._scf = decorate(trial._scf)
+                        else:
+                            trial = decorate(trial)
+                        self.addCleanup(trial.close)
+                        for method in ('kernel', 'gasci', 'get_grad', 'newton'):
+                            with self.subTest(kind=kind, scanner=scanner,
+                                              model=name, target=target, method=method):
+                                with self.assertRaisesRegex(NotImplementedError, message):
+                                    getattr(trial, method)()
+                        with self.subTest(kind=kind, scanner=scanner,
+                                          model=name, target=target, method='scanner'):
+                            with self.assertRaisesRegex(NotImplementedError, message):
+                                if scanner:
+                                    trial(mol)
+                                else:
+                                    trial.as_scanner()
 
     def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
