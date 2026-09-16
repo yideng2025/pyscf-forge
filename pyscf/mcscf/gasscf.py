@@ -750,19 +750,8 @@ class _GASSCFScanner(lib.SinglePointScanner):
                 priority=_orbital_groups(self), use_hf_core=False)
             mo_source = "projected previous GASSCF MO by GAS blocks"
 
-        guess_mo = numpy.asarray(guess_mo)
-        if (guess_mo.ndim != 2 or numpy.iscomplexobj(guess_mo) or
-                not numpy.all(numpy.isfinite(guess_mo))):
-            raise ValueError("scanner MO guess must be a finite real matrix")
-        if guess_mo.shape[0] != mol.nao_nr() or guess_mo.shape[1] < self.ncore + self.ncas:
-            raise ValueError("scanner MO guess has an incompatible shape")
-        overlap = self._scf.get_ovlp()
-        metric = guess_mo.T.dot(overlap).dot(guess_mo)
-        error = float(numpy.max(numpy.abs(metric - numpy.eye(guess_mo.shape[1]))))
-        if error > 1e-7:
-            raise ValueError(
-                "scanner initial MO is not orthonormal in the new AO metric: "
-                "%.6g" % error)
+        # Share GASCI's validation and configurable warning/error thresholds.
+        error = self._check_mo_orthonormality(guess_mo)
 
         self.scan_info = {
             "MO_source": mo_source,
@@ -1147,12 +1136,7 @@ class GASSCF(newton_casscf.CASSCF):
                 mask[frozen] = mask[:, frozen] = False
         return mask
 
-    def _effective_nelecas(self, nelecas=None):
-        """Return active alpha/beta counts after applying ``fcisolver.spin``."""
-
-        if nelecas is None:
-            nelecas = self.nelecas
-        return fci_addons._unpack_nelec(nelecas, self.fcisolver.spin)
+    _effective_nelecas = gasci.GASCI._effective_nelecas
 
     def _normalized_restriction(self, return_info=False):
         """Return the normalized GAS definition used by GASCI kernels."""
@@ -1167,38 +1151,7 @@ class GASSCF(newton_casscf.CASSCF):
         """Return normalized GAS metadata and compact C-space information."""
 
         gas_orbs, blocks, info = self._normalized_restriction(return_info=True)
-        restriction_type = self.gas_restr_type
-        if self.gas_restr is None:
-            restriction = None
-        elif restriction_type == addons_gas.GAS_RESTR_SPIN_SUPERGROUP:
-            restriction = numpy.array(
-                info["canonical_spin_supergroups"], copy=True)
-        elif restriction_type == addons_gas.GAS_RESTR_SUPERGROUP:
-            restriction = numpy.array(info["canonical_supergroups"], copy=True)
-        elif restriction_type == addons_gas.GAS_RESTR_CUMULATIVE_OCC:
-            restriction = numpy.array(info["cumulative_bounds"], copy=True)
-        elif restriction_type == addons_gas.GAS_RESTR_RAS:
-            restriction = {
-                "max_holes": int(info["max_holes"]),
-                "max_particles": int(info["max_particles"]),
-            }
-        else:  # normalize_gas_spec rejects this before reaching this branch.
-            raise RuntimeError("unrecognized normalized GAS restriction type")
-
-        with fci_gas.GasSpace(
-                gas_orbs, self._effective_nelecas(), blocks,
-                lib=self.fcisolver.lib) as space:
-            core = space.core_info()
-        return {
-            "metadata": {
-                "gas_orbs": tuple(int(value) for value in self.gas_orbs),
-                "gas_restr_type": restriction_type,
-                "gas_restr": restriction,
-                "kernel_gas_orbs": tuple(int(value) for value in gas_orbs),
-                "spin_supergroups": numpy.array(blocks, copy=True),
-            },
-            "core": core,
-        }
+        return gasci._gas_space_info(self, gas_orbs, blocks, info)
 
     # Public density/property conventions are shared with GASCI: state=None
     # selects the weighted density on SA objects, while state=i selects root i.
@@ -1269,15 +1222,9 @@ class GASSCF(newton_casscf.CASSCF):
         return gasci.GASCI.get_fock(
             self, mo_coeff, ci, eris, gasdm1, verbose)
 
-    def get_h1gas(self, mo_coeff=None, ncas=None, ncore=None):
-        """Return the effective one-electron Hamiltonian in the GAS space."""
+    get_h1gas = gasci.GASCI.get_h1gas
 
-        return self.get_h1eff(mo_coeff, ncas, ncore)
-
-    def get_h2gas(self, mo_coeff=None):
-        """Return active-space two-electron integrals for GASSCF."""
-
-        return self.get_h2eff(mo_coeff)
+    get_h2gas = gasci.GASCI.get_h2gas
 
     def _prepare_fixed_orbital_gasci(self, mo_coeff=None, ci0=None):
         """Return orbitals and CI guess for a fixed-orbital GASCI call."""
@@ -1514,16 +1461,11 @@ class GASSCF(newton_casscf.CASSCF):
 
     @staticmethod
     def _validate_weights(weights):
-        """Return finite nonnegative state-average weights summing to one."""
+        """Return at least two validated state-average weights."""
 
-        weights = numpy.asarray(weights, dtype=float)
-        if weights.ndim != 1 or weights.size < 2:
+        weights = addons_gas._validate_state_weights(weights)
+        if weights.size < 2:
             raise ValueError("state_average requires at least two weights")
-        if (not numpy.all(numpy.isfinite(weights)) or
-                numpy.any(weights < 0) or
-                abs(float(numpy.sum(weights)) - 1.0) > 1e-10):
-            raise ValueError(
-                "weights must be finite, nonnegative and sum to one")
         return tuple(float(value) for value in weights)
 
     def state_average(self, weights=(.5, .5), wfnsym=None):

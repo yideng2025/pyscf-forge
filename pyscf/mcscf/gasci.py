@@ -80,6 +80,46 @@ def kernel(mc, mo_coeff=None, ci0=None, verbose=logger.NOTE):
     return e_tot, e_tot - energy_core, ci
 
 
+def _gas_space_info(mc, gas_orbs, blocks, info):
+    """Assemble metadata for a GAS specification normalized by the caller."""
+
+    restriction_type = mc.gas_restr_type
+    if mc.gas_restr is None:
+        restriction = None
+    elif restriction_type == addons_gas.GAS_RESTR_SPIN_SUPERGROUP:
+        restriction = numpy.array(
+            info["canonical_spin_supergroups"], copy=True)
+    elif restriction_type == addons_gas.GAS_RESTR_SUPERGROUP:
+        restriction = numpy.array(
+            info["canonical_supergroups"], copy=True)
+    elif restriction_type == addons_gas.GAS_RESTR_CUMULATIVE_OCC:
+        restriction = numpy.array(info["cumulative_bounds"], copy=True)
+    elif restriction_type == addons_gas.GAS_RESTR_RAS:
+        restriction = {
+            "max_holes": int(info["max_holes"]),
+            "max_particles": int(info["max_particles"]),
+        }
+    else:  # normalize_gas_spec rejects this before reaching this branch.
+        raise RuntimeError("unrecognized normalized GAS restriction type")
+
+    user_gas_orbs = ((int(mc.ncas),) if mc.gas_orbs is None else
+                     tuple(int(value) for value in mc.gas_orbs))
+    with fci_gas.GasSpace(
+            gas_orbs, mc._effective_nelecas(), blocks,
+            lib=mc.fcisolver.lib) as space:
+        core = space.core_info()
+    return {
+        "metadata": {
+            "gas_orbs": user_gas_orbs,
+            "gas_restr_type": restriction_type,
+            "gas_restr": restriction,
+            "kernel_gas_orbs": tuple(int(value) for value in gas_orbs),
+            "spin_supergroups": numpy.array(blocks, copy=True),
+        },
+        "core": core,
+    }
+
+
 def _energy_value(value):
     """Copy an energy without changing its scalar/array convention."""
     value = numpy.asarray(value, dtype=float)
@@ -326,41 +366,7 @@ class GASCI(casci.CASCI):
         self._sync_fcisolver()
         gas_orbs, blocks, info = self._normalized_restriction(
             return_info=True)
-        restriction_type = self.gas_restr_type
-        if self.gas_restr is None:
-            restriction = None
-        elif restriction_type == addons_gas.GAS_RESTR_SPIN_SUPERGROUP:
-            restriction = numpy.array(
-                info["canonical_spin_supergroups"], copy=True)
-        elif restriction_type == addons_gas.GAS_RESTR_SUPERGROUP:
-            restriction = numpy.array(
-                info["canonical_supergroups"], copy=True)
-        elif restriction_type == addons_gas.GAS_RESTR_CUMULATIVE_OCC:
-            restriction = numpy.array(info["cumulative_bounds"], copy=True)
-        elif restriction_type == addons_gas.GAS_RESTR_RAS:
-            restriction = {
-                "max_holes": int(info["max_holes"]),
-                "max_particles": int(info["max_particles"]),
-            }
-        else:  # normalize_gas_spec rejects this before reaching this branch.
-            raise RuntimeError("unrecognized normalized GAS restriction type")
-
-        user_gas_orbs = ((int(self.ncas),) if self.gas_orbs is None else
-                         tuple(int(value) for value in self.gas_orbs))
-        with fci_gas.GasSpace(
-                gas_orbs, self._effective_nelecas(), blocks,
-                lib=self.fcisolver.lib) as space:
-            core = space.core_info()
-        return {
-            "metadata": {
-                "gas_orbs": user_gas_orbs,
-                "gas_restr_type": restriction_type,
-                "gas_restr": restriction,
-                "kernel_gas_orbs": tuple(int(value) for value in gas_orbs),
-                "spin_supergroups": numpy.array(blocks, copy=True),
-            },
-            "core": core,
-        }
+        return _gas_space_info(self, gas_orbs, blocks, info)
 
     def _gas_problem_signature(self):
         """Return the normalized GAS definition associated with a CI vector."""

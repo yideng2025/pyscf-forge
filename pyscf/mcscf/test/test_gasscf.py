@@ -1971,6 +1971,133 @@ class KnownValues(unittest.TestCase):
             numpy.asarray([[0, 1, 1, 0], [1, 0, 0, 1]], dtype=numpy.int32))
         self.assertEqual(info["core"]["ndet"], 2)
 
+    def test_shared_space_info_preserves_user_and_kernel_specs(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol)
+        blocks = numpy.array([[0, 1, 1, 0], [1, 0, 0, 1]])
+        cases = (
+            ((1, 1), blocks, 'spin-supergroup', 2, (1, 1)),
+            ((1, 1), ((1, 1),), 'supergroup', 2, (1, 1)),
+            ((1, 1), ((1, 1), (2, 2)), 'cumulative-occ', 2, (1, 1)),
+            ((0, 2, 0), {'max_holes': 0, 'max_particles': 0}, 'ras', 4, (2,)),
+            (None, None, 'spin-supergroup', 4, (2,)),
+        )
+        for sizes, restriction, kind, ndet, kernel_sizes in cases:
+            for driver in (gasci.GASCI, gasscf.GASSCF):
+                with self.subTest(driver=driver.__name__, kind=kind, sizes=sizes):
+                    mc = driver(mf, 2, (1, 1), ncore=0, gas_orbs=sizes,
+                                gas_restr=restriction, gas_restr_type=kind)
+                    if isinstance(mc, gasscf.GASSCF):
+                        self.addCleanup(mc.close)
+                    report = mc.gas_space_info()
+                    meta = report['metadata']
+                    self.assertEqual(meta['gas_orbs'], (2,) if sizes is None else sizes)
+                    self.assertEqual(meta['kernel_gas_orbs'], kernel_sizes)
+                    self.assertEqual(meta['gas_restr_type'], kind)
+                    self.assertEqual(report['core']['ndet'], ndet)
+                    expected = blocks if ndet == 2 else numpy.array([[1, 1]])
+                    numpy.testing.assert_array_equal(meta['spin_supergroups'], expected)
+                    if kind == 'ras':
+                        self.assertEqual(meta['gas_restr'],
+                                         {'max_holes': 0, 'max_particles': 0})
+                    elif restriction is None:
+                        self.assertIsNone(meta['gas_restr'])
+                    else:
+                        numpy.testing.assert_array_equal(meta['gas_restr'], restriction)
+                    # Reports own their arrays; changing one must not change
+                    # either the user specification or the next kernel space.
+                    meta['spin_supergroups'][:] = -1
+                    if isinstance(meta['gas_restr'], numpy.ndarray):
+                        meta['gas_restr'][:] = -1
+                    self.assertEqual(mc.gas_space_info()['core']['ndet'], ndet)
+
+        # GASCI stores a user specification separately from its solver.
+        mc = gasci.GASCI(mf, 2, (1, 1), ncore=0)
+        mc.gas_orbs = (1, 1)
+        mc.gas_restr = ((1, 1), (2, 2))
+        mc.gas_restr_type = 'cumulative-occ'
+        self.assertEqual(mc.gas_space_info()['core']['ndet'], 2)
+        self.assertEqual(mc.fcisolver.gas_orbs, (1, 1))
+
+    def test_shared_integral_methods_preserve_df_dispatch(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=1, gas_orbs=(1, 1),
+                          gas_restr=((1, 1), (2, 2)),
+                          gas_restr_type='cumulative-occ')
+        self.addCleanup(mc.close)
+        fitted = mc.density_fit(auxbasis='weigend')
+        self.addCleanup(fitted.close)
+        rotation = numpy.zeros((4, 4))
+        rotation[0, 2], rotation[2, 0] = .13, -.13
+        mo = mf.mo_coeff @ scipy.linalg.expm(rotation)
+        active = mo[:, 1:3]
+        exact = ao2mo.kernel(mol, active)
+        approximate = fitted.with_df.ao2mo(active)
+        self.assertGreater(numpy.linalg.norm(exact - approximate), 1e-8)
+        for obj, expected in ((mc, exact), (fitted, approximate)):
+            with self.subTest(df=hasattr(obj, 'with_df')):
+                numpy.testing.assert_allclose(obj.get_h2gas(mo), expected, atol=1e-12)
+                for ncore, ncas in ((1, 2), (0, 1)):
+                    core = mo[:, :ncore]
+                    dm = 2 * core @ core.T
+                    vj, vk = obj.get_jk(mol, dm)
+                    potential = vj - .5 * vk
+                    hcore = obj.get_hcore()
+                    act = mo[:, ncore:ncore+ncas]
+                    expected_h1 = act.T @ (hcore + potential) @ act
+                    expected_core = (mol.energy_nuc() + numpy.einsum('ij,ji', dm, hcore)
+                                     + .5 * numpy.einsum('ij,ji', dm, potential))
+                    h1, energy = obj.get_h1gas(mo, ncas=ncas, ncore=ncore)
+                    numpy.testing.assert_allclose(h1, expected_h1, atol=1e-12)
+                    self.assertAlmostEqual(energy, expected_core, 12)
+
+    def test_scanner_uses_gasci_mo_validation_and_thresholds(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=0, gas_orbs=(1, 1),
+                          gas_restr=((1, 1), (2, 2)),
+                          gas_restr_type='cumulative-occ')
+        self.addCleanup(mc.close)
+        scanner = mc.as_scanner()
+        self.addCleanup(scanner.close)
+        scanner.verbose = 4
+        scanner.stdout = io.StringIO()
+        # Exercise the real scanner through its optimizer boundary. The MO
+        # validation must accept the warning interval and reject bad guesses
+        # before the orbital/CI optimizer is called.
+        with mock.patch.object(gasci, 'MO_ORTH_WARN_TOL', 1e-7), \
+                mock.patch.object(gasci, 'MO_ORTH_ERROR_TOL', 1e-5), \
+                mock.patch.object(scanner, 'kernel', return_value=(-1.,)) as solve:
+            for error in (5e-8, 2e-6):
+                mo = mf.mo_coeff.copy()
+                mo[:, 0] *= numpy.sqrt(1 + error)
+                scanner.stdout.seek(0)
+                scanner.stdout.truncate(0)
+                solve.reset_mock()
+                self.assertEqual(scanner(mol, mo_coeff=mo), -1.)
+                solve.assert_called_once()
+                self.assertAlmostEqual(scanner.scan_info['initial_MO_metric_error'],
+                                       error, delta=1e-14)
+                self.assertEqual('WARN' in scanner.stdout.getvalue(), error > 1e-7)
+                numpy.testing.assert_array_equal(solve.call_args.args[0], mo)
+            mo = mf.mo_coeff.copy()
+            mo[:, 0] *= numpy.sqrt(1 + 2e-5)
+            bad = (mo, mf.mo_coeff[:, :1], mf.mo_coeff[:1],
+                   numpy.full((2, 2), numpy.nan), numpy.full((2, 2), numpy.inf),
+                   numpy.ones(2))
+            for mo in bad:
+                with self.subTest(shape=mo.shape):
+                    solve.reset_mock()
+                    with self.assertRaises(ValueError):
+                        scanner(mol, mo_coeff=mo)
+                    solve.assert_not_called()
+            with self.assertRaises(TypeError):
+                scanner(mol, mo_coeff=mf.mo_coeff.astype(complex))
+            with self.assertRaises(TypeError):
+                scanner(mol, mo_coeff=mf.mo_coeff.astype(str))
+
     def test_effective_nelecas_honors_solver_spin(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
@@ -2814,10 +2941,16 @@ class KnownValues(unittest.TestCase):
         mc = gasscf.GASSCF(
             mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=0)
 
-        for weights in ((1.0,), (0.7, 0.4), (1.1, -0.1), (float("nan"), 1.0)):
+        for weights in ((), (1.0,), ((.5, .5),), (0.7, 0.4), (1.1, -0.1),
+                        (float("nan"), 1.0), (float("inf"), 0.),
+                        (.5, .5 + 2e-10)):
             with self.subTest(weights=weights):
                 with self.assertRaisesRegex(ValueError, "weights"):
                     mc.state_average(weights)
+        for weights in ((1., 0.), (0., 1.), (.5, .5 + 5e-11)):
+            result = mc._validate_weights(weights)
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(result, weights)
         with self.assertRaisesRegex(NotImplementedError, "wfnsym"):
             mc.state_average((0.5, 0.5), wfnsym=0)
 
