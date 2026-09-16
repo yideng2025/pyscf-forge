@@ -42,6 +42,10 @@ by GASSCF calculation entry points. Such external wrappers can still expose
 their own CASSCF methods (including gradient constructors); those methods
 are outside the supported GASSCF API. The separate ``approx_hessian``
 wrapper is not supported.
+
+Use ``kernel()`` for joint Newton orbital optimization. The ``mc1step()``
+entry and its legacy ``rotate_orb_cc``, ``update_casdm`` and ``solve_approx_ci``
+helpers are not supported.
 """
 
 from collections import OrderedDict
@@ -1771,8 +1775,16 @@ class GASSCF(newton_casscf.CASSCF):
             envs_or_file["e_cas"] = self.e_cas
         return super().dump_chk(envs_or_file)
 
-    def mc1step(self, mo_coeff=None, ci0=None, callback=None):
-        return self.kernel(mo_coeff, ci0, callback)
+    def mc1step(self, *args, **kwargs):
+        """Reject mc1step entry points; use :meth:`kernel` for joint Newton."""
+        raise NotImplementedError(
+            "GASSCF does not support legacy mc1step entry points; "
+            "use kernel() for joint Newton orbital optimization")
+
+    # The joint Newton driver does not use these inherited mc1step helpers.
+    solve_approx_ci = mc1step
+    update_casdm = mc1step
+    rotate_orb_cc = mc1step
 
     def mc2step(self, mo_coeff=None, ci0=None, callback=None):
         _unsupported("two-step GASSCF kernel")

@@ -4638,7 +4638,7 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same atoms"):
             scanner(changed)
 
-    def test_unsupported_derivatives_and_gpu_through_wrappers(self):
+    def test_unsupported_apis_through_wrappers(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol)
         # No SCF/CI solve is needed: unsupported APIs must fail at entry,
@@ -4671,6 +4671,14 @@ class KnownValues(unittest.TestCase):
                     ('NACs', {}, 'nonadiabatic coupling'),
                     ('to_gpu', {}, 'C/OpenMP backend'),
                     ('approx_hessian', {}, 'approximate Hessian'),
+                    ('mc1step', {}, 'use kernel\\(\\)'),
+                    ('solve_approx_ci', dict(h1=None, h2=None, ci0=None,
+                                             ecore=0., e_cas=0., envs={}),
+                     'legacy mc1step'),
+                    ('update_casdm', dict(mo=None, u=None, fcivec=None,
+                                          e_cas=0., eris=None), 'legacy mc1step'),
+                    ('rotate_orb_cc', dict(mo=None, fcivec=None, fcasdm1=None,
+                                           fcasdm2=None, eris=None), 'legacy mc1step'),
                 )
                 for method, kwargs, message in calls:
                     with self.subTest(kind=kind, scanner=scanner,
