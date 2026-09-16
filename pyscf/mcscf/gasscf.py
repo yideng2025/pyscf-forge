@@ -77,6 +77,9 @@ def _nuc_grad_method(self, state=None):
     _unsupported("analytic nuclear gradient evaluation")
 
 
+def _is_native_casscf_warning(message):
+    return "SO-CASSCF" in message and "experimental feature" in message
+
 
 class _GASSCFLogFilter:
     """Write-through stream filter for native Newton/CASSCF messages.
@@ -87,10 +90,6 @@ class _GASSCFLogFilter:
     user-visible text while leaving the driver and all numerical data untouched.
     """
 
-    _DROP_SUBSTRINGS = (
-        "SO-CASSCF (Second order CASSCF) is an experimental feature. "
-        "Its performance is bad for large systems.",
-    )
     _REPLACEMENTS = (
         ("Start SO-CASSCF (newton CASSCF)",
          "Start SO-GASSCF (newton GASSCF)"),
@@ -110,9 +109,7 @@ class _GASSCFLogFilter:
         self._pending = ""
 
     def _rewrite_line(self, line):
-        if any(text in line for text in self._DROP_SUBSTRINGS):
-            return ""
-        if "SO-CASSCF" in line and "experimental feature" in line:
+        if _is_native_casscf_warning(line):
             return ""
         for old, new in self._REPLACEMENTS:
             line = line.replace(old, new)
@@ -154,9 +151,7 @@ class _GASSCFLogger(logger.Logger):
 
     def warn(self, msg, *args):
         rendered = msg % args if args else msg
-        if any(text in rendered for text in _GASSCFLogFilter._DROP_SUBSTRINGS):
-            return
-        if "SO-CASSCF" in rendered and "experimental feature" in rendered:
+        if _is_native_casscf_warning(rendered):
             return
         return super().warn(msg, *args)
 
@@ -795,8 +790,7 @@ class _StateAverageGASSCF(addons.StateAverageMCSCF):
             return None
         return float(numpy.dot(self.weights, self.e_states))
 
-    def _finalize(self):
-        return gasci.GASCI._finalize(self)
+    _finalize = gasci.GASCI._finalize
 
     def undo_state_average(self):
         self.close()
@@ -1410,38 +1404,20 @@ class GASSCF(newton_casscf.CASSCF):
 
             if "imacro" in envs:
                 stat = envs["stat"]
-                if ss is None:
-                    log.info(
-                        "macro %d (%d JK  %d micro), "
-                        "GASSCF E = %.15g  dE = %.4g  |grad|=%5.3g",
-                        envs["imacro"],
-                        stat.tot_hop + stat.tot_kf,
-                        stat.imic,
-                        e_tot,
-                        e_tot - envs["elast"],
-                        envs["norm_gall"],
-                    )
-                else:
-                    log.info(
-                        "macro %d (%d JK  %d micro), "
-                        "GASSCF E = %.15g  dE = %.4g  |grad|=%5.3g  "
-                        "S^2 = %.7f",
-                        envs["imacro"],
-                        stat.tot_hop + stat.tot_kf,
-                        stat.imic,
-                        e_tot,
-                        e_tot - envs["elast"],
-                        envs["norm_gall"],
-                        ss[0],
-                    )
+                message = ("macro %d (%d JK  %d micro), "
+                           "GASSCF E = %.15g  dE = %.4g  |grad|=%5.3g")
+                values = (envs["imacro"], stat.tot_hop + stat.tot_kf,
+                          stat.imic, e_tot, e_tot - envs["elast"],
+                          envs["norm_gall"])
             else:
-                elast = envs.get("elast", 0)
-                if ss is None:
-                    log.info("GASCI E = %.15g", e_tot)
-                else:
-                    log.info(
-                        "GASCI E = %.15g  dE = %.8g  S^2 = %.7f",
-                        e_tot, e_tot - elast, ss[0])
+                message, values = "GASCI E = %.15g", (e_tot,)
+                if ss is not None:
+                    message += "  dE = %.8g"
+                    values += (e_tot - envs.get("elast", 0),)
+            if ss is not None:
+                message += "  S^2 = %.7f"
+                values += (ss[0],)
+            log.info(message, *values)
 
         return e_tot, e_gas, ci
 
@@ -1620,9 +1596,10 @@ class GASSCF(newton_casscf.CASSCF):
     def state_average(self, weights=(.5, .5), wfnsym=None):
         """Return an ordinary state-average GASSCF object.
 
-        Zero-weight roots are retained exactly as requested, so they may still
-        contribute to the native CI-response path even though they do not enter
-        the scalar energy objective.  ``wfnsym`` and SA-mix are not supported.
+        Zero-weight roots are still solved and stored, but contribute neither
+        to the weighted energy nor to its gradient and Hessian. Their presence
+        may affect multiroot solver work and the numerical optimization path.
+        ``wfnsym`` and SA-mix are not supported.
         """
 
         if wfnsym is not None:
