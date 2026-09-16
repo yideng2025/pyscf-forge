@@ -4671,6 +4671,9 @@ class KnownValues(unittest.TestCase):
                     ('NACs', {}, 'nonadiabatic coupling'),
                     ('to_gpu', {}, 'C/OpenMP backend'),
                     ('approx_hessian', {}, 'approximate Hessian'),
+                    ('sfx2c1e', {}, 'X2C'),
+                    ('x2c1e', {}, 'X2C'),
+                    ('x2c', {}, 'X2C'),
                     ('mc1step', {}, 'use kernel\\(\\)'),
                     ('solve_approx_ci', dict(h1=None, h2=None, ci0=None,
                                              ecore=0., e_cas=0., envs={}),
@@ -4685,6 +4688,18 @@ class KnownValues(unittest.TestCase):
                                       method=method, kwargs=kwargs):
                         with self.assertRaisesRegex(NotImplementedError, message):
                             getattr(mc, method)(**kwargs)
+
+                # X2C enabled at SCF level must not bypass the conversion guards.
+                mc._scf = mc._scf.sfx2c1e()
+                for method in ('kernel', 'gasci', 'get_grad', 'newton'):
+                    with self.subTest(kind=kind, scanner=scanner, x2c_entry=method):
+                        with self.assertRaisesRegex(NotImplementedError, 'X2C'):
+                            getattr(mc, method)()
+                with self.assertRaisesRegex(NotImplementedError, 'X2C'):
+                    if scanner:
+                        mc(mol)
+                    else:
+                        mc.as_scanner()
 
     def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)

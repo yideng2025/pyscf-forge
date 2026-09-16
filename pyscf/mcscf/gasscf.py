@@ -32,7 +32,8 @@ density fitting through PySCF's ``mcscf.df`` machinery, energy-only scanners
 and the GASCI-native spin-penalty Hamiltonian.  It does not implement
 state-average-mix, state-specific excited-state wrappers,
 unrestricted active-space natural-orbital rotations, analytic gradients/NACs or the
-legacy two-step CASSCF driver.
+legacy two-step CASSCF driver. X2C is not supported, including SCF inputs
+with an active ``with_x2c`` helper.
 
 Construct supported SA/DF objects with ``mc.state_average(...)``,
 ``mc.density_fit(...)`` or ``DFGASSCF(...)``. These entry points install the
@@ -1037,6 +1038,8 @@ class GASSCF(newton_casscf.CASSCF):
         or DFGASSCF factory to construct them.
         """
 
+        if getattr(self._scf, "with_x2c", None) is not None:
+            _unsupported("X2C")
         if isinstance(self, mcdf._DFHessianCASSCF):
             _unsupported("density-fitted approximate Hessian")
         if isinstance(self, mcdf._DFCAS) and not isinstance(self, _DFGASSCF):
@@ -1701,6 +1704,12 @@ class GASSCF(newton_casscf.CASSCF):
         """Reject the unvalidated native DF-only Hessian approximation."""
 
         _unsupported("density-fitted approximate Hessian")
+
+    def sfx2c1e(self, *args, **kwargs):
+        """Reject X2C conversion, including the inherited alias names."""
+        _unsupported("X2C")
+
+    x2c = x2c1e = sfx2c1e
 
 
     def as_scanner(self):
