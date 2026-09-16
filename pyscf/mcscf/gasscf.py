@@ -62,6 +62,11 @@ def _unsupported(feature):
     raise NotImplementedError(feature + " is not implemented for GASSCF")
 
 
+def _nuc_grad_method(self, state=None):
+    """Reject nuclear gradients, including native state-average dispatch."""
+    _unsupported("analytic nuclear gradient evaluation")
+
+
 
 class _GASSCFLogFilter:
     """Write-through stream filter for native Newton/CASSCF messages.
@@ -808,6 +813,12 @@ class _DFGASSCF(mcdf._DFCASSCF):
 
     __name_mixin__ = "DF"
 
+    # The DF mixin precedes GASSCF in the MRO and supplies its own CASSCF
+    # gradient constructors. Guard both the public and native SA hook names.
+    nuc_grad_method = _nuc_grad_method
+    Gradients = nuc_grad_method
+    _state_average_nuc_grad_method = nuc_grad_method
+
     def dump_flags(self, verbose=None):
         super(mcdf._DFCAS, self).dump_flags(verbose)
         logger.info(
@@ -1240,6 +1251,7 @@ class GASSCF(newton_casscf.CASSCF):
     get_gas_pseudo_natorb_occupations = gasci.GASCI.get_gas_pseudo_natorb_occupations
     _gas_analysis_label = "GASSCF"
     analyze = gasci.GASCI.analyze
+    to_gpu = gasci.GASCI.to_gpu
 
     def get_fock(self, mo_coeff=None, ci=None, eris=None, gasdm1=None,
                  verbose=None, *, casdm1=None):
@@ -1605,6 +1617,18 @@ class GASSCF(newton_casscf.CASSCF):
         _unsupported("state-specific GASSCF")
 
     state_specific = state_specific_
+
+    # StateAverageMCSCF's Gradients/NACs aliases dispatch through these hooks.
+    # Defining only the public methods would leave those inherited paths open.
+    nuc_grad_method = _nuc_grad_method
+    Gradients = nuc_grad_method
+    _state_average_nuc_grad_method = nuc_grad_method
+
+    def nac_method(self, *args, **kwargs):
+        _unsupported("nonadiabatic coupling evaluation")
+
+    NACs = nac_method
+    _state_average_nac_method = nac_method
 
     gen_g_hop = gen_g_hop
 

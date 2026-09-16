@@ -3427,6 +3427,45 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same atoms"):
             scanner(changed)
 
+    def test_unsupported_derivatives_and_gpu_through_wrappers(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol)
+        # No SCF/CI solve is needed: unsupported APIs must fail at entry,
+        # independently of the availability of orbitals or GPU packages.
+        for kind in ('plain', 'df', 'sa', 'df-sa', 'sa-df', 'undo-sa', 'undo-df'):
+            for scanner in (False, True):
+                mc = gasscf.GASSCF(
+                    mf, 2, (1, 1), ncore=0, gas_orbs=(1, 1),
+                    gas_restr=((1, 1), (2, 2)), gas_restr_type='cumulative-occ')
+                self.addCleanup(mc.close)
+                if kind in ('df', 'df-sa', 'undo-df'):
+                    mc = mc.density_fit()
+                if kind in ('sa', 'df-sa', 'sa-df', 'undo-sa'):
+                    mc = mc.state_average((.5, .5))
+                if kind == 'sa-df':
+                    mc = mc.density_fit()
+                if kind == 'undo-sa':
+                    mc = mc.undo_state_average()
+                if kind == 'undo-df':
+                    mc = mc.undo_df()
+                if scanner:
+                    mc = mc.as_scanner()
+                self.addCleanup(mc.close)
+                calls = (
+                    ('nuc_grad_method', {}, 'nuclear gradient'),
+                    ('Gradients', {}, 'nuclear gradient'),
+                    ('nuc_grad_method', {'state': 1}, 'nuclear gradient'),
+                    ('Gradients', {'state': 1}, 'nuclear gradient'),
+                    ('nac_method', {}, 'nonadiabatic coupling'),
+                    ('NACs', {}, 'nonadiabatic coupling'),
+                    ('to_gpu', {}, 'C/OpenMP backend'),
+                )
+                for method, kwargs, message in calls:
+                    with self.subTest(kind=kind, scanner=scanner,
+                                      method=method, kwargs=kwargs):
+                        with self.assertRaisesRegex(NotImplementedError, message):
+                            getattr(mc, method)(**kwargs)
+
     def test_mc2step_remains_guarded(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)
