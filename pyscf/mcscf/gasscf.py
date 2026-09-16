@@ -697,7 +697,7 @@ def _as_scanner(mc):
     source = mc.copy()
     source.mo_coeff = None if mc.mo_coeff is None else numpy.array(
         mc.mo_coeff, copy=True)
-    source.ci = _copy_ci(mc.ci, _problem_signature(mc))
+    source.ci = _copy_ci(source._resolve_ci_guess(), _problem_signature(source))
     return lib.set_class(
         _GASSCFScanner(source), (_GASSCFScanner, source.__class__),
         source.__class__.__name__ + "Scanner")
@@ -735,7 +735,7 @@ class _GASSCFScanner(lib.SinglePointScanner):
         old_mol = self.mol
         previous_mo = None if self.mo_coeff is None else numpy.array(
             self.mo_coeff, copy=True)
-        guess_ci = _copy_ci(self.ci if ci0 is None else ci0, signature)
+        guess_ci = _copy_ci(self._resolve_ci_guess(ci0), signature)
 
         self.reset(mol)
         self._scf(mol)
@@ -1303,6 +1303,18 @@ class GASSCF(newton_casscf.CASSCF):
     _ci_matches_signature = gasci.GASCI._ci_matches_signature
     _clear_ci_guess = gasci.GASCI._clear_ci_guess
 
+    def _resolve_ci_guess(self, ci0=None):
+        """Use an explicit CI guess or a stored guess with a matching GAS basis."""
+
+        if ci0 is None:
+            if self._ci_matches_signature(self.ci, self._gas_problem_signature()):
+                ci0 = self.ci
+            else:
+                # Also clear self.ci: native CASSCF falls back to this slot
+                # when the explicitly supplied ci0 is None.
+                self._clear_ci_guess()
+        return ci0
+
     def _prepare_fixed_orbital_gasci(
             self, mo_coeff=None, ci0=None, *, validate=False, verbose=None):
         """Resolve MO/CI guesses, validating at public calculation entries.
@@ -1323,13 +1335,7 @@ class GASSCF(newton_casscf.CASSCF):
         self.mo_coeff = mo_coeff
         if validate:
             self.check_sanity()
-        if ci0 is None:
-            if self._ci_matches_signature(self.ci, self._gas_problem_signature()):
-                ci0 = self.ci
-            else:
-                # Also clear self.ci: native CASSCF falls back to this slot
-                # when the explicitly supplied ci0 is None.
-                self._clear_ci_guess()
+        ci0 = self._resolve_ci_guess(ci0)
         self.fcisolver.mol = self.mol
         return mo_coeff, ci0
 
@@ -1691,7 +1697,13 @@ class GASSCF(newton_casscf.CASSCF):
 
 
     def as_scanner(self):
-        """Return an energy-only scanner for a fixed GASSCF objective."""
+        """Return an energy-only scanner for a fixed GASSCF objective.
+
+        Stored CI guesses are copied and reused only when their recorded GAS
+        basis matches the current model. Checkpoint CI has no such metadata;
+        pass it explicitly as ``scanner(mol, ci0=ci)`` when its basis is known
+        to be compatible. Creating a scanner does not change the source CI.
+        """
 
         return _as_scanner(self)
 

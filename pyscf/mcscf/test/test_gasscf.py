@@ -3260,7 +3260,7 @@ class KnownValues(unittest.TestCase):
         mf = scf.RHF(mol).run()
         if getattr(mf, '_chkfile', None) is not None:
             self.addCleanup(mf._chkfile.close)
-        for method in ('gasci', 'kernel', 'get_grad'):
+        for method in ('gasci', 'kernel', 'get_grad', 'scanner'):
             # Both fixed occupations have four determinants, with different
             # meanings; the unrestricted variant changes the vector length.
             for bounds, ndet in (((1, 1), 4), ((0, 2), 9)):
@@ -3275,9 +3275,23 @@ class KnownValues(unittest.TestCase):
                     self.assertEqual(mc.ci.size, 4)
                     old_ci = mc.ci
                     mc.gas_restr = (bounds, (2, 2))
+                    if method == 'scanner':
+                        source = mc
+                        old_signature = source._gas_ci_signature
+                        mc = source.as_scanner()
+                        self.addCleanup(mc.close)
+                        self.assertIsNone(mc.ci)
+                        self.assertIs(source.ci, old_ci)
+                        self.assertEqual(source._gas_ci_signature, old_signature)
                     with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
-                        getattr(mc, method)()
+                        if method == 'scanner':
+                            mc(mol)
+                        else:
+                            getattr(mc, method)()
                     self.assertIsNone(solve.call_args_list[0].kwargs['ci0'])
+                    if method == 'scanner':
+                        self.assertEqual(mc.scan_info['CI_source'], 'native initial guess')
+                        self.assertIs(source.ci, old_ci)
                     self.assertIsNot(mc.ci, old_ci)
                     self.assertEqual(mc.ci.size, ndet)
                     ref = gasci.GASCI(
@@ -3357,16 +3371,82 @@ class KnownValues(unittest.TestCase):
             mc.chk_ci = True
             mc.dump_chk(dict(e_tot=mc.e_tot, e_cas=mc.e_cas, fcivec=mc.ci,
                              mo_coeff=mc.mo_coeff, casdm1=mc.make_gasdm1()))
-            for explicit in (False, True):
-                mc.update_from_chk()
-                self.assertIsNone(mc._gas_ci_signature)
-                loaded_ci = mc.ci
-                self.assertIsNotNone(loaded_ci)
-                with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
-                    mc.kernel(ci0=loaded_ci if explicit else None)
-                self.assertIs(solve.call_args_list[0].kwargs['ci0'],
-                              loaded_ci if explicit else None)
-                self.assertIsNotNone(mc._gas_ci_signature)
+            for entry in ('kernel', 'new-scanner', 'existing-scanner'):
+                for explicit in (False, True):
+                    with self.subTest(entry=entry, explicit=explicit):
+                        target = mc if entry != 'existing-scanner' else mc.as_scanner()
+                        self.addCleanup(target.close)
+                        target.update_from_chk()
+                        self.assertIsNone(target._gas_ci_signature)
+                        loaded_ci = target.ci
+                        self.assertIsNotNone(loaded_ci)
+                        if entry == 'new-scanner':
+                            target = mc.as_scanner()
+                            self.addCleanup(target.close)
+                            self.assertIs(mc.ci, loaded_ci)
+                        with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                            if entry == 'kernel':
+                                target.kernel(ci0=loaded_ci if explicit else None)
+                            else:
+                                target(mol, ci0=loaded_ci if explicit else None)
+                        initial = solve.call_args_list[0].kwargs['ci0']
+                        if explicit:
+                            numpy.testing.assert_array_equal(initial, loaded_ci)
+                            if entry != 'kernel':
+                                self.assertFalse(numpy.shares_memory(initial, loaded_ci))
+                        else:
+                            self.assertIsNone(initial)
+                        if entry != 'kernel':
+                            self.assertEqual(target.scan_info['CI_source'],
+                                             'explicit' if explicit else 'native initial guess')
+                        self.assertIsNotNone(target._gas_ci_signature)
+
+    def test_scanner_reuses_compatible_ci_with_independent_storage(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        moved = mol.set_geom_('H 0 0 0; H 0 0 .8', inplace=False)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for use_df, weights in ((False, None), (True, (.5, .5))):
+            with self.subTest(df=use_df, weights=weights):
+                mc = gasscf.GASSCF(mf, 2, (1, 1), ncore=0)
+                self.addCleanup(mc.close)
+                if use_df:
+                    mc = mc.density_fit().state_average(weights)
+                    self.addCleanup(mc.close)
+                mc.gasci()
+                original_ci = mc.ci
+                original_values = numpy.array(original_ci, copy=True)
+                original_energy = mc.e_tot
+                _, blocks = mc._normalized_restriction()
+                mc.gas_restr, mc.gas_restr_type = blocks, 'spin-supergroup'
+                scanner = mc.as_scanner()
+                self.addCleanup(scanner.close)
+                numpy.testing.assert_array_equal(scanner.ci, original_values)
+                pairs = (zip(original_ci, scanner.ci) if weights is not None
+                         else ((original_ci, scanner.ci),))
+                for left, right in pairs:
+                    self.assertFalse(numpy.shares_memory(left, right))
+                # A second geometry must reuse the newly solved CI as well.
+                for geometry in (mol, moved):
+                    previous_ci = scanner.ci
+                    with mock.patch.object(gasci, 'kernel', wraps=gasci.kernel) as solve:
+                        energy = scanner(geometry)
+                    initial = solve.call_args_list[0].kwargs['ci0']
+                    numpy.testing.assert_array_equal(initial, previous_ci)
+                    pairs = (zip(initial, previous_ci) if weights is not None
+                             else ((initial, previous_ci),))
+                    for left, right in pairs:
+                        self.assertFalse(numpy.shares_memory(left, right))
+                    self.assertEqual(scanner.scan_info['CI_source'], 'previous GAS CI guess')
+                    # A fresh solve at the resulting orbitals is an energy reference.
+                    ref = scanner.copy()
+                    self.addCleanup(ref.close)
+                    ref._clear_ci_guess()
+                    self.assertAlmostEqual(energy, ref.gasci()[0], places=10)
+                self.assertIs(mc.ci, original_ci)
+                numpy.testing.assert_array_equal(mc.ci, original_values)
+                self.assertEqual(mc.e_tot, original_energy)
 
     def test_full_active_gas_as_cas_kernel_without_canonicalization(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
