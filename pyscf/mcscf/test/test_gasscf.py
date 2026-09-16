@@ -31,8 +31,11 @@ import numpy
 import scipy.linalg
 
 from pyscf import ao2mo
+from pyscf import df
+from pyscf import dft
 from pyscf import gto
 from pyscf import lib
+from pyscf import mcscf
 from pyscf import scf
 from pyscf import solvent
 from pyscf.tools import molden
@@ -4389,20 +4392,166 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
         self.assertIsNone(mo_energy)
 
+    def test_scf_inputs_follow_native_casscf_conversion(self):
+        for spin in (0, 2):
+            mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                        basis='sto-3g', spin=spin, verbose=0)
+            nelec = (1 + spin // 2, 1 - spin // 2)
+            for factory in (scf.UHF, dft.UKS):
+                base = factory(mol).run()
+                self.addCleanup(base._chkfile.close)
+                for kind in ('plain', 'df', 'newton', 'df-newton'):
+                    source = base.copy()
+                    if 'df' in kind:
+                        source = source.density_fit(auxbasis='weigend')
+                    if 'newton' in kind:
+                        source = source.newton()
+                    for orbitals in (True, False):
+                        for key in ('mo_coeff', 'mo_occ', 'mo_energy'):
+                            setattr(source, key, getattr(base, key) if orbitals else None)
+                        original = {key: getattr(source, key)
+                                    for key in ('mo_coeff', 'mo_occ', 'mo_energy')}
+                        with self.subTest(spin=spin, scf=factory.__name__,
+                                          kind=kind, orbitals=orbitals):
+                            ref = mcscf.CASSCF(source, 2, nelec)
+                            for constructor in (gasscf.GASSCF, gasscf.DFGASSCF):
+                                mc = constructor(source, 2, nelec)
+                                self.addCleanup(mc.close)
+                                self.assertEqual(type(mc._scf), type(ref._scf))
+                                self.assertIsNot(mc._scf, source)
+                                self.assertEqual(isinstance(mc, mcdf._DFCAS),
+                                                 'df' in kind or
+                                                 constructor is gasscf.DFGASSCF)
+                                for key, value in original.items():
+                                    self.assertIs(getattr(source, key), value)
+                                    expected = getattr(ref._scf, key)
+                                    actual = getattr(mc._scf, key)
+                                    if expected is None:
+                                        self.assertIsNone(actual)
+                                    else:
+                                        numpy.testing.assert_array_equal(actual, expected)
+                                if 'df' in kind:
+                                    self.assertIs(mc.with_df, source.with_df)
+                                if orbitals and kind == 'plain':
+                                    native = (ref if constructor is gasscf.GASSCF
+                                              else mcscf.DFCASSCF(source, 2, nelec))
+                                    expected = native.casci(
+                                        native.mo_coeff, eris=native.ao2mo(native.mo_coeff))[0]
+                                    self.assertAlmostEqual(mc.gasci()[0], expected, places=9)
+
+    def test_df_construction_options_and_molecule_inputs(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        for constructor, native in ((gasscf.GASSCF, mcscf.CASSCF),
+                                    (gasscf.DFGASSCF, mcscf.DFCASSCF)):
+            mc, ref = constructor(mol, 2, (1, 1)), native(mol, 2, (1, 1))
+            self.addCleanup(mc.close)
+            self.addCleanup(mc._scf._chkfile.close)
+            self.addCleanup(ref._scf._chkfile.close)
+            self.assertEqual(type(mc._scf), type(ref._scf))
+            self.assertEqual(isinstance(mc, mcdf._DFCAS), isinstance(ref, mcdf._DFCAS))
+        mf = scf.RHF(mol).density_fit()
+        self.addCleanup(mf._chkfile.close)
+        for kwargs in ({}, {'auxbasis': 'weigend'},
+                       {'with_df': df.DF(mol)},
+                       {'auxbasis': 'weigend', 'with_df': df.DF(mol, 'weigend')}):
+            with self.subTest(options=tuple(kwargs)):
+                mc = gasscf.DFGASSCF(mf, 2, (1, 1), **kwargs)
+                self.addCleanup(mc.close)
+                # Compare the explicit options on an unwrapped native object.
+                ref = mcdf.density_fit(mc1step.CASSCF(mf, 2, (1, 1)), **kwargs)
+                self.assertEqual(mc.with_df.auxbasis, ref.with_df.auxbasis)
+                self.assertIs(mc._scf, mf)
+                if 'with_df' in kwargs:
+                    self.assertIs(mc.with_df, kwargs['with_df'])
+                elif not kwargs:
+                    self.assertIs(mc.with_df, mf.with_df)
+                else:
+                    self.assertIsNot(mc.with_df, mf.with_df)
+        mf.with_df = None
+        mc = gasscf.GASSCF(mf, 2, (1, 1))
+        self.addCleanup(mc.close)
+        self.assertNotIsInstance(mc, mcdf._DFCAS)
+
+    def test_automatic_df_energy_and_orbital_derivative(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).density_fit(auxbasis='weigend').run()
+        self.addCleanup(mf._chkfile.close)
+        mc = gasscf.GASSCF(mf, 2, (1, 1))
+        self.addCleanup(mc.close)
+        ref = mcscf.CASSCF(mf, 2, (1, 1))
+        direction = numpy.random.default_rng(32).normal(size=5)
+        direction /= numpy.linalg.norm(direction)
+        kappa = mc.unpack_uniq_var(direction)
+        mo = mf.mo_coeff @ scipy.linalg.expm(.05 * kappa)
+        energy, _, ci = mc.gasci(mo)[:3]
+        expected = ref.casci(mo, eris=ref.ao2mo(mo))[0]
+        self.assertAlmostEqual(energy, expected, places=10)
+        dm1, dm2 = mc.fcisolver.make_rdm12(ci, 2, (1, 1))
+        analytic = 2 * mc.get_grad(mo, (dm1, dm2)).dot(direction)
+
+        def fixed_ci_energy(orbitals):
+            h1, ecore = mc.get_h1eff(orbitals)
+            h2 = ao2mo.restore(1, mc.get_h2eff(orbitals), 2)
+            return (ecore + numpy.einsum('pq,qp', h1, dm1)
+                    + .5 * numpy.einsum('pqrs,pqrs', h2, dm2))
+
+        for step in (2e-4, 1e-4):
+            plus = mo @ scipy.linalg.expm(step * kappa)
+            minus = mo @ scipy.linalg.expm(-step * kappa)
+            numerical = (fixed_ci_energy(plus) - fixed_ci_energy(minus)) / (2 * step)
+            self.assertAlmostEqual(analytic, numerical, delta=2e-8)
+
+    def test_spinor_scf_references_rejected_before_integrals(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
+        for factory in (scf.GHF, dft.GKS, scf.DHF, dft.DKS):
+            source = factory(mol)
+            self.addCleanup(source._chkfile.close)
+            for constructor in (gasscf.GASSCF, gasscf.DFGASSCF):
+                with self.subTest(scf=factory.__name__, constructor=constructor.__name__):
+                    with self.assertRaisesRegex(NotImplementedError, 'spinor SCF'):
+                        constructor(source, 2, (1, 1))
+            ordinary = scf.RHF(mol)
+            self.addCleanup(ordinary._chkfile.close)
+            mc = gasscf.GASSCF(ordinary, 2, (1, 1))
+            self.addCleanup(mc.close)
+            mc._scf = source
+            with mock.patch.object(mc, 'ao2mo', side_effect=AssertionError('AO2MO')):
+                with self.assertRaisesRegex(NotImplementedError, 'spinor SCF'):
+                    mc.kernel()
+
+        # Native UHF conversion must not erase an unsupported decoration.
+        source = scf.UHF(mol)
+        self.addCleanup(source._chkfile.close)
+        for decorated, message in ((source.sfx2c1e(), 'X2C'),
+                                   (solvent.ddCOSMO(source), 'solvent models')):
+            with mock.patch.object(decorated, 'to_rhf',
+                                   side_effect=AssertionError('SCF conversion')):
+                for constructor in (gasscf.GASSCF, gasscf.DFGASSCF):
+                    with self.assertRaisesRegex(NotImplementedError, message):
+                        constructor(decorated, 2, (1, 1))
+
     def test_dfgasscf_factory_reuses_density_fit_scf_object(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
             basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).density_fit().run()
-        mc = gasscf.DFGASSCF(
-            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=1)
-
-        self.assertIsInstance(mc, gasscf.GASSCF)
-        self.assertIsInstance(mc, mcdf._DFCAS)
-        self.assertIs(mc.with_df, mf.with_df)
-        self.assertEqual(mc.gas_orbs, (2,))
-        self.assertIs(mc.validate_capabilities(), mc)
-        self.assertIsInstance(mc.undo_df(), gasscf.GASSCF)
+        self.addCleanup(mf._chkfile.close)
+        for constructor in (gasscf.GASSCF, gasscf.DFGASSCF):
+            mc = constructor(mf, 2, (1, 1), gas_orbs=(2,), ncore=1)
+            self.addCleanup(mc.close)
+            self.assertIsInstance(mc, gasscf.GASSCF)
+            self.assertIsInstance(mc, mcdf._DFCAS)
+            self.assertIs(mc.with_df, mf.with_df)
+            self.assertEqual(mc.gas_orbs, (2,))
+            self.assertIs(mc.validate_capabilities(), mc)
+            plain = mc.undo_df()
+            self.addCleanup(plain.close)
+            self.assertIsInstance(plain, gasscf.GASSCF)
+            self.assertNotIsInstance(plain, mcdf._DFCAS)
+            self.assertIsNotNone(plain._scf.with_df)
+            self.assertIs(plain.newton(), plain)
+            self.assertNotIsInstance(plain, mcdf._DFCAS)
 
     def test_df_wrappers_own_solver_and_preserve_source_plans(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
@@ -4441,7 +4590,7 @@ class KnownValues(unittest.TestCase):
                     basis='sto-3g', verbose=0)
         moved = mol.set_geom_(
             'H 0 0 0; H 0 0 1.05; H 0 0 1.8; H 0 0 2.6', inplace=False)
-        for kind in ('mc-df', 'shared-df', 'separate-df', 'scf-df'):
+        for kind in ('mc-df', 'shared-df', 'separate-df', 'auto-df'):
             for sa in (False, True):
                 with self.subTest(kind=kind, sa=sa):
                     mf = scf.RHF(mol)
@@ -4452,7 +4601,7 @@ class KnownValues(unittest.TestCase):
                         mf, 2, (1, 1), ncore=1, gas_orbs=(1, 1),
                         gas_restr=((1, 1), (2, 2)),
                         gas_restr_type='cumulative-occ')
-                    if kind != 'scf-df':
+                    if kind != 'auto-df':
                         auxbasis = 'def2-svp-jkfit' if kind == 'separate-df' else 'weigend'
                         mc = mc.density_fit(auxbasis=auxbasis)
                     if sa:

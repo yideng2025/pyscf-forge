@@ -45,6 +45,11 @@ their own CASSCF methods (including gradient constructors); those methods
 are outside the supported GASSCF API. The separate ``approx_hessian``
 wrapper is not supported.
 
+SCF inputs follow the native CASSCF convention: UHF/UKS objects are converted
+with their ``to_rhf()`` method, and active DF-SCF inputs automatically select
+DF-GASSCF. This does not implement unrestricted GASSCF. Generalized and
+relativistic spinor SCF references are not supported.
+
 Use ``kernel()`` for joint Newton orbital optimization. The ``mc1step()``
 entry and its legacy ``rotate_orb_cc``, ``update_casdm`` and ``solve_approx_ci``
 helpers are not supported.
@@ -60,6 +65,8 @@ import numpy
 
 from pyscf import gto
 from pyscf import lib
+from pyscf import scf
+from pyscf.df.df_jk import _DFHF
 from pyscf.lib import logger
 from pyscf.fci import addons as fci_addons
 from pyscf.mcscf import addons
@@ -76,6 +83,16 @@ __all__ = ["GASSCF", "DFGASSCF"]
 
 def _unsupported(feature):
     raise NotImplementedError(feature + " is not implemented for GASSCF")
+
+
+def _check_scf_reference(mf):
+    """Reject unsupported references before conversion or integral work."""
+    if getattr(mf, "with_x2c", None) is not None:
+        _unsupported("X2C")
+    if getattr(mf, "with_solvent", None) is not None:
+        _unsupported("solvent models")
+    if isinstance(mf, (scf.ghf.GHF, scf.dhf.DHF)):
+        _unsupported("generalized or relativistic spinor SCF references")
 
 
 def _nuc_grad_method(self, state=None):
@@ -908,6 +925,24 @@ class GASSCF(newton_casscf.CASSCF):
     def __init__(self, mf, ncas=None, nelecas=None, gas_orbs=None,
                  gas_restr=None, gas_restr_type=None, *, ncore=None, frozen=None,
                  fcisolver=None, cache_plans=None):
+        self._initialize(mf, ncas, nelecas, gas_orbs, gas_restr, gas_restr_type,
+                         ncore=ncore, frozen=frozen, fcisolver=fcisolver,
+                         cache_plans=cache_plans)
+        if isinstance(self._scf, _DFHF) and self._scf.with_df:
+            fitted = self.density_fit()
+            self.__dict__.update(fitted.__dict__)
+            self.__class__ = fitted.__class__
+
+    def _initialize(self, mf, ncas=None, nelecas=None, gas_orbs=None,
+                    gas_restr=None, gas_restr_type=None, *, ncore=None,
+                    frozen=None, fcisolver=None, cache_plans=None):
+        """Initialize the common unwrapped object before selecting DF once."""
+        if isinstance(mf, gto.MoleBase):
+            mf = mf.RHF()
+        _check_scf_reference(mf)
+        if isinstance(mf, scf.uhf.UHF):
+            mf = mf.to_rhf()
+        _check_scf_reference(mf)
         if nelecas is None:
             raise TypeError("GASSCF requires nelecas")
         if ncas is not None:
@@ -1039,10 +1074,8 @@ class GASSCF(newton_casscf.CASSCF):
         or DFGASSCF factory to construct them.
         """
 
-        if getattr(self._scf, "with_x2c", None) is not None:
-            _unsupported("X2C")
-        if (getattr(self, "with_solvent", None) is not None or
-                getattr(self._scf, "with_solvent", None) is not None):
+        _check_scf_reference(self._scf)
+        if getattr(self, "with_solvent", None) is not None:
             _unsupported("solvent models")
         if isinstance(self, mcdf._DFHessianCASSCF):
             _unsupported("density-fitted approximate Hessian")
@@ -1868,10 +1901,16 @@ def DFGASSCF(mf, ncas=None, nelecas=None, gas_orbs=None, gas_restr=None,
 
     This mirrors PySCF's ``DFCASCI/DFCASSCF`` construction style while keeping
     the user-facing GAS interface identical to :class:`GASSCF`.
+    Mole inputs first create a DF-RHF reference. Explicit DF options are
+    applied once, without an intervening automatic DF construction.
     """
 
-    return GASSCF(
+    if isinstance(mf, gto.MoleBase):
+        mf = mf.RHF().density_fit()
+    mc = GASSCF.__new__(GASSCF)
+    mc._initialize(
         mf, ncas, nelecas, gas_orbs=gas_orbs, gas_restr=gas_restr,
         gas_restr_type=gas_restr_type, ncore=ncore,
         frozen=frozen, fcisolver=fcisolver,
-        cache_plans=cache_plans).density_fit(auxbasis=auxbasis, with_df=with_df)
+        cache_plans=cache_plans)
+    return mc.density_fit(auxbasis=auxbasis, with_df=with_df)
