@@ -1523,6 +1523,10 @@ class KnownValues(unittest.TestCase):
             with mock.patch.object(mc, 'casci', side_effect=AssertionError('CI solve')), \
                     mock.patch.object(mc, 'ao2mo',
                                       side_effect=AssertionError('AO2MO')):
+                # Supplying densities and ERIs must not bypass MO validation.
+                with self.assertRaisesRegex(ValueError, 'orthonormal'):
+                    mc.get_grad(mo * 1.01, densities, eris)
+                self.assertIs(mc.mo_coeff, mo)
                 for frozen, extrasym in ((None, None), (1, None),
                                          ([3], [0, 0, 1, 0])):
                     with self.subTest(df=use_df, frozen=frozen, extrasym=extrasym):
@@ -2364,14 +2368,15 @@ class KnownValues(unittest.TestCase):
             if kind == 'sa-df':
                 mc = mc.density_fit()
             self.addCleanup(mc.close)
-            for method in ('gasci', 'kernel'):
+            for method in ('gasci', 'kernel', 'get_grad'):
                 for implicit in (False, True):
                     for mo, error in bad:
                         with self.subTest(kind=kind, method=method,
                                           implicit=implicit, shape=mo.shape):
                             mc.mo_coeff = mo if implicit else mf.mo_coeff
                             with mock.patch.object(mc, 'get_h1eff') as h1, \
-                                    mock.patch.object(mc, 'ao2mo') as ao:
+                                    mock.patch.object(mc, 'ao2mo',
+                                                      side_effect=AssertionError('AO2MO')) as ao:
                                 with self.assertRaises(error):
                                     getattr(mc, method)(None if implicit else mo)
                                 h1.assert_not_called()
@@ -2382,7 +2387,7 @@ class KnownValues(unittest.TestCase):
     def test_public_entries_share_gasci_metric_thresholds(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol).run()
-        for method in ('gasci', 'kernel'):
+        for method in ('gasci', 'kernel', 'get_grad'):
             for sa in (False, True):
                 mc = gasscf.GASSCF(mf, 2, (1, 1))
                 if sa:
@@ -2404,7 +2409,8 @@ class KnownValues(unittest.TestCase):
                                     getattr(mc, method)(mo)
                             else:
                                 result = getattr(mc, method)(mo)
-                                self.assertTrue(numpy.isfinite(result[0]))
+                                value = result if method == 'get_grad' else result[0]
+                                self.assertTrue(numpy.all(numpy.isfinite(value)))
                                 self.assertEqual('WARN: MO orthonormality' in
                                                  mc.stdout.getvalue(), error > 1e-7)
 

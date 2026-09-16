@@ -1284,11 +1284,14 @@ class GASSCF(newton_casscf.CASSCF):
         Twice this vector is the orbital block of the joint Newton gradient.
         As in native CASSCF, omitted densities trigger a fixed-orbital CI solve;
         supplied densities are used directly, including on state-average objects.
+        Explicit or stored orbitals must pass the shared GASCI MO validation,
+        even when densities and ERIs are supplied. Validation precedes AO2MO.
         """
 
         self.validate_capabilities()
         if mo_coeff is None:
             mo_coeff = self.mo_coeff
+        self._check_mo_orthonormality(mo_coeff)
         if eris is None:
             eris = self.ao2mo(mo_coeff)
         if casdm1_casdm2 is None:
