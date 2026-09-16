@@ -842,12 +842,12 @@ class _StateAverageGASSCF(addons.StateAverageMCSCF):
     _finalize = gasci.GASCI._finalize
 
     def undo_state_average(self):
-        self.close()
-        result = super().undo_state_average()
+        """Return a single-state copy with independent GAS/SCF/DF resources."""
+
+        source = self.copy()
+        result = addons.StateAverageMCSCF.undo_state_average(source)
         gasci._clear_energy_results(result)
         result.fcisolver.nroots = 1
-        result.fcisolver._init_plan_cache()
-        result.fcisolver.mol = result.mol
         return result
 
 

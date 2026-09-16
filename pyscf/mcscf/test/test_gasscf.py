@@ -3721,11 +3721,24 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(sa.gas_orbs, (2,))
         self.assertIs(sa.validate_capabilities(), sa)
 
+        self.addCleanup(mc.close)
+        self.addCleanup(sa.close)
+        self.addCleanup(mf._chkfile.close)
+        plan = sa.fcisolver._get_rdm_plan(2, (1, 1))
         undone = sa.undo_state_average()
+        self.addCleanup(undone.close)
         self.assertIsInstance(undone, gasscf.GASSCF)
         self.assertNotIsInstance(undone, addons.StateAverageMCSCF)
         self.assertEqual(undone.fcisolver.nroots, 1)
         self.assertIs(undone.validate_capabilities(), undone)
+        self.assertIsNotNone(plan._plan)
+        # The trailing-underscore operation still releases the replaced owner.
+        old_solver = sa.fcisolver
+        self.assertIs(sa.state_average_((.3, .7)), sa)
+        self.assertIsNone(plan._plan)
+        self.assertIsNot(sa.fcisolver, old_solver)
+        self.assertEqual(sa.weights, (.3, .7))
+        self.assertIsNone(sa.fcisolver._rdm_plan)
 
     def test_state_average_rejects_invalid_weights_and_wfnsym(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -4598,23 +4611,24 @@ class KnownValues(unittest.TestCase):
                 fitted.close()
                 self.assertIsNotNone(plan._plan)
 
-    def test_df_copy_and_scanner_leave_source_geometry_and_energy_unchanged(self):
+    def test_derived_objects_preserve_source_resources_geometry_and_energy(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
                     basis='sto-3g', verbose=0)
         moved = mol.set_geom_(
             'H 0 0 0; H 0 0 1.05; H 0 0 1.8; H 0 0 2.6', inplace=False)
-        for kind in ('mc-df', 'shared-df', 'separate-df', 'auto-df'):
+        for kind in ('plain', 'mc-df', 'shared-df', 'separate-df', 'auto-df'):
             for sa in (False, True):
                 with self.subTest(kind=kind, sa=sa):
                     mf = scf.RHF(mol)
-                    if kind != 'mc-df':
+                    if kind not in ('plain', 'mc-df'):
                         mf = mf.density_fit(auxbasis='weigend')
                     mf.run()
+                    self.addCleanup(mf._chkfile.close)
                     mc = gasscf.GASSCF(
                         mf, 2, (1, 1), ncore=1, gas_orbs=(1, 1),
                         gas_restr=((1, 1), (2, 2)),
                         gas_restr_type='cumulative-occ')
-                    if kind != 'auto-df':
+                    if kind not in ('plain', 'auto-df'):
                         auxbasis = 'def2-svp-jkfit' if kind == 'separate-df' else 'weigend'
                         mc = mc.density_fit(auxbasis=auxbasis)
                     if sa:
@@ -4624,9 +4638,27 @@ class KnownValues(unittest.TestCase):
                     source_df = getattr(mc, 'with_df', None)
                     source_scf_df = getattr(mc._scf, 'with_df', None)
                     source_cderi = None if source_df is None else source_df._cderi
-                    for factory in (mc.copy, mc.as_scanner):
+                    solver = mc.fcisolver
+                    rdm = solver._get_rdm_plan(mc.ncas, mc.nelecas)
+                    contract = solver._get_contract_plan(numpy.eye(3), mc.ncas, mc.nelecas)
+                    spin = solver._get_spin_plan(mc.ncas, mc.nelecas)
+                    factories = [mc.copy, mc.as_scanner]
+                    if sa:
+                        factories += [mc.undo_state_average,
+                                      lambda: mc.state_average((.3, .7))]
+                    for factory in factories:
                         copied = factory()
                         self.addCleanup(copied.close)
+                        self.assertIsNot(copied.fcisolver, solver)
+                        self.assertIsNone(copied.fcisolver._rdm_plan)
+                        self.assertIsNone(copied.fcisolver._contract_space)
+                        self.assertIsNone(copied.fcisolver._spin_plan)
+                        self.assertIsNotNone(rdm._plan)
+                        self.assertIsNotNone(contract._plan)
+                        self.assertIs(solver._spin_plan, spin)
+                        if sa:
+                            self.assertEqual(mc.weights, (.5, .5))
+                            self.assertEqual(mc.fcisolver.nroots, 2)
                         self.assertIsNot(copied._scf, mc._scf)
                         if source_df is not None:
                             self.assertIsNot(copied.with_df, source_df)
@@ -4647,16 +4679,24 @@ class KnownValues(unittest.TestCase):
                         if source_scf_df is not None:
                             self.assertIs(source_scf_df.mol, mol)
                             self.assertIs(copied._scf.with_df.mol, moved)
+                        copied.close()
+                        copied.close()
+                        self.assertIsNotNone(rdm._plan)
+                        self.assertIsNotNone(contract._plan)
                         self.assertAlmostEqual(mc.gasci()[0], before, places=11)
 
     def test_df_copies_do_not_overwrite_source_integral_files(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         moved = mol.set_geom_('H 0 0 0; H 0 0 1.05', inplace=False)
         mf = scf.RHF(mol).run()
-        for storage in ('named', 'temporary'):
-            with self.subTest(storage=storage), ExitStack() as files:
+        self.addCleanup(mf._chkfile.close)
+        for storage, sa in (('named', False), ('temporary', False),
+                            ('named', True), ('temporary', True)):
+            with self.subTest(storage=storage, sa=sa), ExitStack() as files:
                 tmp = files.enter_context(tempfile.TemporaryDirectory())
                 mc = gasscf.GASSCF(mf, 2, (1, 1)).density_fit(auxbasis='weigend')
+                if sa:
+                    mc = mc.state_average((.5, .5))
                 self.addCleanup(mc.close)
                 source_df = mc.with_df
                 source_df.max_memory = 0
@@ -4668,7 +4708,11 @@ class KnownValues(unittest.TestCase):
                 before = mc.gasci()[0]
                 source_path = Path(target if storage == 'named' else target.name)
                 contents = source_path.read_bytes()
-                for factory in (mc.copy, mc.as_scanner):
+                factories = [mc.copy, mc.as_scanner]
+                if sa:
+                    factories += [mc.undo_state_average,
+                                  lambda: mc.state_average((.3, .7))]
+                for factory in factories:
                     copied = factory()
                     self.addCleanup(copied.close)
                     self.assertIsNone(copied.with_df._cderi)
