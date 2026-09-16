@@ -163,6 +163,87 @@ class TestGASRestrictions(unittest.TestCase):
 
 class TestGASFCISolver(unittest.TestCase):
 
+    def test_borrowed_rdm_plan_matches_full_fci_transitions(self):
+        solver = fci_gas.FCISolver(
+            gas_orbs=(1, 2), gas_restr=((0, 1), (2, 2)),
+            gas_restr_type='cumulative-occ')
+        norb, nelec = 3, (1, 1)
+        with solver.make_rdm_plan(norb, nelec) as plan:
+            rng = numpy.random.default_rng(902)
+            bra, ket = rng.normal(size=(2, plan.ndet))
+            bra /= numpy.linalg.norm(bra)
+            ket /= numpy.linalg.norm(ket)
+            full_bra = fci_gas.gas2fci(bra, plan.gas)
+            full_ket = fci_gas.gas2fci(ket, plan.gas)
+            methods = ('make_rdm1', 'make_rdm1s', 'make_rdm12',
+                       'make_rdm12s', 'trans_rdm1', 'trans_rdm1s',
+                       'trans_rdm12', 'trans_rdm12s')
+            def compare(actual, expected):
+                if isinstance(expected, tuple):
+                    self.assertEqual(len(actual), len(expected))
+                    for a, e in zip(actual, expected):
+                        compare(a, e)
+                else:
+                    numpy.testing.assert_allclose(actual, expected,
+                                                  atol=1e-12, rtol=0)
+            with mock.patch.object(solver, 'make_rdm_plan',
+                                   side_effect=AssertionError('borrowed plan replaced')):
+                for method in methods:
+                    args = (bra, ket) if method.startswith('trans') else (ket,)
+                    full = ((full_bra, full_ket) if method.startswith('trans')
+                            else (full_ket,))
+                    with self.subTest(method=method):
+                        expected = getattr(direct_spin1, method)(*full, norb, nelec)
+                        compare(getattr(solver, method)(*args, norb, nelec, plan=plan),
+                                expected)
+                        self.assertIsNotNone(plan._plan)
+                compare(solver.make_rdm2(ket, norb, nelec, plan=plan),
+                        direct_spin1.make_rdm12(full_ket, norb, nelec)[1])
+                # A failed execution also leaves the borrowed plan reusable.
+                with self.assertRaisesRegex(ValueError, 'CI vector size'):
+                    solver.make_rdm12(ket[:-1], norb, nelec, plan=plan)
+                self.assertIsNotNone(plan._plan)
+                compare(solver.trans_rdm12s(bra, ket, norb, nelec, plan=plan),
+                        direct_spin1.trans_rdm12s(full_bra, full_ket, norb, nelec))
+        self.assertIsNone(plan._plan)
+        self.assertIsNone(plan.gas)
+
+    def test_rdm_plan_validation_and_temporary_lifetime(self):
+        solver = fci_gas.FCISolver(gas_orbs=(1, 2),
+                                  gas_restr=((1, 0, 0, 1),))
+        opposite = fci_gas.FCISolver(gas_orbs=(1, 2),
+                                    gas_restr=((0, 1, 1, 0),))
+        ci = numpy.ones(2) / numpy.sqrt(2)
+        with opposite.make_rdm_plan(3, (1, 1)) as wrong:
+            # Same norb, electron counts and ndet, but different determinants.
+            self.assertEqual(wrong.ndet, ci.size)
+            with self.assertRaisesRegex(ValueError, 'GAS space'):
+                solver.make_rdm1(ci, 3, (1, 1), plan=wrong)
+            self.assertIsNotNone(wrong._plan)
+        with self.assertRaisesRegex(RuntimeError, 'closed'):
+            solver.make_rdm1(ci, 3, (1, 1), plan=wrong)
+        with self.assertRaisesRegex(TypeError, 'GasRDMPlan'):
+            solver.make_rdm1(ci, 3, (1, 1), plan=object())
+
+        original = solver.make_rdm_plan
+        created = []
+        def create(*args):
+            plan = original(*args)
+            created.append(plan)
+            return plan
+        with mock.patch.object(solver, 'make_rdm_plan', side_effect=create):
+            solver.make_rdm12(ci, 3, (1, 1))
+            with self.assertRaisesRegex(ValueError, 'CI vector size'):
+                solver.trans_rdm12s(ci[:-1], ci, 3, (1, 1))
+            self.assertEqual(len(created), 2)
+            for plan in created:
+                self.assertIsNone(plan._plan)
+                self.assertIsNone(plan.gas)
+            with self.assertRaises(NotImplementedError):
+                solver.make_rdm12(ci, 3, (1, 1), reorder=False)
+            self.assertEqual(len(created), 2)
+
+
     @classmethod
     def setUpClass(cls):
         cls.norb = 4

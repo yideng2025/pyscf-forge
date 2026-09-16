@@ -356,6 +356,13 @@ class _GASFCISolver(fci_gas.FCISolver):
             self._rdm_plan = self.make_rdm_plan(norb, nelec)
         return self._rdm_plan
 
+    def _rdm_plan_context(self, norb, nelec, plan=None):
+        """Supply an owned cache entry or let GASCI manage a temporary plan."""
+
+        if plan is None and self.cache_plans:
+            plan = self._get_rdm_plan(norb, nelec)
+        return super()._rdm_plan_context(norb, nelec, plan)
+
     def _get_spin_plan(self, norb, nelec):
         """Return a Newton-owned independent ``S^2`` contraction plan."""
 
@@ -372,17 +379,14 @@ class _GASFCISolver(fci_gas.FCISolver):
         ``self`` is still the decorated state-average object.  The GASCI base
         implementation computes spin from ``self.make_rdm12s``; on a decorated
         object that name resolves back to the state-average wrapper and can
-        incorrectly split a single GAS CI vector into scalar elements.  Build
-        the spin-resolved RDMs directly from a Newton-owned GAS RDM plan here.
+        incorrectly split a single GAS CI vector into scalar elements.  Call
+        the GASCI base RDM method directly; the plan-context hook supplies
+        either a Newton-owned cached plan or a temporary plan.
         """
 
         ci = self._as_state_specific_ci(ci)
         nelec = fci_addons._unpack_nelec(nelec, self.spin)
-        if self.cache_plans:
-            rdm1s, rdm2s = self._get_rdm_plan(norb, nelec).make_rdm12s(ci, ci)
-        else:
-            with self.make_rdm_plan(norb, nelec) as plan:
-                rdm1s, rdm2s = plan.make_rdm12s(ci, ci)
+        rdm1s, rdm2s = super().make_rdm12s(ci, norb, nelec)
         return fci_gas.spin_square_from_rdm12s(rdm1s, rdm2s, nelec)
 
 
@@ -422,7 +426,9 @@ class _GASFCISolver(fci_gas.FCISolver):
             return super().contract_2e(
                 eri, fcivec, norb, nelec, link_index,
                 *args, compress_links=compress_links, **kwargs)
-        return self._get_contract_plan(eri, norb, nelec).contract(fcivec)
+        plan = self._get_contract_plan(eri, norb, nelec)
+        return super().contract_2e(
+            eri, fcivec, norb, nelec, link_index, plan=plan)
 
     @staticmethod
     def _as_state_specific_ci(ci):
@@ -441,78 +447,57 @@ class _GASFCISolver(fci_gas.FCISolver):
             return ci[0]
         return ci
 
-    def make_rdm1s(self, ci, norb, nelec, link_index=None):
+    def make_rdm1s(self, ci, norb, nelec, link_index=None, *, plan=None):
         ci = self._as_state_specific_ci(ci)
-        return self.trans_rdm1s(ci, ci, norb, nelec, link_index)
+        return super().make_rdm1s(
+            ci, norb, nelec, link_index, plan=plan)
 
-    def make_rdm1(self, ci, norb, nelec, link_index=None):
+    def make_rdm1(self, ci, norb, nelec, link_index=None, *, plan=None):
         ci = self._as_state_specific_ci(ci)
-        return self.trans_rdm1(ci, ci, norb, nelec, link_index)
+        return super().make_rdm1(
+            ci, norb, nelec, link_index, plan=plan)
 
-    def make_rdm12s(self, ci, norb, nelec, link_index=None, reorder=True):
+    def make_rdm12s(self, ci, norb, nelec, link_index=None,
+                    reorder=True, *, plan=None):
         ci = self._as_state_specific_ci(ci)
-        if not reorder:
-            raise NotImplementedError("reorder=False is not supported")
-        if not self.cache_plans:
-            return super().make_rdm12s(
-                ci, norb, nelec, link_index=link_index, reorder=reorder)
-        return self._get_rdm_plan(norb, nelec).make_rdm12s(ci, ci)
+        return super().make_rdm12s(
+            ci, norb, nelec, link_index, reorder, plan=plan)
 
-    def make_rdm12(self, ci, norb, nelec, link_index=None, reorder=True):
+    def make_rdm12(self, ci, norb, nelec, link_index=None,
+                   reorder=True, *, plan=None):
         ci = self._as_state_specific_ci(ci)
-        if not reorder:
-            raise NotImplementedError("reorder=False is not supported")
-        if not self.cache_plans:
-            return super().make_rdm12(
-                ci, norb, nelec, link_index=link_index, reorder=reorder)
-        return self._get_rdm_plan(norb, nelec).make_rdm12(ci, ci)
+        return super().make_rdm12(
+            ci, norb, nelec, link_index, reorder, plan=plan)
 
-    def make_rdm2(self, ci, norb, nelec, link_index=None, reorder=True):
-        return self.make_rdm12(ci, norb, nelec, link_index, reorder)[1]
+    make_rdm2 = fci_gas.FCISolver.make_rdm2
 
-    def trans_rdm1s(self, cibra, ciket, norb, nelec, link_index=None):
+    def trans_rdm1s(self, cibra, ciket, norb, nelec, link_index=None,
+                    *, plan=None):
         cibra = self._as_state_specific_ci(cibra)
         ciket = self._as_state_specific_ci(ciket)
-        if not self.cache_plans:
-            return super().trans_rdm1s(
-                cibra, ciket, norb, nelec, link_index=link_index)
-        return self._get_rdm_plan(norb, nelec).make_rdm1s(cibra, ciket)
+        return super().trans_rdm1s(
+            cibra, ciket, norb, nelec, link_index, plan=plan)
 
-    def trans_rdm1(self, cibra, ciket, norb, nelec, link_index=None):
+    def trans_rdm1(self, cibra, ciket, norb, nelec, link_index=None,
+                   *, plan=None):
         cibra = self._as_state_specific_ci(cibra)
         ciket = self._as_state_specific_ci(ciket)
-        if not self.cache_plans:
-            return super().trans_rdm1(
-                cibra, ciket, norb, nelec, link_index=link_index)
-        return self._get_rdm_plan(norb, nelec).make_rdm1(cibra, ciket)
+        return super().trans_rdm1(
+            cibra, ciket, norb, nelec, link_index, plan=plan)
 
     def trans_rdm12s(self, cibra, ciket, norb, nelec, link_index=None,
-                     reorder=True):
+                     reorder=True, *, plan=None):
         cibra = self._as_state_specific_ci(cibra)
         ciket = self._as_state_specific_ci(ciket)
-        if not reorder:
-            raise NotImplementedError("reorder=False is not supported")
-        if not self.cache_plans:
-            return super().trans_rdm12s(
-                cibra, ciket, norb, nelec,
-                link_index=link_index, reorder=reorder)
-        plan = self._get_rdm_plan(norb, nelec)
-        dm1s, (dm2aa, dm2ab, dm2bb) = plan.make_rdm12s(cibra, ciket)
-        _, (_, dm2ba_ji, _) = plan.make_rdm12s(ciket, cibra)
-        dm2ba = dm2ba_ji.transpose(3, 2, 1, 0)
-        return dm1s, (dm2aa, dm2ab, dm2ba, dm2bb)
+        return super().trans_rdm12s(
+            cibra, ciket, norb, nelec, link_index, reorder, plan=plan)
 
     def trans_rdm12(self, cibra, ciket, norb, nelec, link_index=None,
-                    reorder=True):
+                    reorder=True, *, plan=None):
         cibra = self._as_state_specific_ci(cibra)
         ciket = self._as_state_specific_ci(ciket)
-        if not reorder:
-            raise NotImplementedError("reorder=False is not supported")
-        if not self.cache_plans:
-            return super().trans_rdm12(
-                cibra, ciket, norb, nelec,
-                link_index=link_index, reorder=reorder)
-        return self._get_rdm_plan(norb, nelec).make_rdm12(cibra, ciket)
+        return super().trans_rdm12(
+            cibra, ciket, norb, nelec, link_index, reorder, plan=plan)
 
     def contract_ss(self, fcivec, norb, nelec):
         """Contract ``S^2`` with a GAS CI vector, reusing a spin plan."""

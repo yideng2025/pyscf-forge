@@ -1104,6 +1104,131 @@ N2_GASSCF_MO_COEFF = numpy.asarray([
 ], dtype=numpy.float64).reshape((62, 62))
 
 class KnownValues(unittest.TestCase):
+
+    def test_cached_rdm_dispatch_matches_full_fci_for_ss_and_sa(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol)
+        norb, nelec = 3, (1, 1)
+        def compare(actual, expected):
+            if isinstance(expected, tuple):
+                self.assertEqual(len(actual), len(expected))
+                for a, e in zip(actual, expected):
+                    compare(a, e)
+            else:
+                numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+        for cache in (False, True):
+            for weights in (None, (.3, .7), (1., 0.)):
+                mc = gasscf.GASSCF(
+                    mf, norb, nelec, ncore=1, gas_orbs=(1, 2),
+                    gas_restr=((0, 1), (2, 2)), gas_restr_type='cumulative-occ',
+                    cache_plans=cache)
+                if weights is not None:
+                    mc = mc.state_average(weights)
+                self.addCleanup(mc.close)
+                solver = mc.fcisolver
+                with solver.make_space(norb, nelec) as space:
+                    rng = numpy.random.default_rng(903)
+                    roots = list(numpy.linalg.qr(rng.normal(size=(space.ndet, 2)))[0].T)
+                    full = [fci_gas.gas2fci(c, space) for c in roots]
+                base = (solver if weights is None else
+                        super(addons.StateAverageFCISolver, solver))
+                with self.subTest(cache=cache, weights=weights):
+                    for method in ('make_rdm1', 'make_rdm1s', 'make_rdm12',
+                                   'make_rdm12s', 'trans_rdm1', 'trans_rdm1s',
+                                   'trans_rdm12', 'trans_rdm12s'):
+                        transition = method.startswith('trans')
+                        args = tuple(full) if transition else (full[0],)
+                        expected = getattr(direct_spin1, method)(*args, norb, nelec)
+                        # Native Newton may supply single-root CI lists.
+                        args = tuple([c] for c in roots) if transition else ([roots[0]],)
+                        compare(getattr(base, method)(*args, norb, nelec), expected)
+                    expected_spin = [spin_op.spin_square(c, norb, nelec) for c in full]
+                    compare(base.spin_square(roots[0], norb, nelec), expected_spin[0])
+                    if weights is not None:
+                        expected = [direct_spin1.make_rdm12s(c, norb, nelec) for c in full]
+                        dm1s, dm2s = solver.make_rdm12s(roots, norb, nelec)
+                        for s in range(2):
+                            compare(dm1s[s], sum(w*d[0][s] for w, d in zip(weights, expected)))
+                        for s in range(3):
+                            compare(dm2s[s], sum(w*d[1][s] for w, d in zip(weights, expected)))
+                        compare(solver.make_rdm2(roots, norb, nelec),
+                                sum(w*direct_spin1.make_rdm12(c, norb, nelec)[1]
+                                    for w, c in zip(weights, full)))
+                        compare(solver.spin_square(roots, norb, nelec),
+                                tuple(numpy.asarray(weights) @ numpy.asarray(expected_spin)))
+                    plan = solver._rdm_plan
+                    if cache:
+                        self.assertIsNotNone(plan)
+                        base.make_rdm12(roots[0], norb, nelec)
+                        self.assertIs(solver._rdm_plan, plan)
+                        with self.assertRaises(ValueError):
+                            base.make_rdm12(roots[0][:-1], norb, nelec)
+                        self.assertIsNotNone(plan._plan)
+                        mc.close()
+                        self.assertIsNone(plan._plan)
+                        self.assertIsNone(plan.gas)
+                    else:
+                        self.assertIsNone(plan)
+
+    def test_external_rdm_plan_bypasses_and_survives_newton_cache(self):
+        solver = gasscf._GASFCISolver(gas_orbs=(2,))
+        self.addCleanup(solver.close)
+        ci = numpy.array([.5, .5, .5, .5])
+        reference = fci_gas.FCISolver(gas_orbs=(2,))
+        with reference.make_rdm_plan(2, (1, 1)) as external:
+            for cache in (False, True):
+                solver.cache_plans = cache
+                with mock.patch.object(solver, '_get_rdm_plan',
+                                       side_effect=AssertionError('borrowed plan cached')):
+                    actual = solver.make_rdm1(ci, 2, (1, 1), plan=external)
+                    numpy.testing.assert_allclose(
+                        actual, direct_spin1.make_rdm1(ci.reshape(2, 2), 2, (1, 1)),
+                        atol=1e-12, rtol=0)
+                    with self.assertRaises(ValueError):
+                        solver.make_rdm12(ci[:-1], 2, (1, 1), plan=external)
+                self.assertIsNone(solver._rdm_plan)
+                solver.close()
+                self.assertIsNotNone(external._plan)
+            # A populated owned cache also survives an external-plan call.
+            solver.make_rdm1(ci, 2, (1, 1))
+            owned = solver._rdm_plan
+            solver.make_rdm12(ci, 2, (1, 1), plan=external)
+            self.assertIs(solver._rdm_plan, owned)
+            solver.close()
+            self.assertIsNone(owned._plan)
+            self.assertIsNotNone(external._plan)
+
+    def test_cached_contraction_uses_base_entry_and_physical_operator(self):
+        solver = gasscf._GASFCISolver(
+            gas_orbs=(1, 2), gas_restr=((0, 1), (2, 2)),
+            gas_restr_type='cumulative-occ')
+        self.addCleanup(solver.close)
+        solver.ss_penalty, solver.ss_value = .2, 0.
+        rng = numpy.random.default_rng(904)
+        eri = rng.normal(size=(6, 6))
+        eri += eri.T
+        with solver.make_space(3, (1, 1)) as space:
+            ci = rng.normal(size=space.ndet)
+            full = fci_gas.gas2fci(ci, space)
+            expected = fci_gas.fci2gas(
+                direct_spin1.contract_2e(eri, full, 3, (1, 1)), space)
+        original = fci_gas.FCISolver.contract_2e
+        seen = []
+        def contract(obj, *args, **kwargs):
+            seen.append(kwargs.get('plan'))
+            return original(obj, *args, **kwargs)
+        with mock.patch.object(fci_gas.FCISolver, 'contract_2e', new=contract):
+            for cache in (True, False):
+                solver.cache_plans = cache
+                for _ in range(2):
+                    numpy.testing.assert_allclose(solver.contract_2e(eri, ci, 3, (1, 1)),
+                                                  expected, atol=1e-12, rtol=0)
+        self.assertEqual(len(seen), 4)
+        self.assertIsInstance(seen[0], fci_gas.GasContractPlan)
+        self.assertIs(seen[0], seen[1])
+        self.assertEqual(seen[2:], [None, None])
+
     def test_constructor_gasci_argument_order(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol)

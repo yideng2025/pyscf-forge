@@ -18,6 +18,7 @@
 
 """GAS-aware FCISolver bindings for the frozen GAS FCI C kernels."""
 
+from contextlib import nullcontext
 import ctypes
 
 import numpy
@@ -759,6 +760,11 @@ class FCISolver(direct_spin1.FCISolver):
     The Davidson driver and its convergence controls follow
     :class:`pyscf.fci.direct_spin1.FCISolver`.  CI vectors are one-dimensional
     arrays in canonical GAS block order rather than rectangular CAS arrays.
+
+    RDM methods accept an optional keyword-only ``plan`` created by
+    :meth:`make_rdm_plan`. Such plans are borrowed, not closed by the method.
+    Without a supplied plan, the base solver creates and closes a temporary
+    plan for each call; the GASSCF adapter may provide an owned cache entry.
     """
 
     _keys = direct_spin1.FCISolver._keys | {
@@ -821,6 +827,26 @@ class FCISolver(direct_spin1.FCISolver):
         """Construct a reusable :class:`GasRDMPlan` context manager."""
 
         return GasRDMPlan(self, norb, nelec)
+
+    def _rdm_plan_context(self, norb, nelec, plan=None):
+        """Own a temporary RDM plan, or borrow an explicitly supplied plan.
+
+        RDM methods accept keyword-only ``plan=``. Borrowed plans remain open
+        on both success and failure; the caller controls their lifetime.
+        """
+
+        if plan is None:
+            return self.make_rdm_plan(norb, nelec)
+        if not isinstance(plan, GasRDMPlan):
+            raise TypeError("plan must be a GasRDMPlan")
+        if plan._plan is None or plan.gas is None:
+            raise RuntimeError("RDM plan is closed")
+        gas_orbs, expected_nelec, blocks = self._space_spec(norb, nelec)
+        if (tuple(gas_orbs) != plan.gas.norb or
+                tuple(expected_nelec) != tuple(plan.gas.nelec) or
+                not numpy.array_equal(blocks, plan.gas.blocks)):
+            raise ValueError("RDM plan does not match the GAS space")
+        return nullcontext(plan)
 
     def make_spin_plan(self, norb, nelec):
         """Construct an independent reusable ``S^2`` contraction plan.
@@ -1364,48 +1390,53 @@ class FCISolver(direct_spin1.FCISolver):
         return self.eci, self.ci
 
     @pyscf_lib.with_doc(direct_spin1.make_rdm1s.__doc__)
-    def make_rdm1s(self, ci, norb, nelec, link_index=None):
-        return self.trans_rdm1s(ci, ci, norb, nelec, link_index)
+    def make_rdm1s(self, ci, norb, nelec, link_index=None, *, plan=None):
+        return self.trans_rdm1s(ci, ci, norb, nelec, link_index, plan=plan)
 
     @pyscf_lib.with_doc(direct_spin1.make_rdm1.__doc__)
-    def make_rdm1(self, ci, norb, nelec, link_index=None):
-        return self.trans_rdm1(ci, ci, norb, nelec, link_index)
+    def make_rdm1(self, ci, norb, nelec, link_index=None, *, plan=None):
+        return self.trans_rdm1(ci, ci, norb, nelec, link_index, plan=plan)
 
     @pyscf_lib.with_doc(direct_spin1.make_rdm12s.__doc__)
-    def make_rdm12s(self, ci, norb, nelec, link_index=None, reorder=True):
+    def make_rdm12s(self, ci, norb, nelec, link_index=None,
+                    reorder=True, *, plan=None):
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
-        with self.make_rdm_plan(norb, nelec) as plan:
+        with self._rdm_plan_context(norb, nelec, plan) as plan:
             return plan.make_rdm12s(ci, ci)
 
     @pyscf_lib.with_doc(direct_spin1.make_rdm12.__doc__)
-    def make_rdm12(self, ci, norb, nelec, link_index=None, reorder=True):
+    def make_rdm12(self, ci, norb, nelec, link_index=None,
+                   reorder=True, *, plan=None):
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
-        with self.make_rdm_plan(norb, nelec) as plan:
+        with self._rdm_plan_context(norb, nelec, plan) as plan:
             return plan.make_rdm12(ci, ci)
 
-    def make_rdm2(self, ci, norb, nelec, link_index=None, reorder=True):
+    def make_rdm2(self, ci, norb, nelec, link_index=None,
+                  reorder=True, *, plan=None):
         """Return the spin-traced GAS two-particle density matrix."""
 
-        return self.make_rdm12(ci, norb, nelec, link_index, reorder)[1]
+        return self.make_rdm12(ci, norb, nelec, link_index, reorder, plan=plan)[1]
 
     @pyscf_lib.with_doc(direct_spin1.trans_rdm1s.__doc__)
-    def trans_rdm1s(self, cibra, ciket, norb, nelec, link_index=None):
-        with self.make_rdm_plan(norb, nelec) as plan:
+    def trans_rdm1s(self, cibra, ciket, norb, nelec, link_index=None,
+                    *, plan=None):
+        with self._rdm_plan_context(norb, nelec, plan) as plan:
             return plan.make_rdm1s(cibra, ciket)
 
     @pyscf_lib.with_doc(direct_spin1.trans_rdm1.__doc__)
-    def trans_rdm1(self, cibra, ciket, norb, nelec, link_index=None):
-        with self.make_rdm_plan(norb, nelec) as plan:
+    def trans_rdm1(self, cibra, ciket, norb, nelec, link_index=None,
+                   *, plan=None):
+        with self._rdm_plan_context(norb, nelec, plan) as plan:
             return plan.make_rdm1(cibra, ciket)
 
     @pyscf_lib.with_doc(direct_spin1.trans_rdm12s.__doc__)
     def trans_rdm12s(self, cibra, ciket, norb, nelec, link_index=None,
-                     reorder=True):
+                     reorder=True, *, plan=None):
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
-        with self.make_rdm_plan(norb, nelec) as plan:
+        with self._rdm_plan_context(norb, nelec, plan) as plan:
             dm1s, (dm2aa, dm2ab, dm2bb) = plan.make_rdm12s(cibra, ciket)
             _, (_, dm2ba_ji, _) = plan.make_rdm12s(ciket, cibra)
         dm2ba = dm2ba_ji.transpose(3, 2, 1, 0)
@@ -1413,10 +1444,10 @@ class FCISolver(direct_spin1.FCISolver):
 
     @pyscf_lib.with_doc(direct_spin1.trans_rdm12.__doc__)
     def trans_rdm12(self, cibra, ciket, norb, nelec, link_index=None,
-                    reorder=True):
+                    reorder=True, *, plan=None):
         if not reorder:
             raise NotImplementedError("reorder=False is not supported")
-        with self.make_rdm_plan(norb, nelec) as plan:
+        with self._rdm_plan_context(norb, nelec, plan) as plan:
             return plan.make_rdm12(cibra, ciket)
 
     def spin_square(self, ci, norb, nelec, *args, **kwargs):
