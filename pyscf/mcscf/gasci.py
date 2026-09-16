@@ -1087,7 +1087,8 @@ class GASCI(casci.CASCI):
             raise ValueError("mo_coeff does not contain the complete GAS space")
         if rotation.shape != (self.ncas, self.ncas):
             raise ValueError("GAS orbital rotation has an invalid shape")
-        mo_natorb = mo_coeff.copy()
+        mo_natorb = numpy.array(
+            mo_coeff, dtype=numpy.result_type(mo_coeff, rotation), copy=True)
         gas = slice(self.ncore, self.ncore + self.ncas)
         mo_natorb[:, gas] = numpy.dot(mo_coeff[:, gas], rotation)
         return mo_natorb
@@ -1100,6 +1101,8 @@ class GASCI(casci.CASCI):
         diagonalized.  For a restricted GAS, the resulting orbitals can mix
         different GAS subspaces and are therefore analysis orbitals only.
         This method never modifies ``mo_coeff`` or transforms the CI vector.
+        The returned array preserves the eigenvectors' numeric dtype; complex
+        analysis orbitals cannot be used by the real-valued GAS solver.
         """
 
         if gasdm1 is None and state is None:
@@ -1149,7 +1152,8 @@ class GASCI(casci.CASCI):
 
         gas_orbs = ((self.ncas,) if self.gas_orbs is None else
                     tuple(int(value) for value in self.gas_orbs))
-        rotation = numpy.zeros_like(gasdm1)
+        rotation = numpy.zeros_like(
+            gasdm1, dtype=numpy.result_type(gasdm1, numpy.float64))
         occupations = []
         offset = 0
         for size in gas_orbs:

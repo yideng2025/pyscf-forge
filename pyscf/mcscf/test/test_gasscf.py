@@ -2857,6 +2857,54 @@ class KnownValues(unittest.TestCase):
         _, ref_occ = ref.get_gas_pseudo_natorb(state=1)
         self._assert_property_close(occupations, ref_occ)
 
+    def test_analysis_orbitals_preserve_eigenvector_dtype(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6; '
+                        'H 0 0 3.7; H 0 0 4.5', basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        self.addCleanup(mf._chkfile.close)
+        overlap = mf.get_ovlp()
+        for driver in (gasci.GASCI, gasscf.GASSCF):
+            for sa in (False, True):
+                mc = driver(mf, 4, (2, 2), ncore=1, gas_orbs=(2, 2),
+                            gas_restr=((2, 2), (4, 4)),
+                            gas_restr_type='cumulative-occ')
+                if sa:
+                    mc = mc.state_average((.3, .7))
+                if hasattr(mc, 'close'):
+                    self.addCleanup(mc.close)
+                before = mc.mo_coeff
+                active = before[:, 1:5]
+                methods = ['get_gas_natorb', 'get_gas_pseudo_natorb']
+                if sa:
+                    methods.append('get_gas_average_natorb')
+                for dtype in (numpy.int64, numpy.float64, numpy.complex128):
+                    block = numpy.array([[1, 1], [1, 1]], dtype=dtype)
+                    if numpy.iscomplexobj(block):
+                        block[0, 1], block[1, 0] = 1j, -1j
+                    density = scipy.linalg.block_diag(block, block)
+                    expected = active @ density @ active.conj().T
+                    for method in methods:
+                        with self.subTest(driver=driver.__name__, sa=sa,
+                                          dtype=dtype, method=method):
+                            mo, occ = getattr(mc, method)(gasdm1=density)
+                            if isinstance(occ, tuple):
+                                occ = numpy.concatenate(occ)
+                            numpy.testing.assert_allclose(
+                                mo.conj().T @ overlap @ mo, numpy.eye(6), atol=2e-12)
+                            reconstructed = (mo[:, 1:5] * occ) @ mo[:, 1:5].conj().T
+                            numpy.testing.assert_allclose(reconstructed, expected, atol=2e-12)
+                            numpy.testing.assert_array_equal(mo[:, [0, 5]], before[:, [0, 5]])
+                            self.assertIs(mc.mo_coeff, before)
+                            self.assertIsNone(mc.ci)
+                            if method == 'get_gas_pseudo_natorb':
+                                rotation = active.conj().T @ overlap @ mo[:, 1:5]
+                                numpy.testing.assert_allclose(rotation[:2, 2:], 0., atol=2e-12)
+                                numpy.testing.assert_allclose(rotation[2:, :2], 0., atol=2e-12)
+                    # Complex analysis orbitals are not computational GAS MOs.
+                    if numpy.iscomplexobj(density):
+                        with self.assertRaisesRegex(TypeError, 'real-valued orbitals'):
+                            mc.kernel(mo.astype(complex))
+
     def test_n2_analysis_orbitals_can_be_exported_to_molden(self):
         mc, _, roots = self._n2_property_pair()
         obj = mc.state_average((.25, .75))
