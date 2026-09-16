@@ -1256,6 +1256,27 @@ class GASSCF(newton_casscf.CASSCF):
 
     get_h2gas = gasci.GASCI.get_h2gas
 
+    def get_grad(self, mo_coeff=None, casdm1_casdm2=None, eris=None):
+        """Return the packed orbital gradient in PySCF's mc1step convention.
+
+        Twice this vector is the orbital block of the joint Newton gradient.
+        As in native CASSCF, omitted densities trigger a fixed-orbital CI solve;
+        supplied densities are used directly, including on state-average objects.
+        """
+
+        self.validate_capabilities()
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        if eris is None:
+            eris = self.ao2mo(mo_coeff)
+        if casdm1_casdm2 is None:
+            _, _, ci = self.casci(mo_coeff, self.ci, eris)
+            casdm1_casdm2 = self.fcisolver.make_rdm12(ci, self.ncas, self.nelecas)
+        dm1, dm2 = casdm1_casdm2
+        # The inherited get_grad dispatches through self.gen_g_hop, whose
+        # joint orbital/CI signature differs from this orbital-only interface.
+        return mc1step.gen_g_hop(self, mo_coeff, 1, dm1, dm2, eris)[0]
+
     def _prepare_fixed_orbital_gasci(
             self, mo_coeff=None, ci0=None, *, validate=False, verbose=None):
         """Resolve MO/CI guesses, validating at public calculation entries.

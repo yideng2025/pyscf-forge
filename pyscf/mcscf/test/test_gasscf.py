@@ -43,6 +43,7 @@ from pyscf.mcscf import addons_gas
 from pyscf.mcscf import df as mcdf
 from pyscf.mcscf import fci_gas
 from pyscf.mcscf import gasci
+from pyscf.mcscf import mc1step
 from pyscf.mcscf import newton_casscf
 from pyscf.mcscf import gasscf
 
@@ -1414,6 +1415,14 @@ class KnownValues(unittest.TestCase):
         eris = mc.ao2mo(mo)
         gradient = mc.gen_g_hop(mo, ci, eris)[0][:rows.size]
         self.assertGreater(numpy.linalg.norm(gradient), 1e-3)
+        # Public get_grad follows mc1step's half-gradient convention.
+        # Supplying densities must not solve CI or enter joint Newton.
+        with mock.patch.object(mc, 'casci', side_effect=AssertionError('CI solve')), \
+                mock.patch.object(mc, 'gen_g_hop',
+                                  side_effect=AssertionError('joint Newton')):
+            orbital_gradient = mc.get_grad(mo, (dm1, dm2), eris)
+        numpy.testing.assert_allclose(2 * orbital_gradient, gradient,
+                                      atol=2e-10, rtol=1e-10)
 
         def energy(orbitals):
             # Independent scalar expectation value at fixed CI coefficients.
@@ -1430,7 +1439,7 @@ class KnownValues(unittest.TestCase):
         directions["combined"] = combined / numpy.linalg.norm(combined)
         for name, direction in directions.items():
             with self.subTest(weights=weights, df=use_df, sector=name):
-                analytic = numpy.dot(gradient, direction)
+                analytic = 2 * numpy.dot(orbital_gradient, direction)
                 self.assertGreater(abs(analytic), 1e-6)
                 kappa = mc.unpack_uniq_var(direction)
                 errors = []
@@ -1456,6 +1465,72 @@ class KnownValues(unittest.TestCase):
         for weights in (None, (.3, .7)):
             self._check_n2_orbital_gradient_finite_difference(
                 weights=weights, use_df=True)
+
+    def test_get_grad_matches_casscf_for_cas_space(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 1; H 0 0 2.2; H 0 0 3.4',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for use_df in (False, True):
+            for weights in (None, (.3, .7), (1., 0.)):
+                with self.subTest(df=use_df, weights=weights):
+                    mc = gasscf.GASSCF(mf, 2, (1, 1), gas_orbs=(2,))
+                    self.addCleanup(mc.close)
+                    ref = mc1step.CASSCF(mf, 2, (1, 1))
+                    if use_df:
+                        mc = mc.density_fit()
+                        self.addCleanup(mc.close)
+                        ref = ref.density_fit()
+                    if weights is not None:
+                        mc = mc.state_average(weights)
+                        self.addCleanup(mc.close)
+                        ref = ref.state_average(weights)
+                    # Compare away from an orbital stationary point.
+                    kappa = mc.unpack_uniq_var(numpy.linspace(-.08, .06, 5))
+                    mo = mf.mo_coeff @ scipy.linalg.expm(kappa)
+                    actual = mc.get_grad(mo)
+                    expected = ref.get_grad(mo)
+                    self.assertGreater(numpy.linalg.norm(expected), 1e-3)
+                    numpy.testing.assert_allclose(actual, expected,
+                                                  atol=2e-9, rtol=1e-8)
+
+    def test_get_grad_preserves_gas_mask_and_fixed_density(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 1; H 0 0 2.2; H 0 0 3.4',
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        if getattr(mf, '_chkfile', None) is not None:
+            self.addCleanup(mf._chkfile.close)
+        for use_df in (False, True):
+            mc = gasscf.GASSCF(
+                mf, 2, (1, 1), gas_orbs=(1, 1),
+                gas_restr=((1, 1), (2, 2)), gas_restr_type='cumulative-occ')
+            self.addCleanup(mc.close)
+            if use_df:
+                mc = mc.density_fit()
+                self.addCleanup(mc.close)
+            mc.gasci()
+            densities = mc.make_gasdm12()
+            eris = mc.ao2mo()
+            mo = mc.mo_coeff
+            full_mask = mc.uniq_var_indices(4, 1, 2, None)
+            self.assertTrue(full_mask[2, 1])  # inter-GAS rotation
+            full = mc.get_grad(mo, densities, eris)
+            mc.fix_spin_(shift=.2, ss=0.)
+            # At fixed CI, the spin penalty has no orbital derivative.
+            # Supplied densities/integrals remain usable without CI data.
+            mc.ci = None
+            with mock.patch.object(mc, 'casci', side_effect=AssertionError('CI solve')), \
+                    mock.patch.object(mc, 'ao2mo',
+                                      side_effect=AssertionError('AO2MO')):
+                for frozen, extrasym in ((None, None), (1, None),
+                                         ([3], [0, 0, 1, 0])):
+                    with self.subTest(df=use_df, frozen=frozen, extrasym=extrasym):
+                        mc.frozen, mc.extrasym = frozen, extrasym
+                        mask = mc.uniq_var_indices(4, 1, 2, frozen)
+                        actual = mc.get_grad(casdm1_casdm2=densities, eris=eris)
+                        numpy.testing.assert_allclose(actual, full[mask[full_mask]],
+                                                      atol=1e-12, rtol=1e-12)
 
     def test_n2_numerical_regression_ss_and_zero_weight_sa(self):
         _, mf, mo = self._n2_regression_fixture()
@@ -3247,7 +3322,8 @@ class KnownValues(unittest.TestCase):
             mc = wrap(source)
             self.addCleanup(mc.close)
             for method in ('validate_capabilities', 'kernel', 'gasci',
-                           'newton', 'as_scanner', 'state_average', 'density_fit'):
+                           'newton', 'as_scanner', 'state_average', 'density_fit',
+                           'get_grad'):
                 with self.subTest(kind=kind, method=method):
                     with mock.patch.object(mc._scf, 'run') as scf_run, \
                             mock.patch.object(mc, 'get_h1eff') as h1, \
@@ -3273,7 +3349,8 @@ class KnownValues(unittest.TestCase):
             mc = mcdf.approx_hessian(source)
             self.addCleanup(mc.close)
             for method in ('validate_capabilities', 'kernel', 'gasci',
-                           'newton', 'as_scanner', 'state_average', 'density_fit'):
+                           'newton', 'as_scanner', 'state_average', 'density_fit',
+                           'get_grad'):
                 with self.subTest(sa=sa, method=method):
                     with mock.patch.object(mc._scf, 'run') as run, \
                             mock.patch.object(mc, 'ao2mo') as ao:
