@@ -114,9 +114,8 @@ print(f"GAS determinant count : {numpy.asarray(mc.ci).size}")
 # Example output (last digits may depend on platform):
 #
 # E(OpenMolcas) / Eh     : -3066.326994318111
-# E(PySCF, physical) / Eh: -3066.326994395577
-# Difference / Eh       : -7.747e-08
+# E(PySCF, physical) / Eh: -3066.326994395571
+# Difference / Eh       : -7.746e-08
 # <S^2>                 : 20.0000000000
 # GASSCF converged      : True
-# GAS determinant count : 63200
 

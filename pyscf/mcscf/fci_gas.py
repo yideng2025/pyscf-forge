@@ -16,11 +16,7 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""GAS-aware FCISolver bindings for the frozen GAS FCI C kernels.
-
-Density matrices through second order are supported. Higher-order CAS RDM
-implementations and GPU conversion cannot operate on this GAS backend.
-"""
+"""GAS-aware FCISolver interface to the GAS C kernels."""
 
 from contextlib import nullcontext
 import ctypes
@@ -38,7 +34,7 @@ from pyscf.mcscf import _gaslib
 from pyscf.mcscf import addons_gas
 
 
-# A GAS pspace column currently costs one full C-kernel Hamiltonian product.
+# A GAS pspace column currently costs one full C kernel Hamiltonian product.
 # Keep exact small-space diagonalization bounded until a dedicated C pspace
 # builder exists.
 GAS_PSPACE_MATVEC_MAX = 64
@@ -270,14 +266,10 @@ def _spin_penalty_diagonal(spin_diagonal, parameters):
 class _GasSpinPlan:
     """Reusable block-sparse ``S^2`` contraction plan.
 
-    Raw GAS one-electron links retain excitation direction.  Pairing an alpha
-    ``q -> p`` link with the reverse beta ``p -> q`` link applies the
-    opposite-spin exchange term without expanding the CI vector into the full
-    CAS tensor.  The numerical gather/scatter is delegated to PySCF's C-backed
-    ``take_2d`` and ``takebak_2d`` helpers.
-
-    The plan owns Python block descriptors and NumPy link maps. It retains
-    no C pointers and remains valid after the source GasSpace is closed.
+    Opposite-spin exchange is evaluated from paired GAS one-electron
+    links without expanding the CI vector to the full CAS space.
+    The plan retains no C pointers and remains valid after the source
+    ``GasSpace`` is closed.
     """
 
     def __init__(self, gas):
@@ -822,7 +814,7 @@ class FCISolver(direct_spin1.FCISolver):
         return self
 
     def space_info(self, norb, nelec):
-        """Estimate GAS dimensions and validate C-kernel limits."""
+        """Estimate GAS dimensions and validate C kernel limits."""
 
         gas_orbs, nelec, blocks = self._space_spec(norb, nelec)
         return addons_gas.check_kernel_limits(gas_orbs, nelec, blocks)

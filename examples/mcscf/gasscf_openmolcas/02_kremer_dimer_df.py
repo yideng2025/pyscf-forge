@@ -114,7 +114,7 @@ print(f"<S^2>                  : {ss:.10f}")
 #
 # GASSCF converged        : True
 # E(OpenMolcas CD) / Eh   : -3345.736089850000
-# E(PySCF DF, physical)   : -3345.735665001314
-# DF - CD / Eh           : +4.248487e-04
+# E(PySCF DF, physical)   : -3345.735665001371
+# DF - CD / Eh           : +4.248486e-04
 # <S^2>                  : 12.0000000000
 

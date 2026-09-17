@@ -126,6 +126,7 @@ for distance, energy, ss, converged in sorted(rows):
     print(f"{distance:12.7f}  {energy:22.12f}  {ss:12.8f}  {converged}")
 
 # Example output (last digits may depend on platform):
+#
 # R / Angstrom       E(physical) / Eh        <S^2>     converged
 #    1.0967000       -109.135311779472   -0.00000000  True
 #    1.0977000       -109.135348228725   -0.00000000  True

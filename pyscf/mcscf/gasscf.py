@@ -16,50 +16,19 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""Generalized active-space self-consistent field.
+"""Generalized active space self-consistent field.
 
-The public API is :class:`GASSCF` in ``pyscf.mcscf.gasscf``.  The
-implementation reuses PySCF's ``newton_casscf`` joint orbital/CI Newton driver
-and supplies the active-space CI, RDM and spin operations through the
-restricted determinant GASCI kernels. Computational orbitals and CI vectors
-must be real-valued; the C/OpenMP backend does not support GPU conversion.
+GASSCF reuses ``newton_casscf`` joint orbital/CI Newton driver,
+with GASCI kernels providing the active-space CI, RDM and spin operations.
+GAS definitions use ``gas_orbs``, ``gas_restr`` and ``gas_restr_type`` and
+follow the same normalization rules as :mod:`pyscf.mcscf.gasci`.
 
-Supported GAS definitions follow :mod:`pyscf.mcscf.gasci`: ``gas_orbs``,
-``gas_restr`` and ``gas_restr_type`` are normalized by the same GAS helper
-routines.  This module supports ordinary state averaging, including
-zero-weight roots, GAS-safe canonicalization of inactive/external orbitals,
-optional within-GAS pseudo-natural orbitals with synchronized CI rotation,
-density fitting through PySCF's ``mcscf.df`` machinery, energy-only scanners
-and the GASCI-native spin-penalty Hamiltonian.  It does not implement
-state-average-mix, state-specific excited-state wrappers,
-unrestricted active-space natural-orbital rotations, analytic gradients/NACs or the
-legacy two-step CASSCF driver. X2C is not supported, including SCF inputs
-with an active ``with_x2c`` helper. Solvent models are not supported,
-including an active ``with_solvent`` helper on either the SCF or MCSCF object.
-
-Construct supported SA/DF objects with ``mc.state_average(...)``,
-``mc.density_fit(...)`` or ``DFGASSCF(...)``. These entry points install the
-GAS energy, resource-ownership and capability adapters. Unadapted wrappers
-from ``mcscf.addons.state_average`` or ``mcscf.df.density_fit`` are rejected
-by GASSCF calculation entry points. Such external wrappers can still expose
-their own CASSCF methods (including gradient constructors); those methods
-are outside the supported GASSCF API. The separate ``approx_hessian``
-wrapper is not supported.
-
-SCF inputs follow the native CASSCF convention: UHF/UKS objects are converted
-with their ``to_rhf()`` method, and active DF-SCF inputs automatically select
-DF-GASSCF. This does not implement unrestricted GASSCF. Generalized and
-relativistic spinor SCF references are not supported.
-
-Point-group symmetry and orbital/wavefunction symmetry constraints are not
-supported. Disable molecular symmetry and leave ``extrasym``, ``orbsym`` and
-``wfnsym`` unset. Tagged symmetry orbitals are rejected, not silently stripped.
-GAS restrictions, frozen orbitals and the native GAS spin penalty remain
-supported independently of these spatial-symmetry settings.
-
-Use ``kernel()`` for joint Newton orbital optimization. The ``mc1step()``
-entry and its legacy ``rotate_orb_cc``, ``update_casdm`` and ``solve_approx_ci``
-helpers are not supported.
+Supported features include state averaging, GAS-safe canonicalization and
+pseudo natural orbitals, density fitting, energy scanners and the GAS spin
+penalty. Computational orbitals and CI vectors must be real-valued.
+Unrestricted/spinor references, spatial symmetry, X2C, solvent models,
+analytic gradients/NACs, GPU conversion and the legacy CASSCF drivers are
+not supported.
 """
 
 from collections import OrderedDict
@@ -133,7 +102,7 @@ def _is_native_casscf_warning(message):
 class _GASSCFLogFilter:
     """Write-through stream filter for native Newton/CASSCF messages.
 
-    GASSCF deliberately reuses PySCF's native ``newton_casscf`` driver.
+    GASSCF deliberately reuses ``newton_casscf`` driver.
     The numerical driver still contains CASSCF/CASCI text labels and one
     CASSCF-specific experimental-feature warning.  This filter changes only
     user-visible text while leaving the driver and all numerical data untouched.
@@ -216,11 +185,11 @@ def _gasscf_newton_kernel(casscf, *args, **kwargs):
     # Convert only the returned tuple before mc1step assigns/logs public slots.
     native_kernel = newton_casscf.kernel
     if hasattr(casscf.fcisolver, 'ss_penalty'):
-        # PySCF kernel -> update_orb_ci -> gen_g_hop uses module globals,
-        # not casscf.gen_g_hop. Reuse the original function code/defaults in
-        # a private namespace, changing only the response entry point. Never
-        # patch the imported module: other CASSCF calculations keep their
-        # native operators, including during callbacks and nested calls.
+        # ``kernel -> update_orb_ci -> gen_g_hop`` resolves module globals,
+        # not ``casscf.gen_g_hop``. Rebind the original function in a private
+        # namespace and replace only the response entry point, leaving the
+        # imported CASSCF module untouched.
+
         namespace = dict(vars(newton_casscf))
         namespace['gen_g_hop'] = gen_g_hop
         for name in ('update_orb_ci', 'kernel'):
@@ -242,15 +211,15 @@ def _gasscf_newton_kernel(casscf, *args, **kwargs):
 
 
 def gen_g_hop(mc, mo, ci0, eris, verbose=None):
-    """Add spin-penalty CI derivatives to the native Newton operators.
+    """Add spin-penalty contributions to the Newton CI derivatives.
 
-    The spin penalty P has no orbital dependence. Keep contract_2e physical:
-    native Newton uses that hook for both H and orbital variations of H.
-    Only the CI gradient, CI-CI Hessian and CI preconditioner need corrections.
-    For a normalized root c, p = <c|P|c> and r = Pc - pc, these are
-    2 w r and 2 w [(P-p) v - r(c.v) - c(r.v)], respectively, in the native
-    Newton normalization convention. The keyframe gradient uses the same P.
+    The penalty has no orbital dependence, so ``contract_2e`` remains
+    physical. For normalized ``c``, with ``p = <c|P|c>`` and
+    ``r = Pc - pc``, the CI gradient and Hessian corrections are
+    ``2 w r`` and
+    ``2 w [(P-p)v - r(c.v) - c(r.v)]``, respectively.
     """
+
     _check_symmetry(mc, mo)
     gradient, update, hop, hdiag = newton_casscf.gen_g_hop(
         mc, mo, ci0, eris, verbose)
@@ -435,14 +404,10 @@ class _GASFCISolver(fci_gas.FCISolver):
     def spin_square(self, ci, norb, nelec, *args, **kwargs):
         """Return ``(<S^2>, 2S+1)`` without re-entering SA RDM wrappers.
 
-        PySCF's dynamic state-average solver calls the base solver's
-        ``spin_square`` through ``super(StateAverageFCISolver, self)`` while
-        ``self`` is still the decorated state-average object.  The GASCI base
-        implementation computes spin from ``self.make_rdm12s``; on a decorated
-        object that name resolves back to the state-average wrapper and can
-        incorrectly split a single GAS CI vector into scalar elements.  Call
-        the GASCI base RDM method directly; the plan-context hook supplies
-        either a Newton-owned cached plan or a temporary plan.
+        State-average dispatch can route ``spin_square`` back through the
+        decorated RDM methods, causing a single GAS CI vector to be treated
+        as multiple roots. Call the GASCI base RDM implementation directly;
+        the plan-context hook supplies the required RDM plan.
         """
 
         ci = self._as_state_specific_ci(ci)
@@ -495,11 +460,10 @@ class _GASFCISolver(fci_gas.FCISolver):
     def _as_state_specific_ci(ci):
         """Unwrap native Newton's singleton CI-list convention.
 
-        PySCF's native Newton CASSCF helper packs a state-specific CI vector as
-        ``[ci]`` when building initial density matrices.  GASCI public methods
-        operate on one flattened GAS CI vector.  This bridge accepts only the
-        singleton state-specific form here; multiroot/state-average logic
-        is handled at the outer GASSCF object level.
+        Native Newton may represent a state-specific CI vector as ``[ci]``.
+        GASCI methods expect a single flattened GAS CI vector, so this bridge
+        accepts only the singleton form. Multiroot handling remains at the
+        outer GASSCF level.
         """
 
         if isinstance(ci, (list, tuple)):
@@ -935,7 +899,7 @@ class GASSCF(newton_casscf.CASSCF):
         an explicit GASCI solver) by keyword may omit ``ncas``; it is then
         inferred from the GAS orbital counts.
 
-        The optimizer reuses PySCF's native joint orbital/CI Newton driver.
+        The optimizer reuses joint orbital/CI Newton driver.
         GAS-specific CI, RDM, spin and orbital-rotation operations are supplied
         by the determinant GASCI adapter.
 
@@ -962,7 +926,7 @@ class GASSCF(newton_casscf.CASSCF):
         ``mc.canonicalize_(gas_pseudo_natorb=True)``. The variant without the
         trailing underscore returns the transformed results without writeback.
 
-        Real analysis orbitals can be exported with PySCF's Molden writer::
+        Real analysis orbitals can be exported with Molden writer::
 
             from pyscf.tools import molden
             mo_no, active_occ = mc.get_gas_natorb(state=0)
@@ -1233,7 +1197,7 @@ class GASSCF(newton_casscf.CASSCF):
         DF settings are retained, but integrals are rebuilt on demand and DF
         output files are not inherited. SCF and MCSCF share the new DF object
         only when they shared the source DF object.
-        MO and CI arrays retain PySCF's shallow-copy semantics. as_scanner()
+        MO and CI arrays retain shallow-copy semantics. as_scanner()
         additionally copies these arrays for independent scanning.
         """
 
@@ -1399,7 +1363,7 @@ class GASSCF(newton_casscf.CASSCF):
     get_h2gas = gasci.GASCI.get_h2gas
 
     def get_grad(self, mo_coeff=None, casdm1_casdm2=None, eris=None):
-        """Return the packed orbital gradient in PySCF's mc1step convention.
+        """Return the packed orbital gradient in mc1step convention.
 
         Twice this vector is the orbital block of the joint Newton gradient.
         As in native CASSCF, omitted densities trigger a fixed-orbital CI solve;
@@ -1465,7 +1429,7 @@ class GASSCF(newton_casscf.CASSCF):
 
     def _run_fixed_orbital_gasci(
             self, mo_coeff=None, ci0=None, verbose=None, eris=None):
-        """Run fixed-orbital GASCI and update PySCF-style result slots."""
+        """Run fixed-orbital GASCI and update result slots."""
 
         mo_coeff, ci0 = self._prepare_fixed_orbital_gasci(mo_coeff, ci0)
         signature = self._gas_problem_signature()
@@ -1711,19 +1675,12 @@ class GASSCF(newton_casscf.CASSCF):
     state_average_mix_ = state_average_mix
 
     def fix_spin_(self, shift=.2, ss=None):
-        """Enable GASCI-native spin penalty in place and return ``self``.
+        """Enable the GASCI-native spin penalty in place and return ``self``.
 
-        Both ``fix_spin`` and ``fix_spin_`` modify this object, as in GASCI.
-        Use ``mc.copy().fix_spin(...)`` to configure an independent copy.
-
-        ``ss`` is the target ``S(S+1)`` value, matching PySCF's
-        ``fix_spin_`` convention.  The implementation uses the
-        determinant GASCI solver's native spin-penalty Hamiltonian
-        instead of wrapping the solver in PySCF's CAS-oriented
-        ``SpinPenaltyFCISolver`` dynamic class.  This keeps GAS
-        link tables and CI vectors in the GAS representation.
-        The GAS restriction must be spin-complete. Electron counts fix the
-        spin projection, not the total spin; check spin_square() after solving.
+        Both ``fix_spin`` and ``fix_spin_`` modify this object. The target
+        ``ss`` is the ``S(S+1)`` value. The GASCI spin-penalty Hamiltonian
+        operates directly in the GAS representation and requires a
+        spin-complete GAS restriction.
         """
 
         self.validate_capabilities()
@@ -1746,13 +1703,11 @@ class GASSCF(newton_casscf.CASSCF):
         return self.copy().undo_fix_spin_()
 
     def density_fit(self, auxbasis=None, with_df=None):
-        """Return a DF-GASSCF object using PySCF's CASSCF DF machinery.
+        """Return a DF-GASSCF object using CASSCF DF machinery.
 
-        Density fitting changes only integral/J-K construction.  The active
-        CI vector, GAS restrictions, GAS RDMs and spin-penalty bookkeeping
-        remain owned by the GASSCF/GASCI adapter. A new wrapper owns its GAS
-        solver; initial SCF DF reuse follows PySCF. Use copy() or as_scanner()
-        to obtain independent DF caches and output-file ownership.
+        Density fitting changes only integral and J/K construction; GAS
+        restrictions, CI vectors, RDMs and spin-penalty handling remain
+        managed by the GASSCF/GASCI layer.
         """
 
         self.validate_capabilities()
@@ -1853,7 +1808,7 @@ class GASSCF(newton_casscf.CASSCF):
                 self.stdout = stdout
 
     def dump_chk(self, envs_or_file):
-        """Use PySCF's checkpoint format with physical public energies.
+        """Use checkpoint format with physical public energies.
 
         Newton's local dictionary contains objective energies. Substitute the
         public energies in a copy; leave its convergence variables untouched.
@@ -1938,7 +1893,7 @@ def DFGASSCF(mf, ncas=None, nelecas=None, gas_orbs=None, gas_restr=None,
              cache_plans=None, auxbasis=None, with_df=None):
     """Create a density-fitted :class:`GASSCF` object.
 
-    This mirrors PySCF's ``DFCASCI/DFCASSCF`` construction style while keeping
+    This mirrors ``DFCASCI/DFCASSCF`` construction style while keeping
     the user-facing GAS interface identical to :class:`GASSCF`.
     Mole inputs first create a DF-RHF reference. Explicit DF options are
     applied once, without an intervening automatic DF construction.

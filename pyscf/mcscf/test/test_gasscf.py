@@ -16,7 +16,7 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""Small tests for the GASSCF module."""
+"""Tests for the GASSCF module."""
 
 from contextlib import ExitStack
 from functools import reduce

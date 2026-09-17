@@ -16,7 +16,7 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""PySCF-style generalized active-space configuration interaction."""
+"""Generalized active space configuration interaction."""
 
 import hashlib
 from functools import reduce
@@ -239,7 +239,7 @@ def as_scanner(mc):
 
 
 class GASCIScanner(lib.SinglePointScanner):
-    """Callable GASCI scanner following the PySCF CASCI scanner protocol."""
+    """Callable GASCI scanner following the CASCI scanner protocol."""
 
     __name_mixin__ = "Scanner"
 
@@ -267,7 +267,7 @@ class GASCIScanner(lib.SinglePointScanner):
             # sectors.  Reusing only the preceding roots may then follow an
             # excited sector through a crossing.  For spaces covered by the
             # bounded exact pspace, solve for the lowest roots afresh; larger
-            # production spaces retain PySCF-style CI reuse.
+            # production spaces retain CI reuse.
             try:
                 ndet = self._gas_problem_signature()[-1]
             except (TypeError, ValueError, NotImplementedError):
@@ -556,13 +556,13 @@ class GASCI(casci.CASCI):
         return error
 
     def kernel(self, mo_coeff=None, ci0=None, verbose=None):
-        """Run fixed-orbital GASCI and return PySCF-style results.
+        """Run a fixed-orbital GASCI calculation.
 
         Returns:
-            Tuple ``(e_tot, e_gas, ci, mo_coeff, mo_energy)``.  For multiple
-            roots, energies and CI vectors follow the selected PySCF solver
-            convention. Energies exclude any spin penalty; its objective is
-            available from :meth:`spin_energy_report`.
+            Tuple ``(e_tot, e_gas, ci, mo_coeff, mo_energy)``. For multiple
+            roots, energies and CI vectors follow the underlying FCI solver
+            convention. Energies exclude any spin penalty; the penalized
+            objective is available from :meth:`spin_energy_report`.
         """
 
         self._sync_fcisolver()
@@ -690,14 +690,11 @@ class GASCI(casci.CASCI):
     cas_natorb_ = cas_natorb
 
     def fix_spin_(self, shift=0.2, ss=None):
-        """Use a PySCF-style energy penalty to target a GAS spin state.
+        """Apply an energy penalty to target a GAS spin state.
 
-        This optional numerical aid is only defined for a spin-complete GAS
-        restriction.  Its success depends on the energy gaps between spin
-        sectors and on a suitable finite shift; it is not a spin-adapted CI
-        representation.  Small GAS spaces are solved exactly, while larger
-        spaces use target-spin-projected guesses together with global probes
-        so that an insufficient shift does not silently change the eigenproblem.
+        This numerical aid requires a spin-complete GAS restriction.
+        It is not a spin-adapted CI representation, and its effectiveness
+        depends on the spin-state energy gaps and the chosen penalty shift.
         """
 
         self._sync_fcisolver()

@@ -16,7 +16,7 @@
 # Author: Yi Deng <yideng@uchicago.edu>
 #
 
-"""Small GAS helpers shared by the GASCI Python layer."""
+"""Helpers shared by the GAS Python layer."""
 
 import math
 from collections.abc import Mapping
@@ -76,7 +76,7 @@ def gas_restr_usage(gas_restr_type=None):
 
 
 def _exact_integer_array(values, label):
-    """Require integer input and convert it to the C-kernel int32 dtype."""
+    """Require integer input and convert it to the C kernel int32 dtype."""
 
     raw = numpy.asarray(values, dtype=object)
     if not all(lib.isinteger(value) for value in raw.flat):
@@ -114,7 +114,7 @@ def _validate_state_weights(weights):
 
 
 class StateAverageFCISolver(addons.StateAverageFCISolver):
-    """PySCF state wrapper with GAS-specific multi-root RDM kernels."""
+    """State-average wrapper with GAS-specific multi-root RDM kernels."""
 
     __name_mixin__ = "StateAverage"
 
@@ -252,7 +252,7 @@ class StateAverageGASCI(addons.StateAverageMCSCFSolver):
 
 
 def state_average(mc, weights=(0.5, 0.5), wfnsym=None):
-    """Attach PySCF-style state weights to a GASCI calculation.
+    """Attach state weights to a GASCI calculation.
 
     GASCI orbitals remain fixed, and the individual root energies are
     unchanged.  The weights define averaged RDMs and generalized Fock
@@ -766,7 +766,7 @@ def sort_mo(mc, mo_coeff, gaslst, base=1):
 
 def normalize_gas_restr(gas_orbs, nelec, gas_restr=None,
                         gas_restr_type=GAS_RESTR_SPIN_SUPERGROUP):
-    """Convert one public restriction type to canonical C-kernel set D.
+    """Convert one public restriction type to canonical C kernel set D.
 
     ``spin-supergroup`` accepts D directly.  ``supergroup`` accepts spin-free
     occupation rows G.  ``cumulative-occ`` generates G from accumulated
@@ -806,7 +806,7 @@ def _sector_string_count(norb, occ):
 
 
 def check_kernel_limits(norb, nelec, blocks):
-    """Preflight the public C-kernel limits before allocating gas_space_t."""
+    """Preflight the public C kernel limits before allocating gas_space_t."""
 
     norb = _integer_vector(norb, "gas_orbs")
     na, nb = fci_addons._unpack_nelec(nelec)
