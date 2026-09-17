@@ -1035,13 +1035,29 @@ class TestSolverAdapter(unittest.TestCase):
         with mock.patch.object(fci_gas.FCISolver, 'contract_2e', new=contract):
             for cache in (True, False):
                 solver.cache_plans = cache
-                for _ in range(2):
-                    numpy.testing.assert_allclose(solver.contract_2e(eri, ci, 3, (1, 1)),
+                for integrals in (eri, eri.copy()):
+                    numpy.testing.assert_allclose(solver.contract_2e(integrals, ci, 3, (1, 1)),
                                                   expected, atol=1e-12, rtol=0)
         self.assertEqual(len(seen), 4)
         self.assertIsInstance(seen[0], fci_gas.GasContractPlan)
         self.assertIs(seen[0], seen[1])
         self.assertEqual(seen[2:], [None, None])
+
+        # Exercise eviction through the public entry with distinct Hamiltonians.
+        solver.cache_plans = True
+        plan = seen[0]
+        for scale in (1., 2., 3.):
+            solver.contract_2e(eri + numpy.eye(6) * scale, ci, 3, (1, 1))
+        self.assertLessEqual(len(solver._contract_plans), solver._MAX_CONTRACT_PLANS)
+        self.assertIsNone(plan._plan)
+        remaining = list(solver._contract_plans.values())
+        space = solver._contract_space
+        solver.close()
+        self.assertEqual(len(solver._contract_plans), 0)
+        self.assertIsNone(solver._contract_space)
+        self.assertIsNone(space._gas)
+        for plan in remaining:
+            self.assertIsNone(plan._plan)
 
     def test_explicit_gasci_solver_is_adapted_by_copy(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -1112,23 +1128,60 @@ class TestSolverAdapter(unittest.TestCase):
             gasscf.GASSCF(
                 mf, 2, (1, 1), fcisolver=solver, ncore=0)
 
-    def test_owned_rdm_and_spin_plans_are_reused_and_closed(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,))
-
-        rdm_plan = solver._get_rdm_plan(2, (1, 1))
-        spin_plan = solver._get_spin_plan(2, (1, 1))
-
-        self.assertIs(rdm_plan, solver._get_rdm_plan(2, (1, 1)))
-        self.assertIs(spin_plan, solver._get_spin_plan(2, (1, 1)))
-        self.assertEqual(rdm_plan.ndet, spin_plan.ndet)
-        self.assertIsNotNone(solver._topology_key)
-
-        solver.close()
-        self.assertIsNone(rdm_plan._plan)
-        self.assertIsNone(rdm_plan.gas)
-        self.assertIsNone(solver._rdm_plan)
-        self.assertIsNone(solver._spin_plan)
-        self.assertIsNone(solver._topology_key)
+    def test_public_rdm_and_spin_plan_lifecycle(self):
+        reference = fci_gas.FCISolver(gas_orbs=(2,))
+        bra, ket = numpy.random.default_rng(62).normal(size=(2, 4))
+        spin_ci = numpy.random.default_rng(63).normal(size=4)
+        for cached in (False, True):
+            with self.subTest(cache=cached):
+                solver = gasscf._GASFCISolver(gas_orbs=(2,), cache_plans=cached)
+                self.addCleanup(solver.close)
+                rdm_plan = None
+                for method in ('trans_rdm1', 'trans_rdm1s', 'trans_rdm12', 'trans_rdm12s'):
+                    with self.subTest(method=method):
+                        actual = getattr(solver, method)(bra, ket, 2, (1, 1))
+                        expected = getattr(reference, method)(bra, ket, 2, (1, 1))
+                        if method in ('trans_rdm1', 'trans_rdm1s'):
+                            actual, expected = (actual,), (expected,)
+                        for a, e in zip(actual, expected):
+                            numpy.testing.assert_allclose(a, e, atol=1e-12, rtol=0)
+                        if rdm_plan is None:
+                            rdm_plan = solver._rdm_plan
+                        self.assertIs(solver._rdm_plan, rdm_plan)
+                ss_ci = solver.contract_ss(spin_ci, 2, (1, 1))
+                spin_plan = solver._spin_plan
+                ss = solver.spin_square(spin_ci, 2, (1, 1))
+                numpy.testing.assert_allclose(
+                    ss_ci, reference.contract_ss(spin_ci, 2, (1, 1)), atol=1e-12, rtol=0)
+                numpy.testing.assert_allclose(
+                    ss, reference.spin_square(spin_ci, 2, (1, 1)), atol=1e-12, rtol=0)
+                self.assertIs(solver._rdm_plan, rdm_plan)
+                self.assertIs(solver._spin_plan, spin_plan)
+                if cached:
+                    self.assertIsNotNone(rdm_plan)
+                    self.assertIsNotNone(spin_plan)
+                    self.assertIs(rdm_plan, solver._get_rdm_plan(2, (1, 1)))
+                    self.assertIs(spin_plan, solver._get_spin_plan(2, (1, 1)))
+                    self.assertEqual(rdm_plan.ndet, spin_plan.ndet)
+                    self.assertIsNotNone(solver._topology_key)
+                else:
+                    # All three execution paths must avoid persistent caches.
+                    ci = numpy.random.default_rng(64).normal(size=4)
+                    solver.contract_2e(numpy.zeros((3, 3)), ci, 2, (1, 1))
+                    solver.make_rdm12(ci, 2, (1, 1))
+                    solver.contract_ss(ci, 2, (1, 1))
+                    self.assertIsNone(solver._contract_space)
+                    self.assertEqual(len(solver._contract_plans), 0)
+                    self.assertIsNone(solver._rdm_plan)
+                    self.assertIsNone(solver._spin_plan)
+                solver.close()
+                solver.close()
+                self.assertIsNone(solver._rdm_plan)
+                self.assertIsNone(solver._spin_plan)
+                self.assertIsNone(solver._topology_key)
+                if cached:
+                    self.assertIsNone(rdm_plan._plan)
+                    self.assertIsNone(rdm_plan.gas)
 
     def test_topology_change_invalidates_owned_plans(self):
         solver = gasscf._GASFCISolver(gas_orbs=(2,))
@@ -1142,64 +1195,6 @@ class TestSolverAdapter(unittest.TestCase):
         self.assertIsNot(old_plan, new_plan)
         self.assertIsNone(old_plan._plan)
         self.assertIsNone(old_plan.gas)
-        solver.close()
-
-    def test_contract_plan_cache_reuses_and_evicts_plans(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,))
-        eri0 = numpy.zeros((3, 3))
-        plan0 = solver._get_contract_plan(eri0, 2, (1, 1))
-        self.assertIs(plan0, solver._get_contract_plan(eri0.copy(), 2, (1, 1)))
-
-        ci = numpy.random.default_rng(5).normal(size=plan0.ndet)
-        numpy.testing.assert_allclose(
-            plan0.contract(ci), solver.contract_2e(eri0, ci, 2, (1, 1)),
-            atol=1e-12, rtol=0)
-
-        for scale in (1.0, 2.0, 3.0):
-            solver._get_contract_plan(
-                eri0 + numpy.eye(3) * scale, 2, (1, 1))
-        self.assertLessEqual(
-            len(solver._contract_plans), solver._MAX_CONTRACT_PLANS)
-        self.assertIsNone(plan0._plan)
-        solver.close()
-        self.assertEqual(len(solver._contract_plans), 0)
-        self.assertIsNone(solver._contract_space)
-
-    def test_copy_detaches_owned_plan_caches(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,))
-        rdm_plan = solver._get_rdm_plan(2, (1, 1))
-        solver._get_spin_plan(2, (1, 1))
-        solver._get_contract_plan(numpy.zeros((3, 3)), 2, (1, 1))
-
-        copied = solver.copy()
-
-        self.assertIsNone(copied._topology_key)
-        self.assertIsNone(copied._rdm_plan)
-        self.assertIsNone(copied._spin_plan)
-        self.assertIsNone(copied._contract_space)
-        self.assertEqual(len(copied._contract_plans), 0)
-        self.assertIsNot(copied._contract_plans, solver._contract_plans)
-        self.assertIsNotNone(rdm_plan._plan)
-
-        copied.close()
-        solver.close()
-
-    def test_public_contract_2e_reuses_owned_plan(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,))
-        reference = fci_gas.FCISolver(gas_orbs=(2,))
-        eri = numpy.zeros((3, 3))
-        ci = numpy.random.default_rng(61).normal(size=4)
-
-        contracted = solver.contract_2e(eri, ci, 2, (1, 1))
-        plan = next(iter(solver._contract_plans.values()))
-        contracted_again = solver.contract_2e(eri.copy(), ci, 2, (1, 1))
-
-        self.assertIs(plan, next(iter(solver._contract_plans.values())))
-        numpy.testing.assert_allclose(
-            contracted, reference.contract_2e(eri, ci, 2, (1, 1)),
-            atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(contracted_again, contracted,
-                                      atol=1e-12, rtol=0)
         solver.close()
 
     def test_contract_cache_preserves_real_array_validation(self):
@@ -1227,86 +1222,6 @@ class TestSolverAdapter(unittest.TestCase):
             numpy.testing.assert_allclose(
                 solver.contract_2e(eri, ci, 2, (1, 1)), expected,
                 atol=1e-12, rtol=0)
-
-    def test_public_rdm_methods_reuse_owned_plan(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,))
-        reference = fci_gas.FCISolver(gas_orbs=(2,))
-        rng = numpy.random.default_rng(62)
-        bra = rng.normal(size=4)
-        ket = rng.normal(size=4)
-
-        dm1 = solver.trans_rdm1(bra, ket, 2, (1, 1))
-        rdm_plan = solver._rdm_plan
-        dm1s = solver.trans_rdm1s(bra, ket, 2, (1, 1))
-        dm1b, dm2 = solver.trans_rdm12(bra, ket, 2, (1, 1))
-        dm1s_b, dm2s = solver.trans_rdm12s(bra, ket, 2, (1, 1))
-
-        self.assertIs(rdm_plan, solver._rdm_plan)
-        numpy.testing.assert_allclose(
-            dm1, reference.trans_rdm1(bra, ket, 2, (1, 1)),
-            atol=1e-12, rtol=0)
-        ref_dm1s = reference.trans_rdm1s(bra, ket, 2, (1, 1))
-        for actual, expected in zip(dm1s, ref_dm1s):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        ref_dm1, ref_dm2 = reference.trans_rdm12(bra, ket, 2, (1, 1))
-        numpy.testing.assert_allclose(dm1b, ref_dm1, atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(dm2, ref_dm2, atol=1e-12, rtol=0)
-        ref_dm1s_b, ref_dm2s = reference.trans_rdm12s(
-            bra, ket, 2, (1, 1))
-        for actual, expected in zip(dm1s_b, ref_dm1s_b):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        for actual, expected in zip(dm2s, ref_dm2s):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        solver.close()
-
-    def test_public_spin_square_methods_reuse_owned_plans(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,))
-        reference = fci_gas.FCISolver(gas_orbs=(2,))
-        ci = numpy.random.default_rng(63).normal(size=4)
-
-        ss_ci = solver.contract_ss(ci, 2, (1, 1))
-        self.assertIsNotNone(solver._spin_plan)
-        ss = solver.spin_square(ci, 2, (1, 1))
-        self.assertIsNotNone(solver._rdm_plan)
-
-        numpy.testing.assert_allclose(
-            ss_ci, reference.contract_ss(ci, 2, (1, 1)),
-            atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(
-            numpy.asarray(ss), numpy.asarray(reference.spin_square(ci, 2, (1, 1))),
-            atol=1e-12, rtol=0)
-        solver.close()
-
-    def test_cache_plans_false_delegates_public_methods(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,), cache_plans=False)
-        eri = numpy.zeros((3, 3))
-        ci = numpy.random.default_rng(64).normal(size=4)
-
-        solver.contract_2e(eri, ci, 2, (1, 1))
-        solver.make_rdm12(ci, 2, (1, 1))
-        solver.contract_ss(ci, 2, (1, 1))
-
-        self.assertIsNone(solver._contract_space)
-        self.assertEqual(len(solver._contract_plans), 0)
-        self.assertIsNone(solver._rdm_plan)
-        self.assertIsNone(solver._spin_plan)
-
-    def test_explicit_contract_plan_bypasses_owned_cache(self):
-        solver = gasscf._GASFCISolver(gas_orbs=(2,))
-        eri = numpy.zeros((3, 3))
-        ci = numpy.random.default_rng(65).normal(size=4)
-        with solver.make_space(2, (1, 1), compress_links=True) as gas:
-            with fci_gas.GasContractPlan(gas, eri) as plan:
-                contracted = solver.contract_2e(
-                    eri, ci, 2, (1, 1), plan=plan)
-                numpy.testing.assert_allclose(
-                    contracted, plan.contract(ci), atol=1e-12, rtol=0)
-                # Explicit borrowed plans supply their own Hamiltonian.
-                numpy.testing.assert_array_equal(
-                    solver.contract_2e(eri.astype(complex), ci, 2, (1, 1), plan=plan),
-                    contracted)
-        self.assertIsNone(solver._contract_space)
-        self.assertEqual(len(solver._contract_plans), 0)
 
     def test_external_contract_plan_validation_through_gasscf(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1',
@@ -1344,6 +1259,10 @@ class TestSolverAdapter(unittest.TestCase):
                                         expected = plan.contract(ci)
                                         actual = solver.contract_2e(h2, ci, 3, (1, 1), plan=plan)
                                         numpy.testing.assert_array_equal(actual, expected)
+                                        # A borrowed plan supplies its own Hamiltonian.
+                                        numpy.testing.assert_array_equal(
+                                            solver.contract_2e(h2.astype(complex), ci,
+                                                               3, (1, 1), plan=plan), expected)
                                         mc.close()
                                         numpy.testing.assert_array_equal(plan.contract(ci), expected)
                                         self.assertIsNotNone(gas._gas)
@@ -3311,22 +3230,37 @@ class TestCanonicalization(_N2Fixture, unittest.TestCase):
 class TestLifecycle(unittest.TestCase):
     """Object ownership, copies, implicit CI validity and checkpoints."""
 
-    def test_copy_detaches_object_level_solver_caches(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+    def test_solver_and_mc_copy_detach_owned_plan_caches(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol)
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=0)
-        source_plan = mc.fcisolver._get_rdm_plan(2, (1, 1))
-
-        copied = mc.copy()
-
-        self.assertIsNot(copied, mc)
-        self.assertIsNot(copied.fcisolver, mc.fcisolver)
-        self.assertEqual(copied.gas_orbs, mc.gas_orbs)
-        self.assertIsNone(copied.fcisolver._rdm_plan)
-        self.assertIs(source_plan, mc.fcisolver._rdm_plan)
-        mc.close()
-        self.assertIsNone(source_plan._plan)
+        self.addCleanup(mf._chkfile.close)
+        for level in ('solver', 'mc'):
+            with self.subTest(copy=level):
+                mc = gasscf.GASSCF(mf, 2, (1, 1), gas_orbs=(2,), ncore=0)
+                self.addCleanup(mc.close)
+                solver = mc.fcisolver
+                rdm = solver._get_rdm_plan(2, (1, 1))
+                spin = solver._get_spin_plan(2, (1, 1))
+                contract = solver._get_contract_plan(numpy.zeros((3, 3)), 2, (1, 1))
+                source = solver if level == 'solver' else mc
+                copied = source.copy()
+                self.addCleanup(copied.close)
+                self.assertIsNot(copied, source)
+                self.assertEqual(copied.gas_orbs, source.gas_orbs)
+                target = copied if level == 'solver' else copied.fcisolver
+                self.assertIsNot(target, solver)
+                for name in ('_topology_key', '_rdm_plan', '_spin_plan', '_contract_space'):
+                    self.assertIsNone(getattr(target, name))
+                self.assertEqual(len(target._contract_plans), 0)
+                self.assertIsNot(target._contract_plans, solver._contract_plans)
+                copied.close()
+                self.assertIs(solver._rdm_plan, rdm)
+                self.assertIs(solver._spin_plan, spin)
+                self.assertIsNotNone(rdm._plan)
+                self.assertIsNotNone(contract._plan)
+                mc.close()
+                self.assertIsNone(rdm._plan)
+                self.assertIsNone(contract._plan)
 
     def test_changed_gas_space_discards_implicit_ci(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.; H 0 0 3.2',
