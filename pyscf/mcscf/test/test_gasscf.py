@@ -136,36 +136,56 @@ class _N2Fixture:
         self.addCleanup(mc.close)
         return mc, ref, roots
 
-    def _assert_property_close(self, actual, expected):
+    def _assert_property_close(self, actual, expected, *, atol=2e-11):
         if isinstance(expected, (tuple, list)):
             self.assertEqual(len(actual), len(expected))
             for a, e in zip(actual, expected):
-                self._assert_property_close(a, e)
+                self._assert_property_close(a, e, atol=atol)
         else:
-            numpy.testing.assert_allclose(actual, expected, atol=2e-11, rtol=0)
+            numpy.testing.assert_allclose(actual, expected, atol=atol, rtol=0)
 
 
 class TestInputs(unittest.TestCase):
     """Construction, supported inputs and early capability rejection."""
 
-    def test_constructor_gasci_argument_order(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+    def test_constructor_gasci_model_and_defaults(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol)
-        model = (2, (1, 1), (1, 1), ((1, 1), (2, 2)), "cumulative-occ")
+        self.addCleanup(mf._chkfile.close)
+        model = (2, (1, 1), (1, 1), ((1, 1), (2, 2)), 'cumulative-occ')
         reference = gasci.GASCI(mf, *model, ncore=0)
-        mc = gasscf.GASSCF(mf, *model, ncore=0, frozen=[0])
-        keyword = gasscf.GASSCF(
-            mf=mf, ncas=2, nelecas=(1, 1), gas_orbs=(1, 1),
-            gas_restr=((1, 1), (2, 2)), gas_restr_type="cumulative-occ",
-            ncore=0)
-        for obj in (mc, keyword):
-            self.assertEqual(obj.ncas, reference.ncas)
-            self.assertEqual(obj.nelecas, reference.nelecas)
-            actual_orbs, actual_blocks = obj._normalized_restriction()
-            ref_orbs, ref_blocks = reference._normalized_restriction()
-            self.assertEqual(actual_orbs, ref_orbs)
-            numpy.testing.assert_array_equal(actual_blocks, ref_blocks)
-        self.assertEqual(mc.frozen, [0])
+        cases = (
+            ('positional', lambda: gasscf.GASSCF(mf, *model, ncore=0, frozen=[0])),
+            ('keyword', lambda: gasscf.GASSCF(
+                mf=mf, ncas=2, nelecas=(1, 1), gas_orbs=(1, 1),
+                gas_restr=((1, 1), (2, 2)), gas_restr_type='cumulative-occ', ncore=0)),
+            ('list', lambda: gasscf.GASSCF(
+                mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+                gas_restr_type='cumulative-occ', ncore=0)))
+        ref_orbs, ref_blocks = reference._normalized_restriction()
+        for name, construct in cases:
+            with self.subTest(form=name):
+                obj = construct()
+                self.addCleanup(obj.close)
+                self.assertEqual((obj.ncas, obj.nelecas, obj.ncore, obj.ngas),
+                                 (reference.ncas, reference.nelecas, 0, 2))
+                self.assertIsInstance(obj.fcisolver, fci_gas.FCISolver)
+                self.assertTrue(obj.cache_plans)
+                for holder in (obj, obj.fcisolver):
+                    self.assertEqual(holder.gas_orbs, (1, 1))
+                    self.assertEqual(holder.gas_restr_type, 'cumulative-occ')
+                    restriction = [[1, 1], [2, 2]] if name == 'list' else model[3]
+                    self.assertEqual(holder.gas_restr, restriction)
+                actual_orbs, actual_blocks = obj._normalized_restriction()
+                self.assertEqual(actual_orbs, ref_orbs)
+                numpy.testing.assert_array_equal(actual_blocks, ref_blocks)
+                if name == 'positional':
+                    self.assertEqual(obj.frozen, [0])
+        default = gasscf.GASSCF(mf, 2, (1, 1), gas_orbs=(2,), ncore=0,
+                                cache_plans=False)
+        self.addCleanup(default.close)
+        self.assertEqual(default.gas_restr_type, addons_gas.GAS_RESTR_SPIN_SUPERGROUP)
+        self.assertFalse(default.cache_plans)
 
     def test_constructor_default_single_gas_matches_cas(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -176,87 +196,57 @@ class TestInputs(unittest.TestCase):
         self.assertTrue(mc.converged)
         self.assertAlmostEqual(mc.e_tot, reference.e_tot, places=10)
 
-    def test_constructor_rejects_inconsistent_ncas(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+    def test_constructor_rejects_invalid_or_missing_arguments(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol)
+        self.addCleanup(mf._chkfile.close)
         solver = fci_gas.FCISolver(mol, gas_orbs=(2,))
+        cases = [((3, (1, 1)), model, ValueError, 'ncas.*sum')
+                 for model in ({'gas_orbs': (1, 1)}, {'fcisolver': solver})]
+        cases += [((bad, (1, 1)), {'gas_orbs': (2,)}, TypeError, 'ncas.*integer')
+                  for bad in (True, numpy.bool_(True), 2.0, '2', (1, 1))]
+        cases += [((bad, (1, 1)), {'gas_orbs': (2,)}, ValueError, 'ncas.*positive')
+                  for bad in (0, -2)]
+        cases += [((2,), {'gas_orbs': (2,)}, TypeError, 'requires nelecas'),
+                  ((), {'nelecas': (1, 1), 'ncore': 0}, ValueError, 'gas_orbs is required')]
         for factory in (gasscf.GASSCF, gasscf.DFGASSCF):
-            for model in ({"gas_orbs": (1, 1)}, {"fcisolver": solver}):
-                with self.subTest(factory=factory, model=model):
-                    with self.assertRaisesRegex(ValueError, "ncas.*sum"):
-                        factory(mf, 3, (1, 1), **model)
+            for args, kwargs, error, message in cases:
+                with self.subTest(factory=factory.__name__, args=args, kwargs=kwargs):
+                    with self.assertRaisesRegex(error, message):
+                        factory(mf, *args, **kwargs)
         self.assertEqual(solver.gas_orbs, (2,))
-        self.assertFalse(hasattr(solver, "cache_plans"))
+        self.assertFalse(hasattr(solver, 'cache_plans'))
 
-    def test_constructor_rejects_invalid_ncas(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+    def test_constructor_explicit_and_inferred_ncas(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol)
-        for bad in (True, numpy.bool_(True), 2.0, "2", (1, 1)):
-            with self.subTest(ncas=bad):
-                with self.assertRaisesRegex(TypeError, "ncas.*integer"):
-                    gasscf.GASSCF(mf, bad, (1, 1), gas_orbs=(2,))
-        for bad in (0, -2):
-            with self.subTest(ncas=bad):
-                with self.assertRaisesRegex(ValueError, "ncas.*positive"):
-                    gasscf.GASSCF(mf, bad, (1, 1), gas_orbs=(2,))
-
-    def test_constructor_requires_nelecas(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol)
-        for factory in (gasscf.GASSCF, gasscf.DFGASSCF):
-            with self.assertRaisesRegex(TypeError, "requires nelecas"):
-                factory(mf, 2, gas_orbs=(2,))
-
-    def test_constructor_keyword_compatibility(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol)
-        old = gasscf.GASSCF(mf, gas_orbs=(2,), nelecas=(1, 1), ncore=0)
-        new = gasscf.GASSCF(mf, 2, (1, 1), gas_orbs=(2,), ncore=0)
-        self.assertEqual(old.ncas, new.ncas)
-        self.assertEqual(old.nelecas, new.nelecas)
-        old_orbs, old_blocks = old._normalized_restriction()
-        new_orbs, new_blocks = new._normalized_restriction()
-        self.assertEqual(old_orbs, new_orbs)
-        numpy.testing.assert_array_equal(old_blocks, new_blocks)
+        self.addCleanup(mf._chkfile.close)
+        for factory, reference in ((gasscf.GASSCF, mf),
+                                   (gasscf.DFGASSCF, mf.density_fit(auxbasis='weigend'))):
+            cases = [
+                ('explicit', (2, (1, 1)), dict(gas_orbs=(2,), ncore=0)),
+                ('inferred', (), dict(gas_orbs=(2,), nelecas=(1, 1), ncore=0))]
+            if factory is gasscf.DFGASSCF:
+                cases.append(('default', (), dict(ncas=2, nelecas=(1, 1),
+                                                  with_df=reference.with_df)))
+            normalized = []
+            for name, args, kwargs in cases:
+                with self.subTest(factory=factory.__name__, form=name):
+                    obj = factory(reference, *args, **kwargs)
+                    self.addCleanup(obj.close)
+                    self.assertEqual((obj.ncas, obj.nelecas, obj.gas_orbs),
+                                     (2, (1, 1), (2,)))
+                    normalized.append(obj._normalized_restriction())
+                    if factory is gasscf.DFGASSCF:
+                        self.assertIs(obj.with_df, reference.with_df)
+            for orbs, blocks in normalized[1:]:
+                self.assertEqual(orbs, normalized[0][0])
+                numpy.testing.assert_array_equal(blocks, normalized[0][1])
         solver = fci_gas.FCISolver(mol, gas_orbs=(2,))
         adapted = gasscf.GASSCF(mf, nelecas=(1, 1), fcisolver=solver)
+        self.addCleanup(adapted.close)
         self.assertEqual(adapted.ncas, 2)
         self.assertIsNot(adapted.fcisolver, solver)
-
-    def test_dfgasscf_constructor_argument_order_and_compatibility(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol).density_fit(auxbasis="weigend")
-        explicit = gasscf.DFGASSCF(mf, 2, (1, 1), gas_orbs=(2,), ncore=0)
-        default = gasscf.DFGASSCF(mf, ncas=2, nelecas=(1, 1), with_df=mf.with_df)
-        old = gasscf.DFGASSCF(mf, gas_orbs=(2,), nelecas=(1, 1), ncore=0)
-        for obj in (explicit, default, old):
-            self.assertEqual(obj.ncas, 2)
-            self.assertEqual(obj.nelecas, (1, 1))
-            self.assertEqual(obj.gas_orbs, (2,))
-            self.assertIs(obj.with_df, mf.with_df)
-
-    def test_constructs_gasscf_with_gasci_solver(self):
-        mol = gto.M(
-            atom="H 0 0 0; H 0 0 0.75",
-            basis="sto-3g",
-            verbose=0)
-        mf = scf.RHF(mol)
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
-            gas_restr_type="cumulative-occ", ncore=0)
-
-        self.assertEqual(mc.ncas, 2)
-        self.assertEqual(mc.nelecas, (1, 1))
-        self.assertEqual(mc.ncore, 0)
-        self.assertEqual(mc.ngas, 2)
-        self.assertIsInstance(mc.fcisolver, fci_gas.FCISolver)
-        self.assertEqual(mc.gas_orbs, (1, 1))
-        self.assertEqual(mc.fcisolver.gas_orbs, (1, 1))
-        self.assertEqual(mc.gas_restr, [[1, 1], [2, 2]])
-        self.assertEqual(mc.fcisolver.gas_restr, [[1, 1], [2, 2]])
-        self.assertEqual(mc.gas_restr_type, "cumulative-occ")
-        self.assertEqual(mc.fcisolver.gas_restr_type, "cumulative-occ")
-        self.assertTrue(mc.cache_plans)
 
     def test_gas_orbs_uses_strict_gasci_integer_validation(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75",
@@ -305,17 +295,6 @@ class TestInputs(unittest.TestCase):
             mf, 2, (1, 1), fcisolver=solver, ncore=0)
         self.assertEqual(adapted.gas_orbs, (0, 2, 0))
         self.assertEqual(adapted._normalized_restriction()[0], (2,))
-
-    def test_default_restriction_type_matches_gasci(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol)
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=0,
-            cache_plans=False)
-
-        self.assertEqual(
-            mc.gas_restr_type, addons_gas.GAS_RESTR_SPIN_SUPERGROUP)
-        self.assertFalse(mc.cache_plans)
 
     def test_gasscf_space_info_uses_gasci_normalization(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -563,7 +542,7 @@ class TestInputs(unittest.TestCase):
             self.assertGreater(internal.call_count, 1)
             check.assert_called_once()
 
-    def test_kernel_rejects_multiroot_until_state_average_stage(self):
+    def test_kernel_rejects_unwrapped_multiroot(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
         mf = scf.RHF(mol).run()
         mc = gasscf.GASSCF(
@@ -887,6 +866,7 @@ class TestInputs(unittest.TestCase):
                     ('ddPCM', {}, 'solvent models'),
                     ('DDPCM', {}, 'solvent models'),
                     ('PCM', {}, 'solvent models'),
+                    ('mc2step', {}, 'two-step GASSCF kernel'),
                     ('mc1step', {}, 'use kernel\\(\\)'),
                     ('solve_approx_ci', dict(h1=None, h2=None, ci0=None,
                                              ecore=0., e_cas=0., envs={}),
@@ -929,23 +909,6 @@ class TestInputs(unittest.TestCase):
                                     trial(mol)
                                 else:
                                     trial.as_scanner()
-
-    def test_mc2step_remains_guarded(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol)
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=0)
-
-        with self.assertRaisesRegex(NotImplementedError,
-                                    "two-step GASSCF kernel"):
-            mc.mc2step()
-
-    def test_requires_gas_orbs_without_explicit_solver(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol)
-        with self.assertRaisesRegex(ValueError, "gas_orbs is required"):
-            gasscf.GASSCF(mf, nelecas=(1, 1), ncore=0)
-
 
 class TestSolverAdapter(unittest.TestCase):
     """GAS solver dispatch, physical operators and reusable plans."""
@@ -1849,32 +1812,33 @@ class TestNewton(_N2Fixture, unittest.TestCase):
         self.assertAlmostEqual(e_tot, ref_e_tot, places=7)
         self.assertAlmostEqual(e_gas, ref_e_cas, places=7)
 
-    def test_full_kernel_restricted_gas_smoke(self):
-        mol = gto.M(
-            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
-            basis="sto-3g", verbose=0)
+    def test_restricted_gas_kernel_with_and_without_canonicalization(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1',
+                    basis='sto-3g', verbose=0)
         mf = scf.RHF(mol).run()
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
-            gas_restr_type="cumulative-occ", ncore=1)
-        mc.max_cycle_macro = 1
-        mc.max_cycle_micro = 1
-        mc.conv_tol = 1e-8
-        mc.conv_tol_grad = 1e-4
-        mc.canonicalization = False
-
-        mask = mc.uniq_var_indices(
-            mf.mo_coeff.shape[1], mc.ncore, mc.ncas, mc.frozen)
-        self.assertTrue(mask[mc.ncore + 1, mc.ncore])
-
-        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
-        ndet = mc.fcisolver.space_info(mc.ncas, mc.nelecas)["ndet_estimate"]
-
-        self.assertTrue(numpy.isfinite(e_tot))
-        self.assertTrue(numpy.isfinite(e_gas))
-        self.assertEqual(numpy.asarray(ci).size, ndet)
-        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
-        self.assertIsNone(mo_energy)
+        self.addCleanup(mf._chkfile.close)
+        for canonicalization in (False, True):
+            with self.subTest(canonicalization=canonicalization):
+                mc = gasscf.GASSCF(
+                    mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
+                    gas_restr_type='cumulative-occ', ncore=1)
+                self.addCleanup(mc.close)
+                mc.max_cycle_macro = mc.max_cycle_micro = 1
+                mc.conv_tol, mc.conv_tol_grad = 1e-8, 1e-4
+                if not canonicalization:
+                    mc.canonicalization = False
+                mask = mc.uniq_var_indices(mf.mo_coeff.shape[1], mc.ncore, mc.ncas, mc.frozen)
+                self.assertTrue(mask[mc.ncore + 1, mc.ncore])
+                e_tot, e_gas, ci, mo, mo_energy = mc.kernel(mf.mo_coeff)
+                ndet = mc.fcisolver.space_info(mc.ncas, mc.nelecas)['ndet_estimate']
+                self.assertTrue(numpy.isfinite(e_tot))
+                self.assertTrue(numpy.isfinite(e_gas))
+                self.assertEqual(numpy.asarray(ci).shape, (ndet,))
+                self.assertEqual(mo.shape, mf.mo_coeff.shape)
+                if canonicalization:
+                    self.assertEqual(mo_energy.shape, (mf.mo_coeff.shape[1],))
+                else:
+                    self.assertIsNone(mo_energy)
 
     def test_validate_capabilities_sets_internal_rotation_policy(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -2623,69 +2587,38 @@ class TestProperties(_N2Fixture, unittest.TestCase):
         mc.fcisolver.spin = 2
         self.assertEqual(mc._effective_nelecas(), (2, 0))
 
-    def test_gasscf_gasdm_wrappers_match_solver_methods(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
+    def test_density_transition_and_spin_wrapper_dispatch(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
         mf = scf.RHF(mol)
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=0)
+        self.addCleanup(mf._chkfile.close)
+        mc = gasscf.GASSCF(mf, 2, (1, 1), gas_orbs=(2,), ncore=0)
+        self.addCleanup(mc.close)
+        solver = mc.fcisolver
+
+        # Deliberately unnormalized: wrappers must forward the supplied vectors.
         ci = numpy.random.default_rng(71).normal(size=4)
         mc.ci = ci
-
-        dm1s = mc.make_gasdm1s()
-        dm1 = mc.make_gasdm1()
-        dm1_ref, dm2_ref = mc.fcisolver.make_rdm12(ci, 2, (1, 1))
-        dm1s_ref, dm2s_ref = mc.fcisolver.make_rdm12s(ci, 2, (1, 1))
-
-        for actual, expected in zip(dm1s, dm1s_ref):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(dm1, dm1_ref, atol=1e-12, rtol=0)
-        dm1_from_pair, dm2 = mc.make_gasdm12()
-        dm1s_from_pair, dm2s = mc.make_gasdm12s()
-        numpy.testing.assert_allclose(
-            dm1_from_pair, dm1_ref, atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(dm2, dm2_ref, atol=1e-12, rtol=0)
-        for actual, expected in zip(dm1s_from_pair, dm1s_ref):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        for actual, expected in zip(dm2s, dm2s_ref):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(mc.make_gasdm2(), dm2_ref,
-                                      atol=1e-12, rtol=0)
-
-    def test_gasscf_transition_dm_and_spin_wrappers_match_solver(self):
-        mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol)
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(2,), gas_restr=None, ncore=0)
+        d1, d2 = solver.make_rdm12(ci, 2, (1, 1))
+        d1s, d2s = solver.make_rdm12s(ci, 2, (1, 1))
+        for name, expected in (('make_gasdm1', d1), ('make_gasdm1s', d1s),
+                               ('make_gasdm12', (d1, d2)), ('make_gasdm12s', (d1s, d2s)),
+                               ('make_gasdm2', d2)):
+            with self.subTest(method=name):
+                self._assert_property_close(getattr(mc, name)(), expected, atol=1e-12)
         rng = numpy.random.default_rng(72)
-        bra = rng.normal(size=4)
-        ket = rng.normal(size=4)
+        bra, ket = rng.normal(size=(2, 4))
         mc.ci = ket
-
-        numpy.testing.assert_allclose(
-            mc.trans_gasdm1(bra, ket),
-            mc.fcisolver.trans_rdm1(bra, ket, 2, (1, 1)),
-            atol=1e-12, rtol=0)
-        ref_dm1, ref_dm2 = mc.fcisolver.trans_rdm12(bra, ket, 2, (1, 1))
-        dm1, dm2 = mc.trans_gasdm12(bra, ket)
-        numpy.testing.assert_allclose(dm1, ref_dm1, atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(dm2, ref_dm2, atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(mc.trans_gasdm2(bra, ket), ref_dm2,
-                                      atol=1e-12, rtol=0)
-
-        ref_dm1s = mc.fcisolver.trans_rdm1s(bra, ket, 2, (1, 1))
-        for actual, expected in zip(mc.trans_gasdm1s(bra, ket), ref_dm1s):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        ref_dm1s_pair, ref_dm2s_pair = mc.fcisolver.trans_rdm12s(
-            bra, ket, 2, (1, 1))
-        dm1s_pair, dm2s_pair = mc.trans_gasdm12s(bra, ket)
-        for actual, expected in zip(dm1s_pair, ref_dm1s_pair):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        for actual, expected in zip(dm2s_pair, ref_dm2s_pair):
-            numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
-        numpy.testing.assert_allclose(
-            numpy.asarray(mc.spin_square(ket)),
-            numpy.asarray(mc.fcisolver.spin_square(ket, 2, (1, 1))),
-            atol=1e-12, rtol=0)
+        d1, d2 = solver.trans_rdm12(bra, ket, 2, (1, 1))
+        d1s, d2s = solver.trans_rdm12s(bra, ket, 2, (1, 1))
+        for name, expected in (
+                ('trans_gasdm1', solver.trans_rdm1(bra, ket, 2, (1, 1))),
+                ('trans_gasdm1s', solver.trans_rdm1s(bra, ket, 2, (1, 1))),
+                ('trans_gasdm12', (d1, d2)), ('trans_gasdm12s', (d1s, d2s)),
+                ('trans_gasdm2', d2)):
+            with self.subTest(method=name):
+                self._assert_property_close(getattr(mc, name)(bra, ket), expected, atol=1e-12)
+        self._assert_property_close(mc.spin_square(ket), solver.spin_square(ket, 2, (1, 1)),
+                                    atol=1e-12)
 
     def test_gasscf_property_wrappers_require_ci_and_select_roots(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -3374,28 +3307,6 @@ class TestCanonicalization(_N2Fixture, unittest.TestCase):
         mc.natorb = True
         with self.assertRaisesRegex(NotImplementedError, "natural-orbital"):
             mc.validate_capabilities()
-
-    def test_restricted_gas_kernel_with_default_canonicalization_smoke(self):
-        mol = gto.M(
-            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
-            basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol).run()
-        mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
-            gas_restr_type="cumulative-occ", ncore=1)
-        mc.max_cycle_macro = 1
-        mc.max_cycle_micro = 1
-        mc.conv_tol = 1e-8
-        mc.conv_tol_grad = 1e-4
-
-        e_tot, e_gas, ci, mo_coeff, mo_energy = mc.kernel(mf.mo_coeff)
-
-        self.assertTrue(numpy.isfinite(e_tot))
-        self.assertTrue(numpy.isfinite(e_gas))
-        self.assertEqual(mo_coeff.shape, mf.mo_coeff.shape)
-        self.assertEqual(mo_energy.shape, (mf.mo_coeff.shape[1],))
-        self.assertEqual(numpy.asarray(ci).ndim, 1)
-
 
 class TestLifecycle(unittest.TestCase):
     """Object ownership, copies, implicit CI validity and checkpoints."""
