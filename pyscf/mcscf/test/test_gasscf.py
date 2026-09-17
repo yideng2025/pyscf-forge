@@ -70,8 +70,7 @@ class _N2Fixture:
 
     N2_REF_SCANNER_ENERGY = -109.033632423671
 
-    @staticmethod
-    def _n2_regression_fixture():
+    def _n2_regression_fixture(self):
         mol = gto.loads(N2_GASSCF_MOL)
         mol.verbose = 0
         mo = numpy.array(N2_GASSCF_MO_COEFF, copy=True)
@@ -88,6 +87,7 @@ class _N2Fixture:
         )
 
         mf = scf.RHF(mol)
+        self.addCleanup(mf._chkfile.close)
         mf.conv_tol = 1e-12
         mf.max_cycle = 100
         mf.kernel()
@@ -96,8 +96,7 @@ class _N2Fixture:
         mf.mo_coeff = mo.copy()
         return mol, mf, mo
 
-    @staticmethod
-    def _n2_regression_mc(mf):
+    def _n2_regression_mc(self, mf):
         mc = gasscf.GASSCF(
             mf, 8, (5, 5),
             gas_orbs=(2, 4, 2),
@@ -105,6 +104,7 @@ class _N2Fixture:
             gas_restr_type="cumulative-occ",
             ncore=2,
         )
+        self.addCleanup(mc.close)
         mc.verbose = 0
         mc.canonicalization = False
         mc.max_cycle_macro = 50
@@ -133,7 +133,6 @@ class _N2Fixture:
         for obj in (mc, ref):
             obj.mo_coeff = mo.copy()
             obj.ci = [ci.copy() for ci in roots]
-        self.addCleanup(mc.close)
         return mc, ref, roots
 
     def _assert_property_close(self, actual, expected, *, atol=2e-11):
@@ -383,7 +382,7 @@ class TestInputs(unittest.TestCase):
         self.assertGreater(numpy.linalg.norm(exact - approximate), 1e-8)
         for obj, expected in ((mc, exact), (fitted, approximate)):
             with self.subTest(df=hasattr(obj, 'with_df')):
-                numpy.testing.assert_allclose(obj.get_h2gas(mo), expected, atol=1e-12)
+                numpy.testing.assert_allclose(obj.get_h2gas(mo), expected, atol=1e-12, rtol=0)
                 for ncore, ncas in ((1, 2), (0, 1)):
                     core = mo[:, :ncore]
                     dm = 2 * core @ core.T
@@ -395,7 +394,7 @@ class TestInputs(unittest.TestCase):
                     expected_core = (mol.energy_nuc() + numpy.einsum('ij,ji', dm, hcore)
                                      + .5 * numpy.einsum('ij,ji', dm, potential))
                     h1, energy = obj.get_h1gas(mo, ncas=ncas, ncore=ncore)
-                    numpy.testing.assert_allclose(h1, expected_h1, atol=1e-12)
+                    numpy.testing.assert_allclose(h1, expected_h1, atol=1e-12, rtol=0)
                     self.assertAlmostEqual(energy, expected_core, 12)
 
     def test_public_entries_reject_invalid_mo_before_integrals(self):
@@ -1372,7 +1371,6 @@ class TestNewton(_N2Fixture, unittest.TestCase):
     def _check_n2_orbital_gradient_finite_difference(self, weights=None, use_df=False):
         _, mf, mo = self._n2_regression_fixture()
         mc = self._n2_regression_mc(mf)
-        self.addCleanup(mc.close)
         if use_df:
             mc = mc.density_fit()
             self.addCleanup(mc.close)
@@ -1536,6 +1534,7 @@ class TestNewton(_N2Fixture, unittest.TestCase):
 
         _, mf, mo = self._n2_regression_fixture()
         zw = self._n2_regression_mc(mf).state_average((1.0, 0.0))
+        self.addCleanup(zw.close)
         zw.fcisolver.spin = 0
         zw.fcisolver.max_cycle = 300
         zw.fcisolver.max_space = 30
@@ -1595,6 +1594,7 @@ class TestNewton(_N2Fixture, unittest.TestCase):
     def test_n2_numerical_regression_density_fit_entry_points(self):
         _, mf, mo = self._n2_regression_fixture()
         by_method = self._n2_regression_mc(mf).density_fit()
+        self.addCleanup(by_method.close)
         by_method.fcisolver.spin = 0
         by_method.fcisolver.max_cycle = 300
         by_method.fcisolver.max_space = 30
@@ -1609,6 +1609,7 @@ class TestNewton(_N2Fixture, unittest.TestCase):
             gas_restr_type="cumulative-occ",
             ncore=2,
         )
+        self.addCleanup(by_factory.close)
         by_factory.verbose = 0
         by_factory.canonicalization = False
         by_factory.max_cycle_macro = 50
@@ -2038,9 +2039,9 @@ class TestNewton(_N2Fixture, unittest.TestCase):
                     # P is orbital independent: no extra orbital or mixed block.
                     numpy.testing.assert_allclose(g[:ngorb], native[0][:ngorb], atol=0, rtol=0)
                     numpy.testing.assert_allclose(hop(orbital_direction),
-                                                  native[2](orbital_direction), atol=1e-12)
+                                                  native[2](orbital_direction), atol=1e-12, rtol=0)
                     numpy.testing.assert_allclose(hop(ci_direction)[:ngorb],
-                                                  native[2](ci_direction)[:ngorb], atol=1e-12)
+                                                  native[2](ci_direction)[:ngorb], atol=1e-12, rtol=0)
                     # Check the keyframe update at changed, unnormalized CI and
                     # rotated orbitals. Only the normalized CI penalty changes.
                     current = [(1.2+i)*(c+.13*v)
@@ -2053,7 +2054,7 @@ class TestNewton(_N2Fixture, unittest.TestCase):
                         c = c / numpy.linalg.norm(c)
                         expected[start:start+c.size] += 2*a*(penalty @ c-c.dot(penalty @ c)*c)
                         start += c.size
-                    numpy.testing.assert_allclose(actual, expected, atol=1e-11)
+                    numpy.testing.assert_allclose(actual, expected, atol=1e-11, rtol=0)
                     # Quadratic diagonal is a documented preconditioner
                     # approximation, shared with Davidson; the HVP is exact.
                     pd = .2 * (s2.diagonal()-target)
@@ -2066,14 +2067,14 @@ class TestNewton(_N2Fixture, unittest.TestCase):
                         residual = penalty @ c-ep*c
                         expected[start:start+c.size] += 2*a*(pd-ep-2*residual*c)
                         start += c.size
-                    numpy.testing.assert_allclose(diagonal, expected, atol=1e-12)
+                    numpy.testing.assert_allclose(diagonal, expected, atol=1e-12, rtol=0)
                     if weights is not None and weights[-1] == 0:
-                        numpy.testing.assert_allclose(g[-roots[-1].size:], 0, atol=0)
-                        numpy.testing.assert_allclose(hop(ci_direction)[-roots[-1].size:], 0, atol=0)
+                        numpy.testing.assert_allclose(g[-roots[-1].size:], 0, atol=0, rtol=0)
+                        numpy.testing.assert_allclose(hop(ci_direction)[-roots[-1].size:], 0, atol=0, rtol=0)
                     values = (g, hop(ci_direction+orbital_direction), diagonal)
                     if previous is not None:
                         for a, b in zip(values, previous):
-                            numpy.testing.assert_allclose(a, b, atol=1e-12)
+                            numpy.testing.assert_allclose(a, b, atol=1e-12, rtol=0)
                     previous = values
             mc.undo_fix_spin_()
 
@@ -2277,7 +2278,7 @@ class TestStateAverageAndSpin(unittest.TestCase):
                     self.assertIs(mc.undo_fix_spin_(), mc)
                     self.assertFalse(hasattr(solver, "ss_penalty"))
                     if kind == "sa":
-                        numpy.testing.assert_allclose(mc.weights, (.25, .75))
+                        numpy.testing.assert_array_equal(mc.weights, (.25, .75))
 
     def test_fix_spin_rejects_spin_incomplete_gas_and_invalid_target(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.75", basis="sto-3g", verbose=0)
@@ -2346,7 +2347,8 @@ class TestStateAverageAndSpin(unittest.TestCase):
                                       atol=1e-9, rtol=0)
         if len(roots) > 1:
             numpy.testing.assert_allclose(mc.e_states, physical, atol=1e-9, rtol=0)
-            numpy.testing.assert_allclose(mc.fcisolver.e_states, report["root_objective"])
+            numpy.testing.assert_allclose(mc.fcisolver.e_states, report["root_objective"],
+                                          atol=1e-9, rtol=0)
             self.assertAlmostEqual(mc.e_average, expected, 9)
         self.assertFalse(hasattr(mc, "e_tot_physical"))
         self.assertFalse(hasattr(mc, "e_gas_physical"))
@@ -2406,8 +2408,8 @@ class TestStateAverageAndSpin(unittest.TestCase):
                     restored.update_from_chk(mc.chkfile)
                     self.assertAlmostEqual(restored.e_tot, result[0], 10)
                     self.assertAlmostEqual(restored.e_cas, result[1], 10)
-                    numpy.testing.assert_allclose(restored.mo_coeff, mc.mo_coeff)
-                    numpy.testing.assert_allclose(restored.ci, mc.ci)
+                    numpy.testing.assert_array_equal(restored.mo_coeff, mc.mo_coeff)
+                    numpy.testing.assert_array_equal(restored.ci, mc.ci)
                     with self.assertRaises(ValueError):
                         restored.spin_energy_report()
                     self._check_physical_energy_result(
@@ -2422,7 +2424,8 @@ class TestStateAverageAndSpin(unittest.TestCase):
                     mc.gasci(mc.mo_coeff)
                     self.assertIsNone(mc.e_spin_penalty)
                     if weights is not None:
-                        numpy.testing.assert_allclose(mc.e_states, mc.fcisolver.e_states)
+                        numpy.testing.assert_allclose(mc.e_states, mc.fcisolver.e_states,
+                                                      atol=1e-9, rtol=0)
                     mc.reset(mol)
                     with self.assertRaises(ValueError):
                         mc.spin_energy_report()
@@ -2458,8 +2461,8 @@ class TestStateAverageAndSpin(unittest.TestCase):
             restored.update(filename)
             self.assertEqual(restored.e_tot, result[0])
             self.assertEqual(restored.e_cas, result[1])
-            numpy.testing.assert_allclose(restored.mo_coeff, mc.mo_coeff)
-            numpy.testing.assert_allclose(restored.ci, mc.ci)
+            numpy.testing.assert_array_equal(restored.mo_coeff, mc.mo_coeff)
+            numpy.testing.assert_array_equal(restored.ci, mc.ci)
             self._check_physical_energy_result(
                 restored, restored.kernel(restored.mo_coeff, restored.ci))
 
@@ -2553,8 +2556,9 @@ class TestProperties(_N2Fixture, unittest.TestCase):
         for state in (0, 1):
             numpy.testing.assert_allclose(
                 mc.make_gasdm1(state=state),
-                mc.fcisolver.make_rdm1(roots[state], 2, (1, 1)))
-        numpy.testing.assert_allclose(mc.make_gasdm1(), mc.make_gasdm1(state=0))
+                mc.fcisolver.make_rdm1(roots[state], 2, (1, 1)), atol=1e-12, rtol=0)
+        numpy.testing.assert_allclose(mc.make_gasdm1(), mc.make_gasdm1(state=0),
+                                      atol=1e-12, rtol=0)
         sa = mc.state_average((.25, .75))
         with self.assertRaisesRegex(ValueError, "one CI vector per state"):
             sa.make_gasdm1(ci=roots[0])
@@ -2719,7 +2723,7 @@ class TestProperties(_N2Fixture, unittest.TestCase):
                     self.assertEqual(occ.shape, (obj.ncas,))
                     numpy.testing.assert_allclose(occ, ref_occ, atol=2e-12, rtol=0)
                     numpy.testing.assert_allclose(mo.T @ overlap @ mo,
-                                                  numpy.eye(mo.shape[1]), atol=2e-9)
+                                                  numpy.eye(mo.shape[1]), atol=2e-9, rtol=0)
                     numpy.testing.assert_array_equal(mo[:, :ncore], before[:, :ncore])
                     numpy.testing.assert_array_equal(mo[:, nocc:], before[:, nocc:])
                     dm = 2 * mo[:, :ncore] @ mo[:, :ncore].T
@@ -2755,11 +2759,11 @@ class TestProperties(_N2Fixture, unittest.TestCase):
                 allowed[block, block] = True
                 u = rotation[block, block]
                 numpy.testing.assert_allclose(
-                    u.T @ dm[block, block] @ u, numpy.diag(occ), atol=2e-9)
+                    u.T @ dm[block, block] @ u, numpy.diag(occ), atol=2e-9, rtol=0)
                 offset += size
-            numpy.testing.assert_allclose(rotation[~allowed], 0., atol=2e-9)
+            numpy.testing.assert_allclose(rotation[~allowed], 0., atol=2e-9, rtol=0)
             numpy.testing.assert_allclose(mo.T @ overlap @ mo,
-                                          numpy.eye(mo.shape[1]), atol=2e-9)
+                                          numpy.eye(mo.shape[1]), atol=2e-9, rtol=0)
             numpy.testing.assert_array_equal(obj.mo_coeff, before)
             for original, actual in zip(roots, obj.ci):
                 numpy.testing.assert_array_equal(actual, original)
@@ -2799,16 +2803,16 @@ class TestProperties(_N2Fixture, unittest.TestCase):
                             if isinstance(occ, tuple):
                                 occ = numpy.concatenate(occ)
                             numpy.testing.assert_allclose(
-                                mo.conj().T @ overlap @ mo, numpy.eye(6), atol=2e-12)
+                                mo.conj().T @ overlap @ mo, numpy.eye(6), atol=2e-12, rtol=0)
                             reconstructed = (mo[:, 1:5] * occ) @ mo[:, 1:5].conj().T
-                            numpy.testing.assert_allclose(reconstructed, expected, atol=2e-12)
+                            numpy.testing.assert_allclose(reconstructed, expected, atol=2e-12, rtol=0)
                             numpy.testing.assert_array_equal(mo[:, [0, 5]], before[:, [0, 5]])
                             self.assertIs(mc.mo_coeff, before)
                             self.assertIsNone(mc.ci)
                             if method == 'get_gas_pseudo_natorb':
                                 rotation = active.conj().T @ overlap @ mo[:, 1:5]
-                                numpy.testing.assert_allclose(rotation[:2, 2:], 0., atol=2e-12)
-                                numpy.testing.assert_allclose(rotation[2:, :2], 0., atol=2e-12)
+                                numpy.testing.assert_allclose(rotation[:2, 2:], 0., atol=2e-12, rtol=0)
+                                numpy.testing.assert_allclose(rotation[2:, :2], 0., atol=2e-12, rtol=0)
                     # Complex analysis orbitals are not computational GAS MOs.
                     if numpy.iscomplexobj(density):
                         with self.assertRaisesRegex(TypeError, 'real-valued orbitals'):
@@ -3016,7 +3020,7 @@ class TestCanonicalization(_N2Fixture, unittest.TestCase):
         rotation = before[:, active].T @ mc._scf.get_ovlp() @ mo[:, active]
         gas_labels = numpy.repeat(numpy.arange(mc.ngas), mc.gas_orbs)
         numpy.testing.assert_allclose(rotation[gas_labels[:, None] != gas_labels],
-                                      0., atol=2e-9)
+                                      0., atol=2e-9, rtol=0)
         numpy.testing.assert_allclose(
             mc.make_rdm1(mo_coeff=mo, ci=ci), mc.make_rdm1(), atol=2e-11, rtol=0)
         dm = mc.make_gasdm1(ci=ci)
@@ -3032,7 +3036,6 @@ class TestCanonicalization(_N2Fixture, unittest.TestCase):
     def test_n2_pseudo_canonicalize_with_spin_penalty_and_restart(self):
         _, mf, mo = self._n2_regression_fixture()
         mc = self._n2_regression_mc(mf).fix_spin(shift=.2, ss=0)
-        self.addCleanup(mc.close)
         mc.gasci(mo)
         self.assertTrue(mc.converged)
         e_before = mc.e_tot
@@ -3112,8 +3115,8 @@ class TestCanonicalization(_N2Fixture, unittest.TestCase):
             with self.subTest(pseudo=pseudo), \
                     mock.patch.object(mc, 'get_fock', return_value=fock):
                 new, _, eps = mc.canonicalize(sort=True, gas_pseudo_natorb=pseudo)
-                numpy.testing.assert_allclose(new, mo[:, order], atol=2e-11)
-                numpy.testing.assert_allclose(eps, numpy.arange(1., 7.), atol=2e-11)
+                numpy.testing.assert_allclose(new, mo[:, order], atol=2e-11, rtol=0)
+                numpy.testing.assert_allclose(eps, numpy.arange(1., 7.), atol=2e-11, rtol=0)
                 numpy.testing.assert_array_equal(mo, before)
                 self.assertFalse(numpy.shares_memory(new, mo))
 
@@ -3177,11 +3180,11 @@ class TestCanonicalization(_N2Fixture, unittest.TestCase):
                                         self.assertTrue(numpy.all(
                                             numpy.diff(eps[indices]) >= -2e-9))
                                 numpy.testing.assert_allclose(
-                                    eps, numpy.einsum('pi,pi->i', new, fock @ new), atol=2e-11)
+                                    eps, numpy.einsum('pi,pi->i', new, fock @ new), atol=2e-11, rtol=0)
                                 for state, density in zip(states, old_dm):
                                     numpy.testing.assert_allclose(
                                         mc.make_rdm1(mo_coeff=new, ci=ci, state=state),
-                                        density, atol=2e-11)
+                                        density, atol=2e-11, rtol=0)
                                 numpy.testing.assert_allclose(energies(new, ci), old_e, atol=2e-10, rtol=0)
                                 numpy.testing.assert_array_equal(mc.mo_coeff, before)
                                 numpy.testing.assert_array_equal(numpy.asarray(mc.ci), ci_before)
@@ -3668,6 +3671,7 @@ class TestScanner(_N2Fixture, unittest.TestCase):
         self.assertTrue(source.converged)
 
         scanner = source.as_scanner()
+        self.addCleanup(scanner.close)
         coords = numpy.asarray(mol.atom_coords(unit="Angstrom"), dtype=float)
         bond = coords[1] - coords[0]
         coords[1] += 0.01 * bond / numpy.linalg.norm(bond)
