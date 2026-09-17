@@ -3989,6 +3989,118 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target S"):
             complete.fix_spin_(shift=.2, ss=.5)
 
+    def test_joint_newton_curvature_against_full_fci_energy(self):
+        # Nonstationary restricted GAS with core, virtual and inter-GAS rotations.
+        mol = gto.M(atom=';'.join('H 0 0 %s' % z for z in
+                                 (0., .8, 1.8, 2.6, 3.7, 4.8)),
+                    basis='sto-3g', verbose=0)
+        mf = scf.RHF(mol).run()
+        self.addCleanup(mf._chkfile.close)
+        cases = ((False, None, None, None),
+                 (True, None, None, [5]),
+                 (False, (.3, .7), 0., None),
+                 (True, (.3, .7), 2., None),
+                 (False, (.4, 0., .6), 2., [5]),
+                 (True, (.4, 0., .6), 0., [5]))
+        for use_df, weights, target, frozen in cases:
+            with self.subTest(df=use_df, weights=weights, target=target, frozen=frozen):
+                with ExitStack() as resources:
+                    mc = gasscf.GASSCF(
+                        mf, 4, (2, 2), ncore=1, gas_orbs=(1, 2, 1),
+                        gas_restr=((0, 1), (3, 4), (4, 4)),
+                        gas_restr_type='cumulative-occ', frozen=frozen)
+                    resources.callback(mc.close)
+                    if use_df:
+                        mc = mc.density_fit(auxbasis='weigend')
+                        resources.callback(mc.close)
+                    if weights is not None:
+                        mc = mc.state_average(weights)
+                        resources.callback(mc.close)
+                    if target is not None:
+                        mc.fix_spin_(shift=.2, ss=target)
+                    mc.validate_capabilities()
+                    space = resources.enter_context(
+                        mc.fcisolver.make_space(mc.ncas, mc.nelecas))
+                    self.assertEqual(space.ndet, 19)
+                    rng = numpy.random.default_rng(62091)
+                    columns = numpy.linalg.qr(rng.normal(
+                        size=(space.ndet, mc.fcisolver.nroots)))[0]
+                    roots = [column.copy() for column in columns.T]
+                    ci = roots[0] if weights is None else roots
+                    ngorb = int(mc.uniq_var_indices(6, 1, 4, frozen).sum())
+                    mo = mf.mo_coeff @ scipy.linalg.expm(
+                        mc.unpack_uniq_var(.05 * rng.normal(size=ngorb)))
+                    gradient, update, hop, _ = mc.gen_g_hop(mo, ci, mc.ao2mo(mo))
+                    vo = rng.normal(size=ngorb)
+                    vo /= numpy.linalg.norm(vo)
+                    vc = []
+                    for c in roots:
+                        v = rng.normal(size=c.size)
+                        v -= c.dot(v) * c
+                        vc.append(v / numpy.linalg.norm(v))
+                    orbital = numpy.r_[vo, numpy.zeros(space.ndet * len(roots))]
+                    ci_direction = numpy.r_[numpy.zeros(ngorb), numpy.concatenate(vc)]
+                    joint = orbital + ci_direction
+                    joint /= numpy.linalg.norm(joint)
+
+                    def energy(x):
+                        # No CI solve, tested HVP or GAS RDM in this reference.
+                        orbitals = mo @ scipy.linalg.expm(mc.unpack_uniq_var(x[:ngorb]))
+                        h1, core = mc.get_h1eff(orbitals)
+                        h2 = mc.get_h2eff(orbitals)
+                        hamiltonian = direct_spin1.absorb_h1e(h1, h2, 4, (2, 2), .5)
+                        value = core
+                        for i, (weight, c) in enumerate(zip(
+                                (1.,) if weights is None else weights, roots)):
+                            displaced = c + x[ngorb + i * space.ndet:
+                                              ngorb + (i + 1) * space.ndet]
+                            full = fci_gas.gas2fci(
+                                displaced / numpy.linalg.norm(displaced), space)
+                            hfull = direct_spin1.contract_2e(hamiltonian, full, 4, (2, 2))
+                            if target is not None:
+                                penalty = spin_op.contract_ss(full, 4, (2, 2)) - target * full
+                                if target != 0.:
+                                    penalty = (spin_op.contract_ss(penalty, 4, (2, 2))
+                                               - target * penalty)
+                                hfull += .2 * penalty
+                            value += weight * numpy.vdot(full, hfull).real
+                        return float(value)
+
+                    center = energy(numpy.zeros_like(gradient))
+                    for name, direction in (('orbital', orbital), ('ci', ci_direction),
+                                            ('joint', joint)):
+                        slope = gradient @ direction
+                        curvature = direction @ hop(direction)
+                        self.assertGreater(abs(curvature), 1e-4)
+                        for step in (2e-4, 1e-4):
+                            with self.subTest(direction=name, step=step):
+                                plus, minus = energy(step * direction), energy(-step * direction)
+                                self.assertAlmostEqual((plus - minus) / (2 * step),
+                                                       slope, delta=3e-7)
+                                self.assertAlmostEqual((plus - 2 * center + minus) / step**2,
+                                                       curvature, delta=3e-6)
+                    mixed = orbital @ hop(ci_direction)
+                    self.assertGreater(abs(mixed), 1e-4)
+                    for step in (2e-4, 1e-4):
+                        with self.subTest(direction='mixed', step=step):
+                            cross = (energy(step * (orbital + ci_direction))
+                                     - energy(step * (orbital - ci_direction))
+                                     - energy(step * (-orbital + ci_direction))
+                                     + energy(-step * (orbital + ci_direction))) / (4 * step**2)
+                            self.assertAlmostEqual(cross, mixed, delta=3e-6)
+                    x, y = rng.normal(size=(2, gradient.size))
+                    self.assertAlmostEqual(x @ hop(y), y @ hop(x), delta=2e-11)
+                    numpy.testing.assert_allclose(update(numpy.eye(6), ci), gradient,
+                                                  atol=2e-11, rtol=0)
+                    if weights is not None and 0. in weights:
+                        index = weights.index(0.)
+                        block = slice(ngorb + index * space.ndet,
+                                      ngorb + (index + 1) * space.ndet)
+                        zero_root = numpy.zeros_like(gradient)
+                        zero_root[block] = rng.normal(size=space.ndet)
+                        for value in (gradient[block], hop(x)[block], hop(zero_root)):
+                            numpy.testing.assert_allclose(value, 0., atol=2e-11, rtol=0)
+
     def _check_spin_penalty_newton_derivatives(self, use_df=False, weights=None):
         mol = gto.M(atom='H 0 0 0; H 0 0 .8; H 0 0 1.8; H 0 0 2.6',
                     basis='sto-3g', verbose=0)
@@ -5029,19 +5141,66 @@ class KnownValues(unittest.TestCase):
 
     def test_as_scanner_rejects_changed_system_model(self):
         mol = gto.M(
-            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2; H 0 0 3.1",
-            basis="sto-3g", verbose=0)
-        mf = scf.RHF(mol).run()
+            atom='H 0 0 0; H 0 0 .9; H 0 0 2.2; H 0 0 3.1',
+            basis='sto-3g', verbose=0)
+        # Model rejection must precede reset and SCF; no electronic solve needed.
+        mf = scf.RHF(mol)
+        self.addCleanup(mf._chkfile.close)
         mc = gasscf.GASSCF(
-            mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=[[1, 1], [2, 2]],
-            gas_restr_type="cumulative-occ", ncore=1)
+            mf, 2, (1, 1), gas_orbs=(1, 1), gas_restr=((1, 1), (2, 2)),
+            gas_restr_type='cumulative-occ', ncore=1)
+        self.addCleanup(mc.close)
+        mc = mc.state_average((.5, .5)).fix_spin_(shift=.2, ss=0.)
+        self.addCleanup(mc.close)
         scanner = mc.as_scanner()
-        changed = gto.M(
-            atom="H 0 0 0; H 0 0 0.9; H 0 0 2.2",
-            basis="sto-3g", spin=1, verbose=0)
-
-        with self.assertRaisesRegex(ValueError, "same atoms"):
-            scanner(changed)
+        self.addCleanup(scanner.close)
+        molecular_changes = (
+            {'atom': 'H 0 0 0; H 0 0 .9; H 0 0 2.2', 'spin': 1},
+            {'basis': '6-31g'}, {'charge': 2}, {'spin': 2}, {'cart': True})
+        for options in molecular_changes:
+            with self.subTest(molecular_change=options):
+                settings = dict(atom=mol.atom, basis='sto-3g', verbose=0)
+                settings.update(options)
+                changed = gto.M(**settings)
+                with mock.patch.object(scanner, 'reset') as reset, \
+                        mock.patch.object(type(scanner._scf), '__call__') as scf_call:
+                    with self.assertRaisesRegex(ValueError, 'same atoms'):
+                        scanner(changed)
+                    reset.assert_not_called()
+                    scf_call.assert_not_called()
+        model_changes = (
+            ('frozen', {'frozen': [0]}, {}, 'create a new scanner'),
+            ('weights', {'weights': (.3, .7)}, {}, 'create a new scanner'),
+            ('roots', {}, {'nroots': 3}, 'nroots/weights mismatch'),
+            ('penalty-shift', {}, {'ss_penalty': .3}, 'create a new scanner'),
+            ('penalty-target', {}, {'ss_value': 2.}, 'create a new scanner'),
+            ('GAS-size', {'gas_restr': ((0, 2), (2, 2))}, {}, 'create a new scanner'),
+            ('GAS-basis', {'gas_restr_type': 'supergroup',
+                           'gas_restr': ((0, 2), (2, 0))}, {}, 'create a new scanner'))
+        for name, mc_settings, solver_settings, message in model_changes:
+            with self.subTest(model_change=name):
+                trial = scanner.copy()
+                self.addCleanup(trial.close)
+                for key, value in mc_settings.items():
+                    setattr(trial, key, value)
+                for key, value in solver_settings.items():
+                    setattr(trial.fcisolver, key, value)
+                if name == 'GAS-basis':
+                    # Equal determinant counts do not imply compatible CI bases.
+                    trial.validate_capabilities()
+                    with scanner.fcisolver.make_space(2, (1, 1)) as old, \
+                            trial.fcisolver.make_space(2, (1, 1)) as new:
+                        self.assertEqual(old.ndet, 2)
+                        self.assertEqual(new.ndet, old.ndet)
+                        old_full = fci_gas.gas2fci(numpy.ones(old.ndet), old)
+                        new_full = fci_gas.gas2fci(numpy.ones(new.ndet), new)
+                        self.assertFalse(numpy.array_equal(old_full, new_full))
+                with mock.patch.object(trial, 'reset') as reset, \
+                        mock.patch.object(type(trial._scf), '__call__') as scf_call:
+                    with self.assertRaisesRegex(ValueError, message):
+                        trial(mol)
+                    reset.assert_not_called()
+                    scf_call.assert_not_called()
 
     def test_unsupported_apis_through_wrappers(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 .75', basis='sto-3g', verbose=0)
